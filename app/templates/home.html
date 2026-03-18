@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ app_title }}</title>
+    <link rel="stylesheet" href="/static/app.css?v={{ asset_version }}" />
+    <script src="/static/app.js?v={{ asset_version }}" defer></script>
+  </head>
+  <body class="home-body">
+    <div class="ambient-shape ambient-a"></div>
+    <div class="ambient-shape ambient-b"></div>
+    <main class="home-shell">
+      <section class="hero-panel">
+        <p class="eyebrow">Private Research Workflow</p>
+        <h1>{{ app_title }}</h1>
+        <div class="hero-badges">
+          <span>14-18 页深度版</span>
+          <span>SVG 图表 + PDF 导出</span>
+          <span>官方资料优先</span>
+        </div>
+      </section>
+
+      <section class="control-panel">
+        <div class="section-head">
+          <h2>选择范围</h2>
+        </div>
+
+        <form id="report-form" class="report-form">
+          <div class="company-grid">
+            {% for company in companies %}
+            <button
+              class="company-card"
+              type="button"
+              data-company-card
+              data-company-id="{{ company.id }}"
+              data-quarters='{{ company.supported_quarters | tojson }}'
+              aria-pressed="false"
+            >
+              <span class="company-topline">
+                <span class="ticker">{{ company.ticker }}</span>
+                <span class="company-meta">
+                  <span class="selection-chip" aria-hidden="true">
+                    <span class="selection-icon">✓</span>
+                    <span class="selection-text">已选中</span>
+                  </span>
+                </span>
+              </span>
+              <strong>{{ company.name }}</strong>
+              <small>{{ company.english_name }}</small>
+              <p>{{ company.description }}</p>
+              <div class="accent-bar" style="background: linear-gradient(90deg, {{ company.brand.primary }}, {{ company.brand.secondary }});"></div>
+            </button>
+            {% endfor %}
+          </div>
+
+          <input id="company-id" name="company_id" type="hidden" value="" />
+
+          <div class="form-grid">
+            <label class="field">
+              <span>自然年季度</span>
+              <select id="calendar-quarter" name="calendar_quarter" disabled>
+                <option value="">请先选择公司</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span>历史窗口</span>
+              <input id="history-window" name="history_window" type="number" min="8" max="16" value="{{ default_history_window }}" />
+            </label>
+
+            <label class="field upload-field">
+              <span>补充 transcript（可选）</span>
+              <input id="transcript-file" name="transcript_file" type="file" accept=".pdf,.txt,.html,.htm" />
+            </label>
+          </div>
+
+          <label class="toggle-field" for="force-refresh">
+            <input id="force-refresh" name="force_refresh" type="checkbox" />
+            <span>
+              <strong>强制刷新官方源</strong>
+              <small>默认会优先复用近期缓存；勾选后将重新发现 SEC / IR 源并重新抓取原文。</small>
+            </span>
+          </label>
+
+          <div class="form-actions">
+            <button id="generate-button" class="primary-button" type="submit" disabled>生成深度版报告</button>
+            <div class="generation-feedback">
+              <p id="form-status" class="form-status">请先点选一家公司；再次点击同一张卡片可取消选择。</p>
+              <div id="generation-progress" class="generation-progress" hidden>
+                <div class="progress-meta">
+                  <strong id="generation-progress-stage">准备中</strong>
+                  <span id="generation-progress-percent">0%</span>
+                </div>
+                <div class="progress-track" aria-hidden="true">
+                  <span id="generation-progress-fill" class="progress-fill"></span>
+                </div>
+                <p id="generation-progress-message" class="progress-message">系统正在准备生成任务...</p>
+              </div>
+            </div>
+          </div>
+        </form>
+      </section>
+    </main>
+  </body>
+</html>

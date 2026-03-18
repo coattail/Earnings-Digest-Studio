@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ report.company.name }} {{ report.calendar_quarter }} Deep Report</title>
+    <style>{{ embedded_css | safe }}</style>
+    {% if show_toolbar %}
+    <script src="/static/app.js" defer></script>
+    {% endif %}
+  </head>
+  <body
+    class="report-body"
+    style="
+      --brand-primary: {{ report.company.brand.primary }};
+      --brand-secondary: {{ report.company.brand.secondary }};
+      --brand-accent: {{ report.company.brand.accent }};
+      --brand-surface: {{ report.company.brand.surface }};
+    "
+  >
+    {% if show_toolbar %}
+    <div class="preview-toolbar">
+      <a class="ghost-button" href="/">返回首页</a>
+      <div class="toolbar-meta">
+        <strong>{{ report.company.name }} · {{ report.calendar_quarter }}</strong>
+        <span>{{ report.fiscal_label }} · {{ report.page_count }} 页</span>
+      </div>
+      <button class="primary-button" type="button" data-export-button data-report-id="{{ report_id }}">导出 PDF</button>
+      <span id="export-status" class="toolbar-status">预览版与导出版共用同一套模板。</span>
+    </div>
+    {% endif %}
+
+    <main class="report-shell{% if show_toolbar %} has-toolbar{% endif %}">
+      <section class="page cover-page">
+        <div class="page-no">1 / {{ report.page_count }}</div>
+        <div class="cover-grid">
+          <div>
+            <p class="eyebrow">Deep Quarterly Digest</p>
+            <h1>{{ report.company.name }} {{ report.calendar_quarter }} 财报与电话会深度汇总</h1>
+            <p class="deck-subtitle">
+              {{ report.fiscal_label }} · 财报发布日期 {{ report.release_date }} · 经营覆盖期间结束于 {{ report.period_end }}
+            </p>
+            <p class="cover-copy">{{ report.headline }}</p>
+            <div class="cover-chip-row">
+              {% for item in report.scoreboard[:4] %}
+              <div class="cover-chip">
+                <span>{{ item.title }}</span>
+                <strong>{{ item.value }}</strong>
+                <small>{{ item.subvalue }}</small>
+              </div>
+              {% endfor %}
+            </div>
+          </div>
+          <div class="cover-summary-card">
+            <h2>核心结论</h2>
+            <div class="thesis-stack compact">
+              {% for item in report.layered_takeaways[:3] %}
+              <article class="thesis-item compact">
+                <span>{{ item.title }}</span>
+                <p>{{ item.body }}</p>
+              </article>
+              {% endfor %}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="page">
+        <div class="page-no">2 / {{ report.page_count }}</div>
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Quarterly Layer</p>
+            <h2>执行摘要与关键指标</h2>
+          </div>
+          <p class="section-note">把公司、季度、收入兑现、现金流与结构模式压缩到一页内快速浏览。</p>
+        </div>
+        <div class="scoreboard-grid">
+          {% for item in report.scoreboard %}
+          <article class="score-card">
+            <span>{{ item.title }}</span>
+            <strong>{{ item.value }}</strong>
+            <small>{{ item.subvalue }}</small>
+          </article>
+          {% endfor %}
+        </div>
+        <div class="page-split two-col compact-panels">
+          <article class="text-panel">
+            <h3>研究结论分层</h3>
+            <div class="thesis-stack">
+              {% for item in report.layered_takeaways[:3] %}
+              <article class="thesis-item">
+                <span>{{ item.title }}</span>
+                <p>{{ item.body }}</p>
+              </article>
+              {% endfor %}
+            </div>
+          </article>
+          <article class="text-panel">
+            <h3>{{ report.expectation_panel.title }}</h3>
+            <ul class="warning-list">
+              {% for item in report.expectation_panel.bullets %}
+              <li>{{ item }}</li>
+              {% endfor %}
+            </ul>
+            {% if report.expectation_panel.chips %}
+            <div class="signal-chip-row">
+              {% for item in report.expectation_panel.chips %}
+              <article class="signal-chip">
+                <span>{{ item.label }}</span>
+                <strong>{{ item.value }}</strong>
+                <small>{{ item.note }}</small>
+              </article>
+              {% endfor %}
+            </div>
+            {% endif %}
+          </article>
+        </div>
+      </section>
+
+      <section class="page">
+        <div class="page-no">3 / {{ report.page_count }}</div>
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Quarterly Layer</p>
+            <h2>当季业绩对比</h2>
+          </div>
+          <p class="section-note">收入、净利润、毛利率一页并读，强调当季、上季与去年同期的相对位置。</p>
+        </div>
+        <div class="chart-card wide-card">{{ report.visuals.current_quarter | safe }}</div>
+        <div class="evidence-grid">
+          {% for item in report.evidence_cards[:2] %}
+          <article class="evidence-card">
+            <span>{{ item.title }}</span>
+            <strong>{{ item.source_label }}</strong>
+            <p>{{ item.text }}</p>
+          </article>
+          {% endfor %}
+        </div>
+      </section>
+
+      <section class="page">
+        <div class="page-no">4 / {{ report.page_count }}</div>
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Quarterly Layer</p>
+            <h2>{{ report.guidance_title }}</h2>
+          </div>
+          <p class="section-note">{{ report.guidance_note }}</p>
+        </div>
+        <div class="chart-card wide-card">{{ report.visuals.guidance | safe }}</div>
+        <div class="page-split two-col compact-panels tight-panels balanced-panels">
+          <article class="text-panel">
+            <h3>{{ report.guidance_panel.title }}</h3>
+            {% if report.guidance_panel.bullets %}
+            <ul class="warning-list">
+              {% for item in report.guidance_panel.bullets %}
+              <li>{{ item }}</li>
+              {% endfor %}
+            </ul>
+            {% else %}
+            <p>{{ report.guidance.commentary }}</p>
+            {% endif %}
+          </article>
+          <article class="text-panel">
+            <h3>{{ report.expectation_panel.title }}</h3>
+            <ul class="warning-list">
+              {% for item in report.expectation_panel.bullets[:3] %}
+              <li>{{ item }}</li>
+              {% endfor %}
+            </ul>
+            <p class="panel-followup">{{ report.cash_panel.body }}</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="page">
+        <div class="page-no">5 / {{ report.page_count }}</div>
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Quarterly Layer</p>
+            <h2>当季营收结构与集中度</h2>
+          </div>
+          <p class="section-note">同页并读业务结构与地区结构，让“增长来自哪里”不只停留在一句话上。</p>
+        </div>
+        <div class="chart-card wide-card">{{ report.visuals.segment_mix | safe }}</div>
+        <div class="mini-card-grid three-col">
+          {% for item in report.current_detail_cards %}
+          <article class="mini-card">
+            <span>{{ item.title }}</span>
+            <strong>{{ item.value }}</strong>
+            <small>{{ item.note }}</small>
+          </article>
+          {% endfor %}
+        </div>
+      </section>
+
+      <section class="page">
+        <div class="page-no">6 / {{ report.page_count }}</div>
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Quarterly Layer</p>
+            <h2>营收与开支可视化图</h2>
+          </div>
+          <p class="section-note">以利润表路径串起收入、成本、经营费用和净利润，帮助快速看清当季兑现结构。</p>
+        </div>
+        <div class="chart-card wide-card">{{ report.visuals.income_statement | safe }}</div>
+      </section>
+
+      <section class="page">
+        <div class="page-no">7 / {{ report.page_count }}</div>
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Quarterly Layer</p>
+            <h2>财报科目中文直译</h2>
+          </div>
+          <p class="section-note">将收入、成本、费用与利润科目直译为中文，同时保留英文原词，方便快速比对官方利润表。</p>
+        </div>
+        <div class="chart-card wide-card">{{ report.visuals.statement_translation | safe }}</div>
+      </section>
+
+      <section class="page">
+        <div class="page-no">8 / {{ report.page_count }}</div>
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Quarterly Layer</p>
+            <h2>电话会与问答主题</h2>
+          </div>
+          <p class="section-note">不做大段 transcript 堆砌，而是用主题强度、关键摘录和证据卡片组织阅读。</p>
+        </div>
+        <div class="chart-card wide-card">{{ report.visuals.management_qna | safe }}</div>
+        <div class="page-split two-col compact-panels signal-followup-panels balanced-panels">
+          <article class="text-panel">
+            <h3>{{ report.call_panel.title }}</h3>
+            <ul class="warning-list">
+              {% for item in report.call_panel.bullets %}
+              <li>{{ item }}</li>
+              {% endfor %}
+            </ul>
+          </article>
+          <article class="text-panel">
+            {% if report.call_quote_cards %}
+            <h3>官方管理层锚点</h3>
+            <div class="quote-card-stack">
+              {% set featured_quote = report.call_quote_cards[0] %}
+              <article class="quote-card{% if featured_quote.quote|length > 280 or featured_quote.analysis|length > 150 or featured_quote.source_label|length > 88 %} quote-card-dense{% endif %}{% if featured_quote.quote|length > 420 or featured_quote.analysis|length > 210 %} quote-card-ultra-dense{% endif %}">
+                <span>{{ featured_quote.speaker }}</span>
+                <strong>{{ featured_quote.quote }}</strong>
+                <p>{{ featured_quote.analysis }}</p>
+                <small>{{ featured_quote.source_label }}</small>
+              </article>
+            </div>
+            {% else %}
+            <h3>证据卡片</h3>
+            <ul class="warning-list">
+              {% for item in report.evidence_cards[:2] %}
+              <li><strong>{{ item.title }}</strong>：{{ item.text }}</li>
+              {% endfor %}
+            </ul>
+            {% endif %}
+          </article>
+        </div>
+      </section>
+
+      <section class="page">
+        <div class="page-no">9 / {{ report.page_count }}</div>
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Quarterly Layer</p>
+            <h2>风险与催化剂</h2>
+          </div>
+          <p class="section-note">保持图表化表达，避免把风险和催化剂写成大段纯文字备忘录。</p>
+        </div>
+        <div class="chart-card wide-card">{{ report.visuals.risks_catalysts | safe }}</div>
+        <div class="page-split two-col compact-panels signal-followup-panels balanced-panels">
+          <article class="text-panel">
+            <h3>本季风险视角</h3>
+            <ul class="warning-list">
+              {% for item in report.risks[:3] %}
+              <li><strong>{{ item.label }}</strong>：{{ item.note }}</li>
+              {% endfor %}
+            </ul>
+          </article>
+          <article class="text-panel">
+            <h3>本季催化剂视角</h3>
+            <ul class="warning-list">
+              {% for item in report.catalysts[:3] %}
+              <li><strong>{{ item.label }}</strong>：{{ item.note }}</li>
+              {% endfor %}
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section class="page">
+        <div class="page-no">10 / {{ report.page_count }}</div>
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Quarterly Layer</p>
+            <h2>机构视角参考</h2>
+          </div>
+          <p class="section-note">补充公开媒体转述的头部机构观点，帮助把管理层口径与外部 sell-side 关注点放到同一页里对照。</p>
+        </div>
+        {% if report.institutional_views %}
+        <div class="street-view-grid">
+          {% for item in report.institutional_views[:4] %}
+          <article class="street-view-card">
+            <span>{{ item.firm }}</span>
+            <strong>{{ item.stance_label }}</strong>
+            {% if item.view_points %}
+            <ul class="street-view-points">
+              {% for point in item.view_points[:2] %}
+              <li>{{ point }}</li>
+              {% endfor %}
+            </ul>
+            {% else %}
+            <p>{{ item.summary }}</p>
+            {% endif %}
+            <small>{{ item.published_at }} · {{ item.source }}</small>
+            <a href="{{ item.link }}" target="_blank" rel="noreferrer">{{ item.headline }}</a>
+          </article>
+          {% endfor %}
+        </div>
+        {% else %}
+        <article class="text-panel street-view-empty">
+          <h3>当前未稳定抓到可追溯机构观点</h3>
+          <p>系统会优先展示带机构名、发布时间和链接的公开条目；若当前季度没有足够高质量结果，这一页会保留说明而不是硬拼内容。</p>
+        </article>
+        {% endif %}
+        <div class="page-split two-col compact-panels">
+          <article class="text-panel">
+            <h3>{{ report.institutional_digest.title }}</h3>
+            <ul class="warning-list">
+              {% for item in report.institutional_digest.bullets %}
+              <li>{{ item }}</li>
+              {% endfor %}
+            </ul>
+          </article>
+          <article class="text-panel">
+            <h3>使用边界</h3>
+            <ul class="warning-list">
+              <li>这一页只作为辅助参考，不替代官方财报新闻稿、SEC filing 和电话会原文。</li>
+              <li>优先关注机构与管理层是否围绕同一问题，例如 AI 需求、利润率、资本开支和指引兑现。</li>
+              <li>若机构视角与公司原文出现明显背离，应回到原始材料页继续核查。</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section class="page">
+        <div class="page-no">11 / {{ report.page_count }}</div>
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">12-Quarter Layer</p>
+            <h2>近 12 季成长总览</h2>
+          </div>
+          <p class="section-note">从单季结果切换到完整趋势视角，回答“这家公司过去 12 季到底发生了什么变化”。</p>
+        </div>
+        <div class="chart-card wide-card">{{ report.visuals.growth_overview | safe }}</div>
+        <div class="mini-card-grid three-col">
+          {% for item in report.historical_summary_cards %}
+          <article class="mini-card">
+            <span>{{ item.title }}</span>
+            <strong>{{ item.value }}</strong>
+            <small>{{ item.note }}</small>
+          </article>
+          {% endfor %}
+        </div>
+      </section>
+
+      <section class="page">
+        <div class="page-no">12 / {{ report.page_count }}</div>
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">12-Quarter Layer</p>
+            <h2>结构迁移与集中度</h2>
+          </div>
+          <p class="section-note">分部历史完整时展示真实结构迁移；缺失时明确给出降级解释而不是硬拼图表。</p>
+        </div>
+        <div class="chart-card wide-card">{{ report.visuals.structure_transition | safe }}</div>
+        <div class="page-split two-col">
+          <article class="text-panel">
+            <h3>结构判断</h3>
+            <p>
+              当前结构模式为 <strong>{{ report.structure_dimension_used }}</strong>。
+              {% if report.structure_dimension_used == 'segment' %}
+              可直接观察连续季度分部占比变化。
+              {% elif report.structure_dimension_used == 'geography' %}
+              历史业务分部不连续，因此这一页自动改为连续地区结构变化。
+              {% else %}
+              历史分部不完整，因此这一页转为结构限制说明与管理层结构判断。
+              {% endif %}
+            </p>
+          </article>
+          <article class="text-panel">
+            <h3>解读重点</h3>
+            <ul class="warning-list">
+              <li>看头部分部占比是否继续上升，还是开始扩散到第二增长曲线。</li>
+              <li>看集中度变化是否与利润率改善同向。</li>
+              <li>当结构数据不足时，要用管理层主题与最新季度结构一起补充判断。</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section class="page">
+        <div class="page-no">13 / {{ report.page_count }}</div>
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">12-Quarter Layer</p>
+            <h2>盈利质量与经营杠杆</h2>
+          </div>
+          <p class="section-note">不只观察收入，连同毛利率、净利率、收入同比和 ROE 一起读，判断兑现质量。</p>
+        </div>
+        <div class="chart-card wide-card">{{ report.visuals.profitability | safe }}</div>
+      </section>
+
+      <section class="page">
+        <div class="page-no">14 / {{ report.page_count }}</div>
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">12-Quarter Layer</p>
+            <h2>增长拆解与增量来源</h2>
+          </div>
+          <p class="section-note">回答“增长主要来自哪里、谁在拖累、结构是否更集中”。</p>
+        </div>
+        <div class="chart-card wide-card">{{ report.visuals.contribution | safe }}</div>
+      </section>
+
+      <section class="page">
+        <div class="page-no">15 / {{ report.page_count }}</div>
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">12-Quarter Layer</p>
+            <h2>趋势总结</h2>
+          </div>
+          <p class="section-note">把数据页收束成可以直接阅读的研究判断，同时保留证据锚点。</p>
+        </div>
+        <div class="insight-grid">
+          {% for item in report.historical_insights %}
+          <article class="insight-card">
+            <span>{{ item.title }}</span>
+            <strong>{{ item.body }}</strong>
+            <small>{{ item.evidence }}</small>
+          </article>
+          {% endfor %}
+        </div>
+      </section>
+
+      <section class="page">
+        <div class="page-no">16 / {{ report.page_count }}</div>
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Evidence Layer</p>
+            <h2>原始材料与证据摘录</h2>
+          </div>
+          <p class="section-note">用可追溯的材料卡片收尾，方便回到原始文件继续查证。</p>
+        </div>
+        <div class="source-grid">
+          {% for source in report.sources[:2] %}
+          <article class="source-card">
+            <span>{{ source.kind }}</span>
+            <strong>{{ source.label }}</strong>
+            <small>{{ source.date }}</small>
+            {% if source.material %}
+            <small>
+              抓取状态：
+              {% if source.material.status in ['fetched', 'cached'] %}
+              已提取文本
+              {% elif source.material.status == 'disabled' %}
+              当前环境未抓取
+              {% else %}
+              抓取失败
+              {% endif %}
+            </small>
+            {% if source.material.title %}
+            <p class="source-title">{{ source.material.title }}</p>
+            {% endif %}
+            {% if source.material.excerpt %}
+            <p class="source-excerpt">{{ source.material.excerpt }}</p>
+            {% endif %}
+            {% endif %}
+            <a href="{{ source.url }}" target="_blank" rel="noreferrer">{{ source.url }}</a>
+          </article>
+          {% endfor %}
+        </div>
+        {% if report.sources|length > 2 %}
+        <p class="section-footnote">其余 {{ report.sources|length - 2 }} 条源材料仍已纳入解析缓存；本页优先展示最关键、最可追溯的 2 条。</p>
+        {% endif %}
+        <div class="page-split two-col">
+          <article class="text-panel">
+            <h3>证据卡片</h3>
+            <ul class="warning-list">
+              {% for item in report.evidence_cards %}
+              <li>{{ item.text }}</li>
+              {% endfor %}
+            </ul>
+          </article>
+          <article class="text-panel">
+            <h3>当前覆盖情况</h3>
+            <ul class="warning-list">
+              {% for warning in report.coverage_warnings[:4] %}
+              <li>{{ warning }}</li>
+              {% endfor %}
+            </ul>
+          </article>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
