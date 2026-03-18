@@ -1,41 +1,130 @@
 # Earnings Digest Studio
 
-本地私用的深度版财报汇总工具。当前样本内置 `NVDA` 与 `AVGO`，支持：
+Earnings Digest Studio is a web-based research tool for generating high-density quarterly earnings reports as previewable HTML and exportable PDF.
 
-- 选择公司与自然季度
-- 生成图文并茂的 14 页深度版报告
-- 同时覆盖当季结果、电话会摘要、风险催化剂、近 12 季成长与结构分析
-- 网页预览与 PDF 导出共用同一份 HTML 模板
-- 可选上传 `PDF / TXT / HTML` transcript 作为电话会补充材料
+The product is designed for a single workflow:
 
-## 运行方式
+- choose a listed company
+- choose a calendar quarter
+- dynamically fetch official materials
+- parse KPI, structure, guidance, call highlights, and historical trend data
+- generate a polished deep-dive report automatically
+
+## What It Does
+
+- Generates `14-18` page deep-dive earnings reports
+- Covers current-quarter KPI, guidance, call themes, risks, catalysts, and evidence cards
+- Includes a fixed `12-quarter` growth, structure, and profitability module
+- Uses the same HTML template for web preview and PDF export
+- Supports optional transcript upload in `PDF / TXT / HTML`
+- Prioritizes official sources and uses local cache only to accelerate re-use
+
+## Tech Stack
+
+- FastAPI
+- Jinja2 templates
+- SVG-based chart rendering
+- Playwright for PDF export
+- SQLite for local report/job state
+
+## Quick Start
+
+### 1. Clone the repository
 
 ```bash
-cd /Users/yuwan/Documents/New\ project/earnings-digest-studio
-.venv/bin/uvicorn app.main:app --reload
+git clone https://github.com/coattail/Earnings-Digest-Studio.git
+cd Earnings-Digest-Studio
 ```
 
-打开：
+### 2. Create a virtual environment
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+### 3. Install dependencies
+
+```bash
+pip install -e .
+python -m playwright install chromium
+```
+
+### 4. Start the app
+
+```bash
+uvicorn app.main:app --reload
+```
+
+Then open:
 
 `http://127.0.0.1:8000`
 
-## 测试
+## Run Tests
 
 ```bash
-cd /Users/yuwan/Documents/New\ project/earnings-digest-studio
-.venv/bin/python -m unittest discover -s tests
+python -m unittest discover -s tests
 ```
 
-## 当前数据范围
+## Data Expectations
 
-- `NVDA`：内置最新季度样本，12 季结构页走完整 segment 模式
-- `AVGO`：内置最新季度样本，历史结构页按“结构降级”模式展示
+This repository can dynamically fetch official materials on demand, but it also expects two local structured data sources for baseline historical series and legacy segment support:
 
-## 说明
+- `../Tech-Analysis/data.js`
+- `../nvidia-revenue-chart/data/nvidia_quarterly_revenue_by_segment.csv`
 
-- 当前版本优先实现“深度版报告体验”与核心 API。
-- PDF 导出依赖 Playwright Chromium，首次使用前需要安装浏览器：
+These paths are referenced in [app/config.py](app/config.py).
 
-```bash
-.venv/bin/python -m playwright install chromium
+If you do not keep those repositories as sibling folders, you have two options:
+
+1. place the required datasets in equivalent relative locations
+2. update the path constants in [app/config.py](app/config.py) to match your local setup
+
+## Generated Data and Cache
+
+The app creates a local `data/` directory at runtime for:
+
+- `data/cache/`: official materials, discovered sources, and other reusable cache
+- `data/uploads/`: optional user-uploaded transcripts
+- `data/exports/`: generated PDF files
+- `data/earnings_digest.sqlite3`: local app database
+
+These files are not required to be committed. They can be deleted and rebuilt.
+
+## Repository Layout
+
+```text
+app/
+  main.py                  FastAPI entrypoint
+  config.py                app paths and shared constants
+  templates/               home page and report HTML templates
+  static/                  CSS and client-side JS
+  services/                parsing, report building, charts, export, and source resolution
+scripts/                   helper scripts for OCR and auditing
+tests/                     unittest suite
+data/                      runtime cache, exports, uploads, and SQLite state
 ```
+
+## Current Status
+
+The project already supports:
+
+- a web UI for company and quarter selection
+- preview and PDF export
+- dynamic official-source discovery
+- historical 12-quarter analysis
+- company-specific parser extensions for multiple large-cap U.S. and ADR names
+
+The codebase is still evolving, especially in:
+
+- historical parser coverage for older quarters
+- source normalization across companies
+- report-generation speed and cache strategy
+- layout refinement for edge-case reports
+
+## Notes
+
+- First-run report generation is slower because official materials may need to be discovered and downloaded.
+- Repeated generation is faster because reusable source/material cache is stored under `data/cache/`.
+- PDF export depends on Playwright Chromium being installed locally.
+
