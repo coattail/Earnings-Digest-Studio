@@ -58,7 +58,8 @@ def init_db() -> None:
 
 @contextmanager
 def get_connection() -> Iterator[sqlite3.Connection]:
-    ensure_directories()
+    # Self-heal if the runtime SQLite file was deleted or truncated while the app is running.
+    init_db()
     connection = sqlite3.connect(DB_PATH)
     connection.row_factory = sqlite3.Row
     try:
