@@ -27,6 +27,22 @@ The product is designed for a single workflow:
 - Playwright for PDF export
 - SQLite for local report/job state
 
+## System Flow
+
+```mermaid
+flowchart LR
+    A["Web UI<br/>company + quarter selection"] --> B["FastAPI endpoints"]
+    B --> C["Official source discovery"]
+    C --> D["Material hydration<br/>SEC / IR / presentation / transcript"]
+    D --> E["Company-specific + generic parsers"]
+    E --> F["Historical quarter cube builder"]
+    F --> G["Report payload assembler"]
+    G --> H["HTML preview"]
+    G --> I["PDF export via Playwright"]
+    D --> J["Local cache"]
+    G --> K["SQLite report/job state"]
+```
+
 ## Quick Start
 
 ### 1. Clone the repository
@@ -64,6 +80,49 @@ Then open:
 
 ```bash
 python -m unittest discover -s tests
+```
+
+## API Overview
+
+The app ships with both page routes and JSON endpoints.
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/` | `GET` | Home page |
+| `/companies` | `GET` | List supported companies and themes |
+| `/companies/{company_id}/quarters` | `GET` | Return available quarter options |
+| `/uploads` | `POST` | Upload transcript material |
+| `/reports` | `POST` | Generate a report synchronously |
+| `/report-jobs` | `POST` | Start async report generation with progress |
+| `/report-jobs/{job_id}` | `GET` | Poll job progress |
+| `/reports/{report_id}` | `GET` | Return report payload |
+| `/reports/{report_id}/preview` | `GET` | Open HTML preview |
+| `/reports/{report_id}/export.pdf` | `POST` | Export report to PDF |
+| `/reports/{report_id}/download.pdf` | `GET` | Download generated PDF |
+
+### Example: create a report job
+
+```bash
+curl -X POST http://127.0.0.1:8000/report-jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "company_id": "alphabet",
+    "calendar_quarter": "2025Q4",
+    "history_window": 12,
+    "force_refresh": false
+  }'
+```
+
+### Main request body
+
+```json
+{
+  "company_id": "alphabet",
+  "calendar_quarter": "2025Q4",
+  "history_window": 12,
+  "manual_transcript_upload_id": null,
+  "force_refresh": false
+}
 ```
 
 ## Data Expectations
@@ -105,6 +164,14 @@ tests/                     unittest suite
 data/                      runtime cache, exports, uploads, and SQLite state
 ```
 
+## Parsing Strategy
+
+- Prefer official-source parsing over static fixtures whenever source material is available.
+- Combine company-specific parsers with generic parsing instead of relying on one universal extractor.
+- Backfill historical structure and KPI fields quarter by quarter when the latest report alone is not enough.
+- Keep cache as a speed layer only, not as the product itself.
+- Make disclosure limitations explicit when an issuer truly does not publish a stable split.
+
 ## Current Status
 
 The project already supports:
@@ -122,9 +189,68 @@ The codebase is still evolving, especially in:
 - report-generation speed and cache strategy
 - layout refinement for edge-case reports
 
+## FAQ
+
+### Is this a pre-baked report library?
+
+No. The intended workflow is on-demand generation. The app discovers official materials, fetches them, parses them, and assembles a report when the user requests one. Local cache exists only to speed up repeated runs.
+
+### Why is first-run report generation sometimes slow?
+
+Because the pipeline may need to:
+
+- discover official IR and SEC sources
+- download or hydrate source materials
+- parse long filings, decks, and call materials
+- backfill a 12-quarter historical window
+
+Repeat runs are faster because source and material cache can be re-used.
+
+### Can I delete the `data/` folder?
+
+You can safely delete cache, exports, uploads, and the SQLite database. The app will recreate runtime directories automatically. Deleting them just removes local state and cached materials.
+
+### Why do some companies still need custom parser logic?
+
+Official disclosure formats vary widely across issuers and across time. The codebase uses both generic parsing and company-specific parsing to keep structure, KPI, and geography extraction usable across current and historical quarters.
+
+### Does the project require downloaded source libraries committed to git?
+
+No. Runtime source files live under `data/cache/` and are ignored by git. The repository only stores code, templates, tests, and lightweight directory placeholders.
+
+## Roadmap
+
+- Improve older-quarter parser coverage across the full company pool
+- Reduce first-run latency for deep historical backfill
+- Further normalize geography and segment taxonomy across issuers
+- Improve progress reporting so long stages feel more truthful
+- Expand report QA around edge-case layouts and sparse disclosures
+- Add more maintainable source adapters for companies with unstable IR pages
+
+## Contributing
+
+Contributions are welcome, especially in these areas:
+
+- parser robustness
+- PDF layout quality
+- source discovery reliability
+- test coverage for historical edge cases
+- documentation and setup experience
+
+Suggested workflow:
+
+1. Fork the repository
+2. Create a feature branch
+3. Add or update tests when behavior changes
+4. Keep runtime cache and generated files out of commits
+5. Open a pull request with a concise explanation of the change
+
+## License
+
+No license has been added yet. Until a license is explicitly published, reuse rights are not granted by default.
+
 ## Notes
 
 - First-run report generation is slower because official materials may need to be discovered and downloaded.
 - Repeated generation is faster because reusable source/material cache is stored under `data/cache/`.
 - PDF export depends on Playwright Chromium being installed locally.
-
