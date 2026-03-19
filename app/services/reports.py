@@ -16,6 +16,7 @@ from ..utils import json_dumps, now_iso
 from .charts import (
     format_money_bn,
     format_pct,
+    render_company_wordmark_svg,
     render_contribution_svg,
     render_current_quarter_svg,
     render_dual_ranked_svg,
@@ -60,7 +61,7 @@ REPORT_JOB_FUTURES_LOCK = threading.Lock()
 ProgressCallback = Callable[[float, str, str], None]
 RECENT_REPORT_CACHE_TTL_SECONDS = 6 * 60 * 60
 HISTORICAL_REPORT_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
-REPORT_PAYLOAD_SCHEMA_VERSION = 5
+REPORT_PAYLOAD_SCHEMA_VERSION = 8
 
 
 def _progress_value(value: float) -> float:
@@ -119,6 +120,23 @@ def _ttm_sum(entries: list[dict[str, Any]], key: str, end_index: int) -> Optiona
     if any(value is None for value in values):
         return None
     return float(sum(float(value) for value in values))
+
+
+def _ttm_roe_pct(entries: list[dict[str, Any]], end_index: int) -> Optional[float]:
+    ttm_net_income = _ttm_sum(entries, "net_income_bn", end_index)
+    if ttm_net_income is None:
+        return None
+    equity_window = [entries[position].get("equity_bn") for position in range(max(0, end_index - 4), end_index + 1)]
+    equity_values = [float(value) for value in equity_window if value not in (None, 0)]
+    if len(equity_values) < 2:
+        return None
+    average_equity = sum(equity_values) / len(equity_values)
+    if average_equity <= 0:
+        return None
+    roe_pct = float(ttm_net_income) / average_equity * 100
+    if -100 < roe_pct < 250:
+        return roe_pct
+    return None
 
 
 def _quarter_parts(calendar_quarter: str) -> tuple[int, int]:
@@ -265,17 +283,37 @@ def _clean_summary_fragment(text: Optional[str]) -> Optional[str]:
     return cleaned or None
 
 
+def _segment_name_token(name: str) -> str:
+    normalized = str(name or "").strip().casefold()
+    normalized = normalized.replace("&", " and ")
+    normalized = normalized.replace("/", " ")
+    normalized = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
 def _normalize_segment_items(company: dict[str, Any], segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     company_id = str(company.get("id") or "")
     aliases = dict(company.get("segment_aliases") or {})
     display_order = list(company.get("segment_order") or [])
     if not display_order:
         display_order = [str(profile.get("name") or "") for profile in COMPANY_SEGMENT_PROFILES.get(str(company.get("id") or ""), [])]
+    alias_tokens = {
+        _segment_name_token(alias): canonical
+        for alias, canonical in aliases.items()
+        if _segment_name_token(alias)
+    }
+    canonical_tokens = {
+        _segment_name_token(name): name
+        for name in display_order
+        if _segment_name_token(name)
+    }
     order_index = {name: index for index, name in enumerate(display_order)}
     normalized: list[dict[str, Any]] = []
     merged_by_name: dict[str, dict[str, Any]] = {}
     for original_index, raw in enumerate(segments):
-        name = aliases.get(str(raw.get("name") or "").strip(), str(raw.get("name") or "").strip())
+        raw_name = str(raw.get("name") or "").strip()
+        token = _segment_name_token(raw_name)
+        name = aliases.get(raw_name, alias_tokens.get(token, canonical_tokens.get(token, raw_name)))
         if not name:
             continue
         payload = dict(raw)
@@ -309,18 +347,334 @@ def _normalize_segment_items(company: dict[str, Any], segments: list[dict[str, A
     return normalized
 
 
+def _build_report_style(company: dict[str, Any]) -> dict[str, str]:
+    style = dict(company.get("report_style") or {})
+    description = str(company.get("description") or "")
+    base = {
+        "cover_eyebrow": "Deep Quarterly Digest",
+        "quarterly_label": "Quarterly Layer",
+        "historical_label": "12-Quarter Layer",
+        "evidence_label": "Evidence Layer",
+        "cover_tagline": description,
+        "quarterly_lens": str(company.get("card_headline") or description),
+        "historical_lens": "12 季成长、结构迁移与利润兑现",
+        "evidence_lens": "官方财报新闻稿、SEC filing、演示稿与电话会原文",
+        "cover_rhythm": "structured",
+        "section_divider": "beam",
+    }
+    base.update({key: str(value) for key, value in style.items() if value})
+    return base
+
+
+def _build_section_meta(company: dict[str, Any]) -> dict[str, dict[str, str]]:
+    style = _build_report_style(company)
+
+    def _note(base: str, lens: str) -> str:
+        return f"{base} 这一页重点围绕 {lens} 展开。"
+
+    return {
+        "cover": {
+            "eyebrow": style["cover_eyebrow"],
+            "note": style["cover_tagline"],
+        },
+        "summary": {
+            "eyebrow": style["quarterly_label"],
+            "note": _note("把公司、季度、收入兑现、现金流与结构模式压缩到一页内快速浏览。", style["quarterly_lens"]),
+        },
+        "current_quarter": {
+            "eyebrow": style["quarterly_label"],
+            "note": _note("收入、净利润、毛利率一页并读，强调当季、上季与去年同期的相对位置。", style["quarterly_lens"]),
+        },
+        "guidance": {
+            "eyebrow": style["quarterly_label"],
+            "note": "",
+        },
+        "mix": {
+            "eyebrow": style["quarterly_label"],
+            "note": _note("同页并读业务结构与地区结构，让“增长来自哪里”不只停留在一句话上。", style["quarterly_lens"]),
+        },
+        "income_statement": {
+            "eyebrow": style["quarterly_label"],
+            "note": _note("以利润表路径串起收入、成本、经营费用和净利润，帮助快速看清当季兑现结构。", style["quarterly_lens"]),
+        },
+        "translation": {
+            "eyebrow": style["quarterly_label"],
+            "note": _note("将收入、成本、费用与利润科目直译为中文，同时保留英文原词，方便快速比对官方利润表。", style["quarterly_lens"]),
+        },
+        "management_qna": {
+            "eyebrow": style["quarterly_label"],
+            "note": _note("不做大段 transcript 堆砌，而是用主题强度、关键摘录和证据卡片组织阅读。", style["quarterly_lens"]),
+        },
+        "risks": {
+            "eyebrow": style["quarterly_label"],
+            "note": _note("保持图表化表达，避免把风险和催化剂写成大段纯文字备忘录。", style["quarterly_lens"]),
+        },
+        "views": {
+            "eyebrow": style["quarterly_label"],
+            "note": _note("补充公开媒体转述的头部机构观点，帮助把管理层口径与外部 sell-side 关注点放到同一页里对照。", style["quarterly_lens"]),
+        },
+        "growth": {
+            "eyebrow": style["historical_label"],
+            "note": _note("从单季结果切换到完整趋势视角，回答“这家公司过去 12 季到底发生了什么变化”。", style["historical_lens"]),
+        },
+        "transition": {
+            "eyebrow": style["historical_label"],
+            "note": _note("分部历史完整时展示真实结构迁移；缺失时明确给出降级解释而不是硬拼图表。", style["historical_lens"]),
+        },
+        "profitability": {
+            "eyebrow": style["historical_label"],
+            "note": _note("不只观察收入，连同毛利率、净利率、收入同比和 ROE 一起读，判断兑现质量。", style["historical_lens"]),
+        },
+        "contribution": {
+            "eyebrow": style["historical_label"],
+            "note": _note("回答“增长主要来自哪里、谁在拖累、结构是否更集中”。", style["historical_lens"]),
+        },
+        "insights": {
+            "eyebrow": style["historical_label"],
+            "note": _note("把数据页收束成可以直接阅读的研究判断，同时保留证据锚点。", style["historical_lens"]),
+        },
+        "evidence": {
+            "eyebrow": style["evidence_label"],
+            "note": _note("用可追溯的材料卡片收尾，方便回到原始文件继续查证。", style["evidence_lens"]),
+        },
+    }
+
+
+def _short_section_text(text: Optional[str], limit: int = 58) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip(" ，,；;。")
+    if not cleaned:
+        return ""
+    return _excerpt_text(cleaned, limit).rstrip(".") + "。"
+
+
+def _section_label(name: Optional[str]) -> str:
+    raw = re.sub(r"\s+", " ", str(name or "")).strip()
+    if not raw:
+        return ""
+    aliases = {
+        "Wearables, Home and Accessories": "Wearables",
+        "Google subscriptions, platforms, and devices": "Google subs",
+        "Google Search & other": "Search",
+        "Productivity and Business Processes": "Productivity",
+        "More Personal Computing": "Personal Computing",
+        "Intelligent Cloud": "Cloud",
+        "Americas Excluding U.S.": "Americas ex-U.S.",
+        "Rest of Asia Pacific": "Rest of APAC",
+        "Google properties": "Google properties",
+    }
+    if raw in aliases:
+        return aliases[raw]
+    if len(raw) <= 18:
+        return raw
+    compact = raw.replace(" and ", " & ").replace(", ", " / ")
+    return compact if len(compact) <= 22 else _excerpt_text(compact, 22).rstrip(".")
+
+
+def _section_item_name(items: list[dict[str, Any]]) -> Optional[str]:
+    valid_items = [item for item in items if item.get("value_bn") is not None]
+    if not valid_items:
+        return None
+    return str(max(valid_items, key=lambda item: float(item.get("value_bn") or 0.0)).get("name") or "").strip() or None
+
+
+def _history_start_end_revenue_text(history: list[dict[str, Any]], money_symbol: str) -> Optional[str]:
+    if not history:
+        return None
+    start = history[0]
+    latest = history[-1]
+    if start.get("revenue_bn") is None or latest.get("revenue_bn") is None:
+        return None
+    return (
+        f"12 季收入从 {format_money_bn(start.get('revenue_bn'), money_symbol)} "
+        f"走到 {format_money_bn(latest.get('revenue_bn'), money_symbol)}。"
+    )
+
+
+def _history_delta_leader(history: list[dict[str, Any]]) -> Optional[str]:
+    if len(history) < 2:
+        return None
+    first_segments = {str(item.get("name") or ""): float(item.get("value_bn") or 0.0) for item in list(history[0].get("segments") or [])}
+    latest_segments = {str(item.get("name") or ""): float(item.get("value_bn") or 0.0) for item in list(history[-1].get("segments") or [])}
+    candidates: list[tuple[str, float]] = []
+    for name, latest_value in latest_segments.items():
+        candidates.append((name, latest_value - first_segments.get(name, 0.0)))
+    candidates = [item for item in candidates if item[0] and item[1] > 0.05]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[1])[0]
+
+
+def _build_dynamic_section_meta(
+    company: dict[str, Any],
+    fixture: dict[str, Any],
+    history: list[dict[str, Any]],
+    *,
+    structure_dimension: str,
+    money_symbol: str,
+    institutional_views: list[dict[str, Any]],
+    transcript_summary: Optional[dict[str, Any]],
+    qna_topics: list[dict[str, Any]],
+    merged_sources: list[dict[str, Any]],
+    guidance_note: str,
+) -> dict[str, dict[str, str]]:
+    meta = _build_section_meta(company)
+    latest_kpis = dict(fixture.get("latest_kpis") or {})
+    latest = history[-1] if history else {}
+    revenue_bn = _value_or_history(latest_kpis.get("revenue_bn"), latest.get("revenue_bn"))
+    net_income_bn = _value_or_history(latest_kpis.get("net_income_bn"), latest.get("net_income_bn"))
+    gross_margin_pct = _metric_or_fallback(latest_kpis.get("gaap_gross_margin_pct"), latest.get("gross_margin_pct"))
+    top_segment = _section_label(_section_item_name(list(fixture.get("current_segments") or [])))
+    top_geo = _section_label(_section_item_name(list(fixture.get("current_geographies") or [])))
+    top_risk = _section_label(str(((fixture.get("risks") or [{}])[0]).get("label") or "").strip())
+    top_catalyst = _section_label(str(((fixture.get("catalysts") or [{}])[0]).get("label") or "").strip())
+    top_qna = _section_label(str(((qna_topics or [{}])[0]).get("label") or "").strip())
+    second_qna = _section_label(str(((qna_topics or [{}, {}])[1]).get("label") or "").strip()) if len(qna_topics) > 1 else ""
+    first_source = str(((merged_sources or [{}])[0]).get("label") or "").strip()
+    leading_view = _section_label(str(((institutional_views or [{}])[0]).get("firm") or "").strip())
+    growth_driver = _section_label(_history_delta_leader(history))
+    start_end_text = _history_start_end_revenue_text(history, money_symbol)
+    guidance = dict(fixture.get("guidance") or {})
+    guidance_revenue = guidance.get("revenue_bn")
+    guidance_mode = str(guidance.get("mode") or "proxy")
+    guidance_revenue_text = (
+        f"下一阶段收入参考约 {format_money_bn(guidance_revenue, money_symbol)}。"
+        if guidance_revenue is not None
+        else None
+    )
+    transition_focus = None
+    if structure_dimension == "segment":
+        first_name = _section_label(_section_item_name(list(history[0].get("segments") or []))) if history else None
+        latest_name = _section_label(_section_item_name(list(history[-1].get("segments") or []))) if history else None
+        if first_name and latest_name:
+            transition_focus = (
+                f"先看头部分部是否仍是 {latest_name}。"
+                if first_name == latest_name
+                else f"头部分部已从 {first_name} 切换到 {latest_name}。"
+            )
+    elif structure_dimension == "geography":
+        transition_focus = "这一页按地区口径阅读，比硬拼分部更可信。"
+    else:
+        transition_focus = "结构历史不连续，重点看趋势而不是强行读占比。"
+
+    meta["summary"]["note"] = _short_section_text(
+        "先看收入与净利润，再看头部业务和头部地区是否共同支撑本季结果。"
+        if top_segment and top_geo
+        else "先看收入、利润与结构模式，再决定后面几页该优先追哪条主线。"
+    )
+    meta["current_quarter"]["note"] = _short_section_text(
+        (
+            f"本季收入 {format_money_bn(revenue_bn, money_symbol)}、净利润 {format_money_bn(net_income_bn, money_symbol)}，"
+            f"毛利率 {format_pct(gross_margin_pct)}，先看兑现强度。"
+        )
+        if revenue_bn is not None and net_income_bn is not None and gross_margin_pct is not None
+        else "把本季收入、利润和利润率放到同一页里读，先判断结果是否真的兑现。"
+    )
+    meta["guidance"]["note"] = _short_section_text(
+        guidance_note
+        if guidance_mode == "proxy"
+        else (
+            f"{guidance_revenue_text or '这一页优先读官方指引区间与语气。'} 看管理层给出的下一阶段目标，是否承接本季结果。"
+            if guidance_mode == "official"
+            else "公司没有给出明确数值指引时，先读官方展望语气，再看经营基线是否能接住。"
+        )
+    )
+    meta["mix"]["note"] = _short_section_text(
+        (
+            f"业务侧先看 {top_segment}，地区侧再看 {top_geo}；两边是否共振，比单看占比更重要。"
+            if top_segment and top_geo
+            else f"先抓头部结构 {top_segment or top_geo or '主线'}，再判断增长到底来自结构改善还是总量回升。"
+        )
+    )
+    meta["income_statement"]["note"] = _short_section_text(
+        (
+            f"{top_segment or '头部业务'}把收入盘子撑到 {format_money_bn(revenue_bn, money_symbol)}，"
+            f"最后留在净利润端的是 {format_money_bn(net_income_bn, money_symbol)}；成本率和税项是主线。"
+        )
+        if revenue_bn is not None and net_income_bn is not None
+        else "这一页真正要盯的是成本率、费用率和税项，别只看净利润结果。"
+    )
+    meta["translation"]["note"] = _short_section_text(
+        f"把 {top_segment or '收入主线'}、成本和利润率三组科目先认熟，后面回看财报原文会快很多。"
+    )
+    meta["management_qna"]["note"] = _short_section_text(
+        (
+            f"电话会先抓管理层反复强调的 {top_qna}，再看问答是否追问 {second_qna or top_risk or '增长持续性'}。"
+            if transcript_summary or "call_summary" in list(fixture.get("materials") or [])
+            else f"当前没有完整 transcript 时，先围绕 {top_qna or top_segment or '经营主线'} 读研究关注点。"
+        )
+    )
+    meta["risks"]["note"] = _short_section_text(
+        (
+            f"风险先看 {top_risk}，催化剂再看 {top_catalyst}；关键不在谁更响，而在谁离下一季更近。"
+            if top_risk and top_catalyst
+            else "把风险和催化剂放在同一页，是为了判断下一季究竟更可能被什么主导。"
+        )
+    )
+    meta["views"]["note"] = _short_section_text(
+        (
+            f"{leading_view} 的问题最接近市场焦点；真正有价值的是它和管理层口径有没有偏差。"
+            if leading_view
+            else "把机构页当成市场问题清单来用，比把它当结论页更有价值。"
+        )
+    )
+    meta["growth"]["note"] = _short_section_text(
+        (
+            f"{start_end_text} 这一页先看总量，再看 {growth_driver or top_segment or '业务结构'} 是否成为主要驱动。"
+            if start_end_text
+            else "先看 12 季总收入斜率，再看结构分层是否同步发生变化。"
+        )
+    )
+    meta["transition"]["note"] = _short_section_text(transition_focus or "这一页重点读结构迁移，而不是只读静态占比。")
+    meta["profitability"]["note"] = _short_section_text(
+        (
+            f"别只看收入；毛利率 {format_pct(gross_margin_pct)} 与净利率 {format_pct(latest.get('net_margin_pct'))} 是否同向改善，决定增长质量。"
+            if gross_margin_pct is not None and latest.get("net_margin_pct") is not None
+            else "这一页真正想回答的是，收入增长有没有顺利兑现成更好的利润质量。"
+        )
+    )
+    meta["contribution"]["note"] = _short_section_text(
+        (
+            f"若看增量来源，先盯 {growth_driver}；它决定了过去 12 季里最主要的增长斜率。"
+            if growth_driver
+            else "这一页的核心不是画更多条形图，而是回答增长究竟来自哪里。"
+        )
+    )
+    meta["insights"]["note"] = _short_section_text(
+        "这一页把前面分散的数据页收束成判断，重点看加速、集中与利润兑现能否同时成立。"
+    )
+    meta["evidence"]["note"] = _short_section_text(
+        (
+            f"回到 {first_source} 和电话会锚点继续核对；这份报告里的关键判断都应能追溯到原始材料。"
+            if first_source
+            else "最后一页不是装饰，而是用来把结论重新钉回原始材料。"
+        )
+    )
+    return meta
+
+
 REGIONAL_STRUCTURE_NAMES = {
     "north america",
     "international",
+    "other international",
     "united states",
+    "u s",
+    "u.s.",
+    "u.s",
     "united states and canada",
     "other countries",
     "americas",
+    "americas excluding united states",
+    "americas excluding u.s.",
+    "americas excluding us",
+    "other americas",
     "europe",
     "greater china",
     "japan",
     "rest of asia pacific",
     "rest of asia-pacific",
+    "other asia pacific",
+    "other asia-pacific",
+    "rest of asia",
     "asia",
     "asia-pacific",
     "asia pacific",
@@ -328,12 +682,53 @@ REGIONAL_STRUCTURE_NAMES = {
     "apj",
     "emea",
     "europe, the middle east and africa",
+    "europe middle east africa",
+    "europe / middle east / africa",
+    "middle east and africa",
     "latin america / caribbean",
     "latin america/caribbean",
+    "south korea",
+    "singapore",
     "taiwan",
     "china",
+    "china including hong kong",
+    "mainland china excluding hong kong",
+    "hong kong",
+    "non u.s.",
+    "non-u.s.",
+    "rest of world",
     "others",
+    "other",
 }
+
+REGIONAL_STRUCTURE_TOKENS = (
+    "america",
+    "americas",
+    "asia",
+    "apac",
+    "apj",
+    "canada",
+    "china",
+    "country",
+    "countries",
+    "emea",
+    "europe",
+    "hong kong",
+    "international",
+    "japan",
+    "korea",
+    "latin",
+    "middle east",
+    "non u s",
+    "other international",
+    "other countries",
+    "pacific",
+    "singapore",
+    "taiwan",
+    "u s",
+    "united states",
+    "world",
+)
 
 
 def _minimum_required_segment_count(company: dict[str, Any]) -> int:
@@ -388,6 +783,41 @@ def _segments_look_incomplete_for_company(
     if names and names.issubset(REGIONAL_STRUCTURE_NAMES) and len(list(company.get("segment_order") or [])) >= 3:
         return True
     return False
+
+
+def _structure_names_are_geography_like(
+    company: dict[str, Any],
+    names: list[str],
+) -> bool:
+    cleaned = [_segment_name_token(name) for name in names if _segment_name_token(name)]
+    if not cleaned:
+        return False
+    canonical_tokens = {
+        _segment_name_token(name)
+        for name in list(company.get("segment_order") or [])
+        if _segment_name_token(name)
+    }
+    overlap_count = sum(token in canonical_tokens for token in cleaned)
+    if set(cleaned).issubset(REGIONAL_STRUCTURE_NAMES) and overlap_count < len(cleaned):
+        return True
+    geography_like_count = sum(
+        any(marker in token for marker in REGIONAL_STRUCTURE_TOKENS)
+        for token in cleaned
+    )
+    return geography_like_count == len(cleaned) and overlap_count < len(cleaned)
+
+
+def _segments_are_geography_like(
+    company: dict[str, Any],
+    segments: list[dict[str, Any]],
+) -> bool:
+    normalized = _normalize_segment_items(company, list(segments or []))
+    if not normalized:
+        return False
+    return _structure_names_are_geography_like(
+        company,
+        [str(item.get("name") or "") for item in normalized],
+    )
 
 
 def _excerpt_text(text: Optional[str], limit: int) -> str:
@@ -822,6 +1252,7 @@ def build_historical_quarter_cube(
         gross_margin = series["grossMargin"].get(period)
         revenue_yoy = series["revenueGrowth"].get(period)
         roe = series["roe"].get(period)
+        equity = series.get("equity", {}).get(period)
         period_end = _resolved_period_end(
             period,
             series_period_end=_series_period_end(series, period),
@@ -861,6 +1292,7 @@ def build_historical_quarter_cube(
                 "release_date": release_date,
                 "revenue_bn": float(revenue) / 1_000_000_000 if revenue is not None else None,
                 "net_income_bn": float(earnings) / 1_000_000_000 if earnings is not None else None,
+                "equity_bn": float(equity) / 1_000_000_000 if equity is not None else None,
                 "gross_margin_pct": float(gross_margin) if gross_margin is not None else None,
                 "revenue_yoy_pct": float(revenue_yoy) if revenue_yoy is not None else None,
                 "roe_pct": float(roe) if roe is not None else None,
@@ -890,6 +1322,9 @@ def build_historical_quarter_cube(
             entry["ttm_revenue_growth_pct"] = (float(entry["ttm_revenue_bn"]) / float(previous_ttm) - 1) * 100
         else:
             entry["ttm_revenue_growth_pct"] = None
+        recomputed_roe_pct = _ttm_roe_pct(entries, index)
+        if recomputed_roe_pct is not None:
+            entry["roe_pct"] = recomputed_roe_pct
     return _sanitize_history_quality_metrics(entries)
 
 
@@ -949,14 +1384,87 @@ def _normalize_historical_geographies(
     return normalized
 
 
-def _valid_segment_history_entry(company: dict[str, Any], entry: dict[str, Any]) -> bool:
+def _historical_segment_reference_profile(
+    company: dict[str, Any],
+    history: list[dict[str, Any]],
+) -> dict[str, Any]:
+    expected_names = [
+        str(item.get("name") or "")
+        for item in _normalize_segment_items(
+            company,
+            [{"name": name} for name in list(company.get("segment_order") or [])],
+        )
+        if str(item.get("name") or "")
+    ]
+    observed_lists: list[list[str]] = []
+    frequency: Counter[str] = Counter()
+    for entry in history:
+        normalized = _normalize_historical_segments(company, list(entry.get("segments") or []), entry.get("revenue_bn"))
+        names = [str(item.get("name") or "") for item in normalized if str(item.get("name") or "")]
+        if not names:
+            continue
+        lowered = {name.casefold() for name in names}
+        if lowered and lowered.issubset(REGIONAL_STRUCTURE_NAMES):
+            continue
+        observed_lists.append(names)
+        frequency.update(dict.fromkeys(names, 1))
+
+    reference_names = list(expected_names)
+    observed_ranked = sorted(
+        frequency.items(),
+        key=lambda item: (-item[1], reference_names.index(item[0]) if item[0] in reference_names else len(reference_names)),
+    )
+    for name, _count in observed_ranked:
+        if name not in reference_names:
+            reference_names.append(name)
+
+    observed_counts = sorted(len(names) for names in observed_lists if names)
+    median_count = observed_counts[len(observed_counts) // 2] if observed_counts else len(reference_names)
+    target_count = max(
+        _minimum_required_segment_count(company),
+        min(
+            len(reference_names) or median_count or 1,
+            max(2, round(max(median_count or 0, _minimum_required_segment_count(company)) * 0.8)),
+        ),
+    )
+    stable_threshold = max(2, round(len(observed_lists) * 0.4)) if observed_lists else 0
+    core_names = [
+        name
+        for name in reference_names
+        if frequency.get(name, 0) >= stable_threshold
+    ][:2]
+    if not core_names:
+        core_names = reference_names[: min(2, len(reference_names))]
+    return {
+        "reference_names": reference_names,
+        "target_count": target_count,
+        "core_names": core_names,
+    }
+
+
+def _valid_segment_history_entry(
+    company: dict[str, Any],
+    entry: dict[str, Any],
+    reference_profile: Optional[dict[str, Any]] = None,
+) -> bool:
     normalized = _normalize_historical_segments(company, list(entry.get("segments") or []), entry.get("revenue_bn"))
     if not normalized:
         return False
-    names = {str(item.get("name") or "").casefold() for item in normalized}
-    if names and names.issubset(REGIONAL_STRUCTURE_NAMES) and len(list(company.get("segment_order") or [])) >= 3:
+    if _structure_names_are_geography_like(
+        company,
+        [str(item.get("name") or "") for item in normalized],
+    ):
         return False
-    if len(normalized) < _minimum_required_segment_count(company):
+    reference_profile = reference_profile or _historical_segment_reference_profile(company, [entry])
+    target_count = int(reference_profile.get("target_count") or _minimum_required_segment_count(company))
+    if len(normalized) < target_count:
+        return False
+    reference_names = set(str(name) for name in list(reference_profile.get("reference_names") or []))
+    if reference_names and len([item for item in normalized if str(item.get("name") or "") in reference_names]) < target_count:
+        return False
+    core_names = set(str(name) for name in list(reference_profile.get("core_names") or []))
+    required_core_count = min(len(core_names), 2 if target_count >= 4 else 1)
+    if core_names and len([item for item in normalized if str(item.get("name") or "") in core_names]) < required_core_count:
         return False
     return True
 
@@ -966,7 +1474,12 @@ def _harmonize_historical_structures(
     history: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     harmonized = [dict(entry) for entry in history]
-    segment_indexes = [index for index, entry in enumerate(harmonized) if _valid_segment_history_entry(company, entry)]
+    reference_profile = _historical_segment_reference_profile(company, harmonized)
+    segment_indexes = [
+        index
+        for index, entry in enumerate(harmonized)
+        if _valid_segment_history_entry(company, entry, reference_profile)
+    ]
     geography_indexes = [index for index, entry in enumerate(harmonized) if _normalize_historical_geographies(list(entry.get("geographies") or []), entry.get("revenue_bn"))]
     target_basis: Optional[str] = None
     if segment_indexes:
@@ -979,7 +1492,7 @@ def _harmonize_historical_structures(
         if geographies:
             entry["geographies"] = geographies
         if target_basis == "segment":
-            if _valid_segment_history_entry(company, entry):
+            if _valid_segment_history_entry(company, entry, reference_profile):
                 entry["segments"] = _normalize_historical_segments(company, list(entry.get("segments") or []), entry.get("revenue_bn"))
                 entry["structure_basis"] = "segment"
             else:
@@ -988,7 +1501,7 @@ def _harmonize_historical_structures(
                     entry["geographies"] = geographies
                 entry["structure_basis"] = None
         elif target_basis == "geography" and geographies:
-            entry["segments"] = geographies
+            entry["segments"] = []
             entry["structure_basis"] = "geography"
         harmonized[index] = entry
     return harmonized
@@ -1002,6 +1515,11 @@ def _historical_segment_share_map(
     if not segments:
         return {}
     normalized = _normalize_historical_segments(company, segments, entry.get("revenue_bn"))
+    if _structure_names_are_geography_like(
+        company,
+        [str(item.get("name") or "") for item in normalized],
+    ):
+        return {}
     share_map = {
         str(item.get("name") or "Business"): float(item.get("share_pct") or 0.0) / 100
         for item in normalized
@@ -1016,16 +1534,22 @@ def _historical_segment_share_map(
 def _is_complete_segment_snapshot(
     company: dict[str, Any],
     entry: dict[str, Any],
+    reference_profile: Optional[dict[str, Any]] = None,
 ) -> bool:
+    if _segments_are_geography_like(company, list(entry.get("segments") or [])):
+        return False
     share_map = _historical_segment_share_map(company, entry)
     if not share_map:
         return False
-    expected_names = [str(name) for name in list(company.get("segment_order") or [])]
-    if expected_names:
-        min_required = 2 if len(expected_names) <= 2 else 3
-    else:
-        min_required = 2
-    if len(share_map) < min_required:
+    reference_profile = reference_profile or _historical_segment_reference_profile(company, [entry])
+    reference_names = set(str(name) for name in list(reference_profile.get("reference_names") or []))
+    target_count = int(reference_profile.get("target_count") or _minimum_required_segment_count(company))
+    overlap_count = len([name for name in share_map if not reference_names or name in reference_names])
+    if overlap_count < target_count:
+        return False
+    core_names = set(str(name) for name in list(reference_profile.get("core_names") or []))
+    required_core_count = min(len(core_names), 2 if target_count >= 4 else 1)
+    if core_names and len([name for name in share_map if name in core_names]) < required_core_count:
         return False
     total = sum(share_map.values())
     return 0.92 <= total <= 1.08
@@ -1036,13 +1560,18 @@ def _backfill_historical_segment_history(
     history: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     enriched = [dict(entry) for entry in history]
+    reference_profile = _historical_segment_reference_profile(company, enriched)
     expected_names = [str(name) for name in list(company.get("segment_order") or [])]
     for entry in enriched:
         for segment in list(entry.get("segments") or []):
             name = str(segment.get("name") or "")
             if name and name not in expected_names:
                 expected_names.append(name)
-    valid_indexes = [index for index, entry in enumerate(enriched) if _is_complete_segment_snapshot(company, entry)]
+    valid_indexes = [
+        index
+        for index, entry in enumerate(enriched)
+        if _is_complete_segment_snapshot(company, entry, reference_profile)
+    ]
     if len(valid_indexes) < 2 or not expected_names:
         return enriched
 
@@ -1133,6 +1662,9 @@ def _recompute_history_derivatives(history: list[dict[str, Any]]) -> list[dict[s
             entry["ttm_revenue_growth_pct"] = (float(entry["ttm_revenue_bn"]) / float(previous_ttm) - 1) * 100
         else:
             entry["ttm_revenue_growth_pct"] = None
+        recomputed_roe_pct = _ttm_roe_pct(recomputed, index)
+        if recomputed_roe_pct is not None:
+            entry["roe_pct"] = recomputed_roe_pct
         recomputed[index] = entry
     return recomputed
 
@@ -1152,6 +1684,7 @@ def _quarter_fallback_for_structure(entry: dict[str, Any], sources: list[dict[st
             "non_gaap_gross_margin_pct": entry.get("gross_margin_pct"),
             "net_income_bn": entry.get("net_income_bn"),
             "net_income_yoy_pct": entry.get("net_income_yoy_pct"),
+            "ending_equity_bn": entry.get("equity_bn"),
             "gaap_eps": entry.get("eps"),
             "non_gaap_eps": entry.get("eps"),
             "operating_cash_flow_bn": entry.get("operating_cash_flow_bn"),
@@ -1203,12 +1736,16 @@ def _history_needs_official_metric_enrichment(
     missing_revenue = sum(1 for entry in structured_entries if entry.get("revenue_bn") is None)
     missing_profit = sum(1 for entry in structured_entries if entry.get("net_income_bn") is None)
     missing_margin = sum(1 for entry in structured_entries if entry.get("gross_margin_pct") is None)
+    missing_equity = sum(1 for entry in structured_entries if entry.get("equity_bn") is None)
+    missing_roe = sum(1 for entry in structured_entries if entry.get("roe_pct") is None)
     repeated_revenue_run = _same_metric_run_length(structured_entries, "revenue_bn")
     repeated_profit_run = _same_metric_run_length(structured_entries, "net_income_bn")
     return (
         missing_revenue > 0
         or missing_profit > 0
         or missing_margin >= max(4, len(structured_entries) // 2)
+        or missing_equity > 0
+        or missing_roe > 0
         or repeated_revenue_run >= 3
         or repeated_profit_run >= 3
     )
@@ -1221,6 +1758,8 @@ def _entry_needs_official_metric_enrichment(entry: dict[str, Any]) -> bool:
         or entry.get("gross_margin_pct") is None
         or entry.get("revenue_yoy_pct") is None
         or entry.get("net_income_yoy_pct") is None
+        or entry.get("equity_bn") is None
+        or entry.get("roe_pct") is None
     )
 
 
@@ -1300,10 +1839,13 @@ def _enrich_history_with_official_structures(
         gross_margin_pct = latest_kpis.get("gaap_gross_margin_pct")
         revenue_yoy_pct = latest_kpis.get("revenue_yoy_pct")
         net_income_yoy_pct = latest_kpis.get("net_income_yoy_pct")
+        ending_equity_bn = latest_kpis.get("ending_equity_bn")
         if revenue_bn is not None:
             entry["revenue_bn"] = float(revenue_bn)
         if net_income_bn is not None:
             entry["net_income_bn"] = float(net_income_bn)
+        if ending_equity_bn is not None and float(ending_equity_bn) > 0:
+            entry["equity_bn"] = float(ending_equity_bn)
         if gross_margin_pct is not None and -10 <= float(gross_margin_pct) <= 95:
             entry["gross_margin_pct"] = float(gross_margin_pct)
         if revenue_yoy_pct is not None and abs(float(revenue_yoy_pct)) <= 500:
@@ -1321,17 +1863,29 @@ def _enrich_history_with_official_structures(
             list(parsed.get("current_geographies") or []),
             entry.get("revenue_bn") or parsed.get("latest_kpis", {}).get("revenue_bn"),
         )
-        if parsed_segments:
+        valid_parsed_segments = (
+            bool(parsed_segments)
+            and not _segments_look_incomplete_for_company(
+                company,
+                [
+                    {"name": item.get("name"), "value_bn": item.get("value_bn")}
+                    for item in parsed_segments
+                ],
+            )
+            and not _segments_are_geography_like(company, list(parsed_segments))
+        )
+        if valid_parsed_segments:
             entry["segments"] = parsed_segments
             entry["structure_basis"] = "segment"
         elif parsed_geographies:
-            entry["segments"] = parsed_geographies
             entry["structure_basis"] = "geography"
+            entry["segments"] = []
         if parsed_geographies:
             entry["geographies"] = parsed_geographies
         if (
             latest_kpis.get("revenue_bn") is not None
             or latest_kpis.get("net_income_bn") is not None
+            or latest_kpis.get("ending_equity_bn") is not None
             or parsed_segments
             or parsed_geographies
         ):
@@ -1362,12 +1916,14 @@ def _enrich_history_with_official_structures(
 
 
 def resolve_structure_dimension(company_id: str, historical_bundle: list[dict[str, Any]]) -> str:
-    del company_id
-    if historical_bundle and all(entry.get("segments") for entry in historical_bundle):
+    company = get_company(company_id)
+    if historical_bundle and all(entry.get("segments") and not _segments_are_geography_like(company, list(entry.get("segments") or [])) for entry in historical_bundle):
         bases = {str(entry.get("structure_basis") or "segment") for entry in historical_bundle}
         if bases == {"geography"}:
             return "geography"
         return "segment"
+    if historical_bundle and all(entry.get("geographies") for entry in historical_bundle):
+        return "geography"
     return "management"
 
 
@@ -1712,6 +2268,8 @@ def _refresh_latest_history_entry(
         latest["revenue_yoy_pct"] = float(revenue_yoy_pct)
     if latest_kpis.get("net_income_yoy_pct") is not None:
         latest["net_income_yoy_pct"] = float(latest_kpis["net_income_yoy_pct"])
+    if latest_kpis.get("ending_equity_bn") is not None and float(latest_kpis["ending_equity_bn"]) > 0:
+        latest["equity_bn"] = float(latest_kpis["ending_equity_bn"])
 
     if latest.get("revenue_bn") is not None and latest.get("net_income_bn") is not None:
         latest["net_margin_pct"] = _safe_ratio(float(latest["net_income_bn"]), float(latest["revenue_bn"]))
@@ -1745,18 +2303,6 @@ def _refresh_latest_history_entry(
             if item.get("value_bn") is not None
         ]
         if not latest.get("segments"):
-            latest["segments"] = [
-                {
-                    "name": item["name"],
-                    "value_bn": float(item["value_bn"]),
-                    "share_pct": float(item.get("share_pct") or 0.0) or (
-                        float(item["value_bn"]) / float(latest["revenue_bn"]) * 100 if latest.get("revenue_bn") not in (None, 0) else 0.0
-                    ),
-                    "yoy_pct": item.get("yoy_pct"),
-                }
-                for item in current_geographies
-                if item.get("value_bn") is not None
-            ]
             latest["structure_basis"] = "geography"
 
     previous = refreshed[latest_index - 1] if latest_index > 0 else None
@@ -1773,6 +2319,9 @@ def _refresh_latest_history_entry(
         latest["ttm_revenue_growth_pct"] = (float(latest["ttm_revenue_bn"]) / float(previous_ttm) - 1) * 100
     else:
         latest["ttm_revenue_growth_pct"] = None
+    recomputed_roe_pct = _ttm_roe_pct(refreshed, latest_index)
+    if recomputed_roe_pct is not None:
+        latest["roe_pct"] = recomputed_roe_pct
     return refreshed
 
 
@@ -1861,6 +2410,7 @@ def _sanitize_fixture_payload(
     if current_segments and (
         not _quarterly_structure_looks_reasonable(current_segments, trusted_revenue)
         or _segments_look_incomplete_for_company(company, current_segments)
+        or _segments_are_geography_like(company, current_segments)
     ):
         sanitized["current_segments"] = []
     current_geographies = list(sanitized.get("current_geographies") or [])
@@ -1886,9 +2436,11 @@ def _rehydrate_current_structures_from_history(
         (
             not hydrated.get("current_segments")
             or _segments_look_incomplete_for_company(company, list(hydrated.get("current_segments") or []))
+            or _segments_are_geography_like(company, list(hydrated.get("current_segments") or []))
         )
         and latest_history.get("segments")
         and str(latest_history.get("structure_basis") or "segment") == "segment"
+        and not _segments_are_geography_like(company, list(latest_history.get("segments") or []))
     ):
         hydrated["current_segments"] = _normalize_segment_items(
             company,
@@ -2567,6 +3119,7 @@ def build_report_payload(
 ) -> dict[str, Any]:
     _emit_progress(progress_callback, 0.03, "prepare", "正在校验参数并加载公司基础数据...")
     company = get_company(company_id)
+    report_style = _build_report_style(company)
     periods, series = get_company_series(company_id)
     _emit_progress(progress_callback, 0.06, "prepare", "公司基础数据已加载，正在读取历史时间轴...")
     _emit_progress(progress_callback, 0.10, "history", "正在构建近 12 季历史数据与增长结构...")
@@ -2637,6 +3190,7 @@ def build_report_payload(
     _emit_progress(progress_callback, 0.915, "history", "正在统一历史业务结构并补足缺口...")
     fixture = _rehydrate_current_structures_from_history(company, fixture, history[-1])
     fixture["current_segments"] = _normalize_segment_items(company, list(fixture.get("current_segments") or []))
+    fixture = _sanitize_fixture_payload(company, fixture, history[-1])
     fixture["guidance"] = _resolve_guidance_payload(fixture["guidance"], history)
     fixture["current_geographies"] = list(fixture.get("current_geographies") or [])
     fixture["headline"] = _compose_summary_headline(
@@ -2714,8 +3268,22 @@ def build_report_payload(
         guidance_title = "业绩指引页 · 经营基线"
         guidance_note = "当官方下一季指引尚未接入时，使用最近四季经营基线来模拟下一阶段经营参照。"
         guidance_chart_title = "当前业绩与经营基线对照"
+    guidance_note = f"{guidance_note} 重点看指引与本季兑现是否同向。"
+    section_meta = _build_dynamic_section_meta(
+        company,
+        fixture,
+        history,
+        structure_dimension=structure_dimension,
+        money_symbol=money_symbol,
+        institutional_views=institutional_views,
+        transcript_summary=transcript_summary,
+        qna_topics=qna_topics,
+        merged_sources=merged_sources,
+        guidance_note=guidance_note,
+    )
     _emit_progress(progress_callback, 0.97, "visuals", "正在排版图表、结论卡片与 PDF 预览内容...")
     visuals = {
+        "company_brand": render_company_wordmark_svg(str(company["id"]), str(company["english_name"]), brand["primary"]),
         "current_quarter": render_current_quarter_svg(metric_rows, brand["primary"], brand["secondary"]),
         "guidance": render_guidance_svg(
             fixture["latest_kpis"]["revenue_bn"],
@@ -2812,6 +3380,8 @@ def build_report_payload(
     return {
         "payload_schema_version": REPORT_PAYLOAD_SCHEMA_VERSION,
         "company": company,
+        "report_style": report_style,
+        "section_meta": section_meta,
         "calendar_quarter": calendar_quarter,
         "fiscal_label": fixture["fiscal_label"],
         "headline": fixture["headline"],
@@ -3018,6 +3588,32 @@ def get_report(report_id: str) -> dict[str, Any]:
     record["payload"] = json.loads(record["payload_json"])
     record["coverage_warnings"] = json.loads(record["coverage_warnings_json"])
     return record
+
+
+def ensure_report_payload_defaults(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(payload or {})
+    company = dict(normalized.get("company") or {})
+    if not company and normalized.get("company_id"):
+        company = get_company(str(normalized.get("company_id") or ""))
+        normalized["company"] = company
+    if company:
+        if "report_style" not in normalized:
+            normalized["report_style"] = _build_report_style(company)
+        if "section_meta" not in normalized:
+            section_meta = _build_section_meta(company)
+            guidance_note = str(normalized.get("guidance_note") or section_meta["guidance"]["note"])
+            if guidance_note:
+                section_meta["guidance"]["note"] = guidance_note
+            normalized["section_meta"] = section_meta
+        visuals = dict(normalized.get("visuals") or {})
+        if "company_brand" not in visuals:
+            visuals["company_brand"] = render_company_wordmark_svg(
+                str(company.get("id") or ""),
+                str(company.get("english_name") or company.get("name") or ""),
+                str(((company.get("brand") or {}).get("primary")) or "#0F172A"),
+            )
+            normalized["visuals"] = visuals
+    return normalized
 
 
 def update_report_pdf(report_id: str, pdf_path: str) -> None:

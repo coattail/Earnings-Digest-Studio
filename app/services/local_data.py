@@ -347,6 +347,64 @@ def _fact_quarter_label(item: dict[str, Any]) -> Optional[str]:
     return _calendar_quarter_from_period_end(end)
 
 
+def _instant_concept_map(payload: dict[str, Any], concept_names: list[str]) -> dict[str, dict[str, Any]]:
+    selected: dict[str, dict[str, Any]] = {}
+    for concept_name in concept_names:
+        for item in _concept_unit_items(payload, concept_name):
+            period = _fact_quarter_label(item)
+            value = item.get("val")
+            if period is None or value is None:
+                continue
+            score = 0
+            frame = str(item.get("frame") or "")
+            if period in frame:
+                score += 30
+            score -= _fact_form_priority(str(item.get("form") or "")) * 3
+            filed = str(item.get("filed") or "")
+            candidate = dict(item)
+            candidate["_score"] = score
+            candidate["_concept"] = concept_name
+            current = selected.get(period)
+            if current is None:
+                selected[period] = candidate
+                continue
+            current_key = (
+                int(current.get("_score") or 0),
+                str(current.get("filed") or ""),
+                -_fact_form_priority(str(current.get("form") or "")),
+            )
+            candidate_key = (
+                int(candidate.get("_score") or 0),
+                filed,
+                -_fact_form_priority(str(candidate.get("form") or "")),
+            )
+            if candidate_key > current_key:
+                selected[period] = candidate
+    return selected
+
+
+def _compute_ttm_roe_series(periods: list[str], earnings: dict[str, int], equity: dict[str, int]) -> dict[str, float]:
+    roe: dict[str, float] = {}
+    for index, period in enumerate(periods):
+        if index < 3:
+            continue
+        earnings_window = [earnings.get(periods[position]) for position in range(index - 3, index + 1)]
+        if any(value is None for value in earnings_window):
+            continue
+        equity_window = [equity.get(periods[position]) for position in range(max(0, index - 4), index + 1)]
+        equity_values = [float(value) for value in equity_window if value not in (None, 0)]
+        if len(equity_values) < 2:
+            continue
+        avg_equity = sum(equity_values) / len(equity_values)
+        if avg_equity <= 0:
+            continue
+        ttm_earnings = sum(float(value) for value in earnings_window if value is not None)
+        roe_value = ttm_earnings / avg_equity * 100
+        if -100 < roe_value < 250:
+            roe[period] = roe_value
+    return roe
+
+
 def _quarterly_concept_map(payload: dict[str, Any], concept_names: list[str]) -> dict[str, dict[str, Any]]:
     selected: dict[str, dict[str, Any]] = {}
     for concept_name in concept_names:
@@ -400,10 +458,20 @@ def _build_companyfacts_series(payload: dict[str, Any]) -> dict[str, Any]:
     )
     earnings_candidates = _quarterly_concept_map(payload, ["NetIncomeLoss", "ProfitLoss"])
     gross_profit_candidates = _quarterly_concept_map(payload, ["GrossProfit"])
+    equity_candidates = _instant_concept_map(
+        payload,
+        [
+            "StockholdersEquity",
+            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+            "CommonStockholdersEquity",
+            "PartnersCapitalIncludingPortionAttributableToNoncontrollingInterest",
+        ],
+    )
 
     revenue: dict[str, int] = {}
     earnings: dict[str, int] = {}
     gross_margin: dict[str, float] = {}
+    equity: dict[str, int] = {}
     period_meta: dict[str, dict[str, str]] = {}
 
     for period, item in revenue_candidates.items():
@@ -446,8 +514,22 @@ def _build_companyfacts_series(payload: dict[str, Any]) -> dict[str, Any]:
                 "accn": str(item.get("accn") or ""),
             },
         )
+    for period, item in equity_candidates.items():
+        value = item.get("val")
+        if value is None:
+            continue
+        equity[period] = int(float(value))
+        period_meta.setdefault(
+            period,
+            {
+                "date_key": str(item.get("end") or ""),
+                "filed": str(item.get("filed") or ""),
+                "form": str(item.get("form") or ""),
+                "accn": str(item.get("accn") or ""),
+            },
+        )
 
-    periods = _sort_periods(sorted({*revenue.keys(), *earnings.keys(), *gross_margin.keys()}))
+    periods = _sort_periods(sorted({*revenue.keys(), *earnings.keys(), *gross_margin.keys(), *equity.keys()}))
     revenue_growth: dict[str, float] = {}
     for index, period in enumerate(periods):
         if index < 4:
@@ -457,6 +539,7 @@ def _build_companyfacts_series(payload: dict[str, Any]) -> dict[str, Any]:
         previous_revenue = revenue.get(previous_period)
         if current_revenue not in (None, 0) and previous_revenue not in (None, 0):
             revenue_growth[period] = ((float(current_revenue) - float(previous_revenue)) / abs(float(previous_revenue))) * 100
+    roe = _compute_ttm_roe_series(periods, earnings, equity)
 
     return {
         "periods": periods,
@@ -465,6 +548,8 @@ def _build_companyfacts_series(payload: dict[str, Any]) -> dict[str, Any]:
             "earnings": earnings,
             "grossMargin": gross_margin,
             "revenueGrowth": revenue_growth,
+            "roe": roe,
+            "equity": equity,
             "periodMeta": period_meta,
         },
     }
@@ -483,7 +568,7 @@ def _merge_official_series(
         return periods, series
 
     merged = dict(series)
-    for metric_key in ("revenue", "earnings", "grossMargin", "revenueGrowth", "roe", "periodMeta"):
+    for metric_key in ("revenue", "earnings", "grossMargin", "revenueGrowth", "roe", "equity", "periodMeta"):
         merged[metric_key] = dict(merged.get(metric_key) or {})
 
     for period in official_periods:
@@ -501,8 +586,17 @@ def _merge_official_series(
         official_growth = official_series.get("revenueGrowth", {}).get(period)
         if merged["revenueGrowth"].get(period) is None and official_growth is not None:
             merged["revenueGrowth"][period] = official_growth
+        official_equity = official_series.get("equity", {}).get(period)
+        if official_equity is not None:
+            merged["equity"][period] = official_equity
         if period not in merged["periodMeta"] and official_series.get("periodMeta", {}).get(period):
             merged["periodMeta"][period] = dict(official_series["periodMeta"][period])
+
+    authoritative_roe = _compute_ttm_roe_series(_sort_periods(periods), merged["earnings"], merged["equity"])
+    if authoritative_roe:
+        merged["roe"] = authoritative_roe
+    else:
+        merged["roe"] = {}
 
     return _sort_periods(periods), merged
 
@@ -531,11 +625,13 @@ def get_company_series(company_id: str) -> tuple[list[str], dict[str, Any]]:
         dataset = load_financial_source_data()
         periods = dataset["periods"]
         series = dict(dataset["companies"][company["series_key"]])
+        series["equity"] = dict(series.get("equity") or {})
         series["currency_code"] = company.get("currency_code", "USD")
         companyfacts_payload = _load_companyfacts(company)
         if companyfacts_payload:
             official_series = _build_companyfacts_series(companyfacts_payload)
             periods, series = _merge_official_series(list(periods), series, official_series)
+        series["roe"] = _compute_ttm_roe_series(_sort_periods(list(periods)), dict(series.get("earnings") or {}), dict(series.get("equity") or {}))
         available_periods = [period for period in periods if period in series["revenue"]]
         if company.get("quarter_label_mode") not in (None, "natural"):
             available_periods, series = _remap_series_labels(available_periods, series, str(company["quarter_label_mode"]))
@@ -545,10 +641,12 @@ def get_company_series(company_id: str) -> tuple[list[str], dict[str, Any]]:
     payload = cached or _fetch_remote_company_series(company)
     periods = list(payload["periods"])
     series = dict(payload["series"])
+    series["equity"] = dict(series.get("equity") or {})
     companyfacts_payload = _load_companyfacts(company)
     if companyfacts_payload:
         official_series = _build_companyfacts_series(companyfacts_payload)
         periods, series = _merge_official_series(periods, series, official_series)
+    series["roe"] = _compute_ttm_roe_series(_sort_periods(list(periods)), dict(series.get("earnings") or {}), dict(series.get("equity") or {}))
     if company.get("quarter_label_mode") not in (None, "natural"):
         periods, series = _remap_series_labels(periods, series, str(company["quarter_label_mode"]))
     return periods, series

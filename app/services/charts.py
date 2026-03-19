@@ -329,23 +329,23 @@ def _series_points(values: list[float], left: float, top: float, width: float, h
 
 
 def render_current_quarter_svg(metrics: list[dict[str, Any]], primary: str, secondary: str) -> str:
-    width, height = 940, 330
+    width, height = 940, 304
     body = [
-        '<rect x="0" y="0" width="940" height="330" rx="26" fill="#FFFFFF"/>',
-        '<text x="32" y="36" font-size="18" font-weight="700" fill="#0F172A">当季 vs 上季 vs 去年同期</text>',
+        '<rect x="0" y="0" width="940" height="304" rx="26" fill="#FFFFFF"/>',
+        '<text x="32" y="34" font-size="18" font-weight="700" fill="#0F172A">当季 vs 上季 vs 去年同期</text>',
     ]
     group_left = 42
     card_width = 272
-    chart_top = 112
-    chart_height = 104
+    chart_top = 102
+    chart_height = 96
     bar_width = 42
     for index, item in enumerate(metrics):
         left = group_left + index * (card_width + 16)
         values = [float(item.get(key) or 0) for key in ("year_ago", "previous", "current")]
         local_max = max(values) or 1
-        body.append(f'<rect x="{left}" y="58" width="{card_width}" height="230" rx="22" fill="#F8FAFC" stroke="#E2E8F0"/>')
+        body.append(f'<rect x="{left}" y="52" width="{card_width}" height="212" rx="22" fill="#F8FAFC" stroke="#E2E8F0"/>')
         body.append(
-            f'<text x="{left + 18}" y="86" font-size="14" font-weight="600" fill="#0F172A">{_escape(item["label"])}</text>'
+            f'<text x="{left + 18}" y="78" font-size="14" font-weight="600" fill="#0F172A">{_escape(item["label"])}</text>'
         )
         for offset, key, color in [
             (0, "year_ago", "#CBD5E1"),
@@ -362,9 +362,9 @@ def render_current_quarter_svg(metrics: list[dict[str, Any]], primary: str, seco
                 f'<text x="{x + bar_width/2:.1f}" y="{label_y:.1f}" text-anchor="middle" font-size="11" fill="#0F172A">{_escape(item["labels"][key])}</text>'
             )
             label_x = x + bar_width / 2
-            body.append(f'<text x="{label_x:.1f}" y="248" text-anchor="middle" font-size="11" fill="#64748B">{"去年同期" if key == "year_ago" else "上季" if key == "previous" else "当季"}</text>')
+            body.append(f'<text x="{label_x:.1f}" y="228" text-anchor="middle" font-size="11" fill="#64748B">{"去年同期" if key == "year_ago" else "上季" if key == "previous" else "当季"}</text>')
         body.append(
-            f'<text x="{left + 18}" y="276" font-size="12" fill="#94A3B8">同比变化 {format_pct(float(item["delta_yoy"]), signed=True)}</text>'
+            f'<text x="{left + 18}" y="252" font-size="12" fill="#94A3B8">同比变化 {format_pct(float(item["delta_yoy"]), signed=True)}</text>'
         )
     return _svg(width, height, "".join(body))
 
@@ -1138,9 +1138,9 @@ def _statement_metric_tile_svg(
     label_line_height = 10.8
     note_font = 9.6
     note_line_height = 9.8
-    label_y = y + 28
+    label_y = y + 35
     english_y = label_y + label_font + max(len(label_lines) - 1, 0) * label_line_height + 4.5
-    value_y = y + (68 if len(label_lines) == 1 else 74)
+    value_y = y + (74 if len(label_lines) == 1 else 80)
     note_y = y + height - 10.5 - (len(note_lines) - 1) * note_line_height
     return "".join(
         [
@@ -1470,6 +1470,11 @@ def _company_wordmark_svg(company_id: str, company_name: str, x: float, y: float
     display = name if len(name) <= 16 else str(company_id or name).upper()
     body.append(f'<text x="{x:.1f}" y="{y + 18:.1f}" text-anchor="middle" font-size="17" font-weight="700" letter-spacing="0.04em" fill="{fallback_fill}">{_escape(display)}</text>')
     return "".join(body)
+
+
+def render_company_wordmark_svg(company_id: str, company_name: str, primary: str) -> str:
+    width, height = 220, 46
+    return _svg(width, height, _company_wordmark_svg(company_id, company_name, width / 2, 10, primary))
 
 
 def _microsoft_corporate_logo(x: float, y: float, square: float = 17.0) -> str:
@@ -2526,20 +2531,87 @@ def render_dual_ranked_svg(
 
 
 def _segment_share_map(entry: dict[str, object]) -> dict[str, float]:
-    segments = list(entry.get("segments") or [])
-    total = sum(float(item.get("value_bn") or 0.0) for item in segments)
+    items, _basis = _entry_structure_items(entry)
+    total = sum(float(item.get("value_bn") or 0.0) for item in items)
     if total <= 0:
         return {}
     return {
         str(item.get("name") or "Business"): float(item.get("value_bn") or 0.0) / total
-        for item in segments
+        for item in items
         if float(item.get("value_bn") or 0.0) > 0
     }
 
 
+_GEO_STRUCTURE_MARKERS = (
+    "america",
+    "americas",
+    "asia",
+    "apac",
+    "apj",
+    "canada",
+    "china",
+    "country",
+    "countries",
+    "emea",
+    "europe",
+    "hong kong",
+    "international",
+    "japan",
+    "korea",
+    "latin",
+    "middle east",
+    "pacific",
+    "singapore",
+    "taiwan",
+    "u s",
+    "united states",
+    "world",
+)
+
+
+def _looks_like_geography_labels(names: list[str]) -> bool:
+    cleaned = []
+    for name in names:
+        token = re.sub(r"[^a-z0-9]+", " ", str(name or "").casefold()).strip()
+        if token:
+            cleaned.append(token)
+    if not cleaned:
+        return False
+    return all(any(marker in token for marker in _GEO_STRUCTURE_MARKERS) for token in cleaned)
+
+
+def _entry_structure_items(entry: dict[str, object]) -> tuple[list[dict[str, object]], Optional[str]]:
+    segments = list(entry.get("segments") or [])
+    geographies = list(entry.get("geographies") or [])
+    basis = str(entry.get("structure_basis") or "").lower()
+    segment_names = [str(item.get("name") or "") for item in segments]
+    segments_geo_like = _looks_like_geography_labels(segment_names)
+    if basis == "geography" and geographies:
+        return geographies, "geography"
+    if segments and not segments_geo_like:
+        return segments, "segment"
+    if geographies:
+        return geographies, "geography"
+    if segments:
+        return segments, "segment"
+    return [], None
+
+
+def _dominant_history_structure_basis(entries: list[dict[str, object]]) -> str:
+    observed = [
+        basis
+        for entry in entries
+        for _items, basis in [_entry_structure_items(entry)]
+        if basis
+    ]
+    if not observed:
+        return "segment"
+    return "geography" if observed.count("geography") > observed.count("segment") else "segment"
+
+
 def _growth_stack_plan(entries: list[dict[str, object]]) -> tuple[list[str], list[dict[str, object]], bool]:
     share_maps = [_segment_share_map(entry) for entry in entries]
-    anchor_segments = next((list(entry.get("segments") or []) for entry in reversed(entries) if entry.get("segments")), [])
+    anchor_segments = next((_entry_structure_items(entry)[0] for entry in reversed(entries) if _entry_structure_items(entry)[0]), [])
     segment_names = [str(item.get("name") or "Business") for item in anchor_segments]
     for share_map in share_maps:
         for name in share_map:
@@ -2599,17 +2671,20 @@ def render_growth_overview_svg(entries: list[dict[str, object]], colors: dict[st
     max_total = max(totals) if any(totals) else 1
     segment_names, stack_plan, inferred_segments = _growth_stack_plan(entries)
     has_segment_stacks = bool(stack_plan and segment_names)
+    structure_basis = _dominant_history_structure_basis(entries)
+    structure_label = "业务结构" if structure_basis != "geography" else "地区结构"
+    legend_label = "业务类型" if structure_basis != "geography" else "地区类型"
     palette = _segment_palette(segment_names, colors, primary)
     body = [
         f'<rect x="0" y="0" width="{width}" height="{height}" rx="28" fill="#FFFFFF"/>',
         '<text x="32" y="36" font-size="18" font-weight="700" fill="#0F172A">近 12 季成长总览</text>',
         (
-            '<text x="32" y="56" font-size="12" fill="#64748B">每个季度柱体按业务结构分段上色；带 * 的季度按邻近官方结构占比补足显示，并保持全报告颜色映射一致。</text>'
+            f'<text x="32" y="56" font-size="12" fill="#64748B">每个季度柱体按{structure_label}分段上色；带 * 的季度按邻近官方结构占比补足显示，并保持全报告颜色映射一致。</text>'
             if inferred_segments
-            else '<text x="32" y="56" font-size="12" fill="#64748B">每个季度柱体按业务结构分段上色，并保持全报告颜色映射一致。</text>'
+            else f'<text x="32" y="56" font-size="12" fill="#64748B">每个季度柱体按{structure_label}分段上色，并保持全报告颜色映射一致。</text>'
         )
         if has_segment_stacks
-        else '<text x="32" y="56" font-size="12" fill="#64748B">当前历史业务结构尚未完整接入时，先展示总收入柱和总量折线，不伪造分段占比。</text>',
+        else '<text x="32" y="56" font-size="12" fill="#64748B">当前历史结构尚未完整接入时，先展示总收入柱和总量折线，不伪造分段占比。</text>',
     ]
     if not has_total_data:
         body.extend(
@@ -2704,10 +2779,10 @@ def render_growth_overview_svg(entries: list[dict[str, object]], colors: dict[st
                     f'<text x="{x + 18:.1f}" y="{y + 1:.1f}" font-size="11.5" fill="#334155">{_escape(_compact_category_label(name))}</text>',
                 ]
             )
-        body.append(f'<text x="1090" y="{legend_box_y + 22:.1f}" text-anchor="end" font-size="11" fill="#94A3B8">颜色对应不同业务类型</text>')
+        body.append(f'<text x="1090" y="{legend_box_y + 22:.1f}" text-anchor="end" font-size="11" fill="#94A3B8">颜色对应不同{legend_label}</text>')
         if len(segment_names) > len(legend_items):
             body.append(
-                f'<text x="1090" y="{legend_box_y + legend_box_h - 10:.1f}" text-anchor="end" font-size="10.5" fill="#94A3B8">其余细分业务已并入颜色映射并在后续结构页展开</text>'
+                f'<text x="1090" y="{legend_box_y + legend_box_h - 10:.1f}" text-anchor="end" font-size="10.5" fill="#94A3B8">其余细分{legend_label}已并入颜色映射并在后续结构页展开</text>'
             )
         elif inferred_segments:
             body.append(
@@ -2722,7 +2797,9 @@ def render_structure_transition_svg(entries: list[dict[str, object]], colors: di
         f'<rect x="0" y="0" width="{width}" height="{height}" rx="28" fill="#FFFFFF"/>',
         '<text x="32" y="36" font-size="18" font-weight="700" fill="#0F172A">结构迁移与集中度变化</text>',
     ]
-    complete = all(entry.get("segments") for entry in entries)
+    complete = all(_entry_structure_items(entry)[0] for entry in entries)
+    structure_basis = _dominant_history_structure_basis(entries)
+    structure_label = "业务分部" if structure_basis != "geography" else "地区结构"
     if not complete:
         note = fallback_note or "当前历史分部数据不足，结构页自动降级为管理层结构说明。"
         body.extend(
@@ -2741,12 +2818,13 @@ def render_structure_transition_svg(entries: list[dict[str, object]], colors: di
     chart_height = 190
     step_x = chart_width / max(1, len(entries))
     bar_width = step_x * 0.66
-    segment_names = [str(segment.get("name") or "Business") for segment in entries[-1]["segments"]]  # type: ignore[index]
+    latest_items = _entry_structure_items(entries[-1])[0]
+    segment_names = [str(segment.get("name") or "Business") for segment in latest_items]
     palette = _segment_palette(segment_names, colors, primary)
     for index, entry in enumerate(entries):
         x = left + index * step_x + step_x * 0.17
         y_cursor = top + chart_height
-        for segment in entry["segments"]:  # type: ignore[index]
+        for segment in _entry_structure_items(entry)[0]:
             share_pct = float(segment["share_pct"])
             part_height = share_pct / 100 * chart_height
             y_cursor -= part_height
@@ -2756,8 +2834,8 @@ def render_structure_transition_svg(entries: list[dict[str, object]], colors: di
         body.append(
             f'<text x="{x + bar_width/2:.1f}" y="{top+chart_height+22:.1f}" text-anchor="middle" font-size="11" fill="#64748B">{_escape(str(entry["quarter_label"]))}</text>'
         )
-    first = max(entries[0]["segments"], key=lambda item: float(item.get("share_pct") or 0.0))  # type: ignore[index]
-    last = max(entries[-1]["segments"], key=lambda item: float(item.get("share_pct") or 0.0))  # type: ignore[index]
+    first = max(_entry_structure_items(entries[0])[0], key=lambda item: float(item.get("share_pct") or 0.0))
+    last = max(_entry_structure_items(entries[-1])[0], key=lambda item: float(item.get("share_pct") or 0.0))
     legend_items = segment_names[:6]
     legend_rows = 1 if len(legend_items) <= 3 else 2
     legend_y = 280 if legend_rows == 1 else 266
@@ -2767,7 +2845,7 @@ def render_structure_transition_svg(entries: list[dict[str, object]], colors: di
         f'<text x="84" y="{legend_y + 19:.1f}" font-size="11" letter-spacing="0.12em" fill="#94A3B8">STRUCTURE LEGEND</text>'
     )
     body.append(
-        f'<text x="84" y="{legend_y + 39:.1f}" font-size="11.5" fill="#475569">头部分部占比：{_escape(_compact_category_label(str(first["name"])))} {format_pct(float(first["share_pct"]))} → {_escape(_compact_category_label(str(last["name"])))} {format_pct(float(last["share_pct"]))}</text>'
+        f'<text x="84" y="{legend_y + 39:.1f}" font-size="11.5" fill="#475569">头部{structure_label}占比：{_escape(_compact_category_label(str(first["name"])))} {format_pct(float(first["share_pct"]))} → {_escape(_compact_category_label(str(last["name"])))} {format_pct(float(last["share_pct"]))}</text>'
     )
     for index, name in enumerate(legend_items):
         col = index % 3
@@ -2807,7 +2885,7 @@ def render_profitability_svg(
         ("gross_margin_pct", "毛利率", primary),
         ("net_margin_pct", profit_margin_label, secondary),
         ("revenue_yoy_pct", "收入同比", "#0F172A"),
-        ("roe_pct", "ROE", "#F59E0B"),
+        ("roe_pct", "ROE (TTM)", "#F59E0B"),
         ("net_income_yoy_pct", "净利润同比", "#C2410C"),
         ("ttm_revenue_growth_pct", "TTM 增速", "#7C3AED"),
     ]
@@ -2887,7 +2965,9 @@ def render_profitability_svg(
 
 def render_contribution_svg(entries: list[dict[str, object]], colors: dict[str, str], primary: str, fallback_note: Optional[str] = None, money_symbol: str = "$") -> str:
     width, height = 1180, 300
-    complete = all(entry.get("segments") for entry in entries)
+    complete = all(_entry_structure_items(entry)[0] for entry in entries)
+    structure_basis = _dominant_history_structure_basis(entries)
+    structure_label = "分部" if structure_basis != "geography" else "地区"
     body = [
         f'<rect x="0" y="0" width="{width}" height="{height}" rx="28" fill="#FFFFFF"/>',
         '<text x="32" y="36" font-size="18" font-weight="700" fill="#0F172A">增长拆解与增量来源</text>',
@@ -2904,8 +2984,8 @@ def render_contribution_svg(entries: list[dict[str, object]], colors: dict[str, 
         )
         return _svg(width, height, "".join(body))
 
-    first_segments = {segment["name"]: float(segment["value_bn"]) for segment in entries[0]["segments"]}  # type: ignore[index]
-    last_segments = {segment["name"]: float(segment["value_bn"]) for segment in entries[-1]["segments"]}  # type: ignore[index]
+    first_segments = {segment["name"]: float(segment["value_bn"]) for segment in _entry_structure_items(entries[0])[0]}
+    last_segments = {segment["name"]: float(segment["value_bn"]) for segment in _entry_structure_items(entries[-1])[0]}
     names = []
     for name in list(last_segments.keys()) + list(first_segments.keys()):
         if name not in names:
@@ -2920,7 +3000,7 @@ def render_contribution_svg(entries: list[dict[str, object]], colors: dict[str, 
         delta_label = format_money_bn(deltas[index], money_symbol)
         body.extend(
             [
-                f'<text x="42" y="{y}" font-size="12" fill="#334155">{_escape(name)}</text>',
+                f'<text x="42" y="{y}" font-size="12" fill="#334155">{_escape(name)}<tspan fill="#94A3B8"> {structure_label}</tspan></text>',
                 f'<rect x="42" y="{y+10}" width="800" height="14" rx="7" fill="#E2E8F0"/>',
                 f'<rect x="42" y="{y+10}" width="{width_px:.1f}" height="14" rx="7" fill="{color}"/>',
                 f'<text x="{value_x}" y="{y+22}" font-size="12" fill="#0F172A">{delta_label}</text>',

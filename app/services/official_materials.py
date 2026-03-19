@@ -378,6 +378,7 @@ def _material_cache_is_fresh(source: dict[str, Any], cached: dict[str, Any]) -> 
 
 
 def _write_material_meta(meta_path: Path, metadata: dict[str, Any]) -> dict[str, Any]:
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     return metadata
 

@@ -23,6 +23,7 @@ from app.services.official_parsers import _apple_legacy_geographies
 from app.services.official_parsers import _extract_table_metric
 from app.services.official_parsers import _prefer_richer_geographies
 from app.services.official_source_resolver import resolve_official_sources
+from app.services.official_source_resolver import _discover_default_sitemap_urls, _discover_sitemap_sources
 from app.services.official_source_resolver import _ir_role_keywords_match, _ir_temporal_alignment
 from app.services.official_source_resolver import _quarter_reference_terms
 from app.services.reports import (
@@ -31,6 +32,7 @@ from app.services.reports import (
     _build_income_statement_snapshot,
     _enrich_history_with_official_structures,
     _harmonize_historical_structures,
+    _segments_are_geography_like,
     _quarter_fallback_for_structure,
     _sanitize_history_quality_metrics,
     _recompute_history_derivatives,
@@ -103,6 +105,71 @@ def _stub_remote_payload(currency_code: str = "USD") -> dict[str, object]:
     }
 
 
+def _stub_companyfacts_with_equity() -> dict[str, object]:
+    def duration(start: str, end: str, val: int, filed: str, frame: str) -> dict[str, object]:
+        return {"start": start, "end": end, "val": val, "form": "10-Q", "filed": filed, "frame": frame}
+
+    def instant(end: str, val: int, filed: str, frame: str) -> dict[str, object]:
+        return {"end": end, "val": val, "form": "10-Q", "filed": filed, "frame": frame}
+
+    return {
+        "facts": {
+            "us-gaap": {
+                "Revenues": {
+                    "units": {
+                        "USD": [
+                            duration("2023-01-01", "2023-03-31", 10_000_000_000, "2023-05-01", "CY2023Q1"),
+                            duration("2023-04-01", "2023-06-30", 11_000_000_000, "2023-08-01", "CY2023Q2"),
+                            duration("2023-07-01", "2023-09-30", 12_000_000_000, "2023-11-01", "CY2023Q3"),
+                            duration("2023-10-01", "2023-12-31", 13_000_000_000, "2024-02-01", "CY2023Q4"),
+                            duration("2024-01-01", "2024-03-31", 14_000_000_000, "2024-05-01", "CY2024Q1"),
+                        ]
+                    }
+                },
+                "NetIncomeLoss": {
+                    "units": {
+                        "USD": [
+                            duration("2023-01-01", "2023-03-31", 1_000_000_000, "2023-05-01", "CY2023Q1"),
+                            duration("2023-04-01", "2023-06-30", 1_100_000_000, "2023-08-01", "CY2023Q2"),
+                            duration("2023-07-01", "2023-09-30", 1_200_000_000, "2023-11-01", "CY2023Q3"),
+                            duration("2023-10-01", "2023-12-31", 1_300_000_000, "2024-02-01", "CY2023Q4"),
+                            duration("2024-01-01", "2024-03-31", 1_400_000_000, "2024-05-01", "CY2024Q1"),
+                        ]
+                    }
+                },
+                "GrossProfit": {
+                    "units": {
+                        "USD": [
+                            duration("2023-01-01", "2023-03-31", 4_000_000_000, "2023-05-01", "CY2023Q1"),
+                            duration("2023-04-01", "2023-06-30", 4_400_000_000, "2023-08-01", "CY2023Q2"),
+                            duration("2023-07-01", "2023-09-30", 4_800_000_000, "2023-11-01", "CY2023Q3"),
+                            duration("2023-10-01", "2023-12-31", 5_200_000_000, "2024-02-01", "CY2023Q4"),
+                            duration("2024-01-01", "2024-03-31", 5_600_000_000, "2024-05-01", "CY2024Q1"),
+                        ]
+                    }
+                },
+                "StockholdersEquity": {
+                    "units": {
+                        "USD": [
+                            instant("2023-03-31", 10_000_000_000, "2023-05-01", "CY2023Q1I"),
+                            instant("2023-06-30", 11_000_000_000, "2023-08-01", "CY2023Q2I"),
+                            instant("2023-09-30", 12_000_000_000, "2023-11-01", "CY2023Q3I"),
+                            instant("2023-12-31", 13_000_000_000, "2024-02-01", "CY2023Q4I"),
+                            instant("2024-03-31", 14_000_000_000, "2024-05-01", "CY2024Q1I"),
+                        ]
+                    }
+                },
+            }
+        }
+    }
+
+
+def _stub_companyfacts_without_equity() -> dict[str, object]:
+    payload = _stub_companyfacts_with_equity()
+    payload["facts"]["us-gaap"].pop("StockholdersEquity", None)
+    return payload
+
+
 class EarningsDigestStudioTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self._backup_root = Path(tempfile.mkdtemp(prefix="earnings-digest-tests-"))
@@ -123,7 +190,7 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
 
     def _restore_data_dir(self) -> None:
         if DATA_DIR.exists():
-            shutil.rmtree(DATA_DIR)
+            shutil.rmtree(DATA_DIR, ignore_errors=True)
         if self._data_backup_path.exists():
             shutil.move(str(self._data_backup_path), str(DATA_DIR))
         shutil.rmtree(self._backup_root, ignore_errors=True)
@@ -161,6 +228,31 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         sanitized = _sanitize_history_quality_metrics(history)
         self.assertIsNone(sanitized[-1]["roe_pct"])
 
+    def test_recompute_history_derivatives_rebuilds_ttm_roe_from_equity(self) -> None:
+        history = [
+            {"quarter_label": "2024Q1", "net_income_bn": 3.0, "equity_bn": 30.0, "revenue_bn": 20.0},
+            {"quarter_label": "2024Q2", "net_income_bn": 3.2, "equity_bn": 31.0, "revenue_bn": 21.0},
+            {"quarter_label": "2024Q3", "net_income_bn": 3.4, "equity_bn": 32.0, "revenue_bn": 22.0},
+            {"quarter_label": "2024Q4", "net_income_bn": 3.6, "equity_bn": 33.0, "revenue_bn": 23.0},
+            {"quarter_label": "2025Q1", "net_income_bn": 3.8, "equity_bn": 34.0, "revenue_bn": 24.0, "roe_pct": None},
+        ]
+
+        recomputed = _recompute_history_derivatives(history)
+
+        expected_ttm_roe = (3.2 + 3.4 + 3.6 + 3.8) / ((30.0 + 31.0 + 32.0 + 33.0 + 34.0) / 5) * 100
+        self.assertAlmostEqual(recomputed[-1]["roe_pct"], expected_ttm_roe, places=4)
+
+    def test_build_companyfacts_series_computes_ttm_roe_from_equity(self) -> None:
+        series_payload = _build_companyfacts_series(_stub_companyfacts_with_equity())
+        self.assertIn("equity", series_payload["series"])
+        self.assertAlmostEqual(series_payload["series"]["grossMargin"]["2024Q1"], 40.0)
+        expected_ttm_roe = (1.1 + 1.2 + 1.3 + 1.4) / ((10 + 11 + 12 + 13 + 14) / 5) * 100
+        self.assertAlmostEqual(series_payload["series"]["roe"]["2024Q1"], expected_ttm_roe, places=4)
+
+    def test_build_companyfacts_series_drops_roe_when_equity_missing(self) -> None:
+        series_payload = _build_companyfacts_series(_stub_companyfacts_without_equity())
+        self.assertEqual(series_payload["series"]["roe"], {})
+
     def test_backfill_historical_segment_history_interpolates_missing_quarters(self) -> None:
         company = get_company("tsmc")
         history = [
@@ -196,6 +288,60 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         self.assertTrue(enriched[0]["segments_inferred"])
         self.assertEqual(len(enriched[2]["segments"]), 6)
         self.assertTrue(enriched[2]["segments_inferred"])
+
+    def test_incomplete_historical_segment_snapshot_is_rejected_and_backfilled(self) -> None:
+        company = get_company("apple")
+        history = [
+            {
+                "quarter_label": "2025Q1",
+                "revenue_bn": 100.0,
+                "segments": [
+                    {"name": "iPhone", "value_bn": 52.0, "share_pct": 52.0},
+                    {"name": "Mac", "value_bn": 8.0, "share_pct": 8.0},
+                    {"name": "iPad", "value_bn": 7.0, "share_pct": 7.0},
+                    {"name": "Wearables, Home and Accessories", "value_bn": 9.0, "share_pct": 9.0},
+                    {"name": "Services", "value_bn": 24.0, "share_pct": 24.0},
+                ],
+                "geographies": [],
+                "structure_basis": "segment",
+            },
+            {
+                "quarter_label": "2025Q2",
+                "revenue_bn": 102.0,
+                "segments": [
+                    {"name": "Mac", "value_bn": 34.0, "share_pct": 33.3},
+                    {"name": "iPad", "value_bn": 28.0, "share_pct": 27.5},
+                    {"name": "Wearables, Home and Accessories", "value_bn": 40.0, "share_pct": 39.2},
+                ],
+                "geographies": [
+                    {"name": "Americas", "value_bn": 45.0},
+                    {"name": "Europe", "value_bn": 28.0},
+                    {"name": "Greater China", "value_bn": 14.0},
+                    {"name": "Japan", "value_bn": 7.0},
+                    {"name": "Rest of Asia Pacific", "value_bn": 8.0},
+                ],
+                "structure_basis": "segment",
+            },
+            {
+                "quarter_label": "2025Q3",
+                "revenue_bn": 104.0,
+                "segments": [
+                    {"name": "iPhone", "value_bn": 54.0, "share_pct": 51.9},
+                    {"name": "Mac", "value_bn": 8.0, "share_pct": 7.7},
+                    {"name": "iPad", "value_bn": 7.0, "share_pct": 6.7},
+                    {"name": "Wearables, Home and Accessories", "value_bn": 9.0, "share_pct": 8.7},
+                    {"name": "Services", "value_bn": 26.0, "share_pct": 25.0},
+                ],
+                "geographies": [],
+                "structure_basis": "segment",
+            },
+        ]
+        harmonized = _harmonize_historical_structures(company, history)
+        self.assertFalse(harmonized[1]["segments"])
+        self.assertTrue(harmonized[1]["geographies"])
+        enriched = _backfill_historical_segment_history(company, harmonized)
+        self.assertEqual(len(enriched[1]["segments"]), 5)
+        self.assertTrue(enriched[1]["segments_inferred"])
 
     def test_harmonize_historical_structures_clears_geography_segments_when_segment_basis_exists(self) -> None:
         company = get_company("tsmc")
@@ -234,6 +380,61 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         self.assertEqual(harmonized[0]["structure_basis"], "segment")
         self.assertEqual(harmonized[1]["structure_basis"], None)
         self.assertFalse(harmonized[1]["segments"])
+        self.assertTrue(harmonized[1]["geographies"])
+
+    def test_segments_are_geography_like_detects_extended_official_region_labels(self) -> None:
+        company = get_company("alphabet")
+        self.assertTrue(
+            _segments_are_geography_like(
+                company,
+                [
+                    {"name": "United States", "value_bn": 14.933},
+                    {"name": "EMEA", "value_bn": 10.785},
+                    {"name": "Asia Pacific", "value_bn": 5.09},
+                    {"name": "Americas Excluding U.S.", "value_bn": 1.849},
+                ],
+            )
+        )
+
+    def test_harmonize_historical_structures_keeps_geography_only_history_out_of_segments(self) -> None:
+        company = get_company("alphabet")
+        history = [
+            {
+                "quarter_label": "2019Q1",
+                "revenue_bn": 30.7,
+                "segments": [],
+                "geographies": [
+                    {"name": "United States", "value_bn": 13.8},
+                    {"name": "EMEA", "value_bn": 10.1},
+                    {"name": "Asia Pacific", "value_bn": 4.9},
+                    {"name": "Americas Excluding U.S.", "value_bn": 1.9},
+                ],
+                "structure_basis": "geography",
+            },
+            {
+                "quarter_label": "2019Q2",
+                "revenue_bn": 32.657,
+                "segments": [
+                    {"name": "United States", "value_bn": 14.933},
+                    {"name": "EMEA", "value_bn": 10.785},
+                    {"name": "Asia Pacific", "value_bn": 5.09},
+                    {"name": "Americas Excluding U.S.", "value_bn": 1.849},
+                ],
+                "geographies": [
+                    {"name": "United States", "value_bn": 14.933},
+                    {"name": "EMEA", "value_bn": 10.785},
+                    {"name": "Asia Pacific", "value_bn": 5.09},
+                    {"name": "Americas Excluding U.S.", "value_bn": 1.849},
+                ],
+                "structure_basis": "geography",
+            },
+        ]
+        harmonized = _harmonize_historical_structures(company, history)
+        self.assertEqual(harmonized[0]["structure_basis"], "geography")
+        self.assertEqual(harmonized[1]["structure_basis"], "geography")
+        self.assertFalse(harmonized[0]["segments"])
+        self.assertFalse(harmonized[1]["segments"])
+        self.assertTrue(harmonized[0]["geographies"])
         self.assertTrue(harmonized[1]["geographies"])
 
     def test_extract_table_metric_handles_sec_footnote_rows(self) -> None:
@@ -340,6 +541,51 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         self.assertAlmostEqual(enriched[-1]["gross_margin_pct"], 34.7, places=1)
         self.assertEqual(enriched[-1]["source_type"], "official_release")
         self.assertTrue(enriched[-1]["segments"])
+
+    @patch("app.services.reports.parse_official_materials")
+    @patch("app.services.reports.hydrate_source_materials")
+    @patch("app.services.reports.resolve_official_sources")
+    def test_enrich_history_with_official_structures_does_not_copy_geographies_into_segments(
+        self,
+        mock_resolve_sources: object,
+        mock_hydrate: object,
+        mock_parse_materials: object,
+    ) -> None:
+        mock_resolve_sources.return_value = [{"url": "https://example.com/alphabet-release", "date": "2019-07-25"}]
+        mock_hydrate.return_value = [{"label": "Alphabet release", "kind": "official_release", "status": "cached"}]
+        mock_parse_materials.return_value = {
+            "latest_kpis": {"revenue_bn": 32.657},
+            "current_segments": [],
+            "current_geographies": [
+                {"name": "United States", "value_bn": 14.933},
+                {"name": "EMEA", "value_bn": 10.785},
+                {"name": "Asia Pacific", "value_bn": 5.09},
+                {"name": "Americas Excluding U.S.", "value_bn": 1.849},
+            ],
+        }
+        history = [
+            {
+                "quarter_label": "2019Q2",
+                "fiscal_label": "2019Q2",
+                "period_end": "2019-06-30",
+                "release_date": "2019-07-25",
+                "revenue_bn": 32.657,
+                "net_income_bn": 9.947,
+                "gross_margin_pct": None,
+                "revenue_yoy_pct": 19.0,
+                "net_income_yoy_pct": 0.0,
+                "net_margin_pct": 30.5,
+                "segments": None,
+                "geographies": None,
+                "structure_basis": None,
+                "source_type": "structured_financial_series",
+                "source_url": "",
+            }
+        ]
+        enriched = _enrich_history_with_official_structures(get_company("alphabet"), history)
+        self.assertEqual(enriched[-1]["structure_basis"], "geography")
+        self.assertFalse(enriched[-1]["segments"])
+        self.assertTrue(enriched[-1]["geographies"])
 
     def test_history_cube_requires_full_window(self) -> None:
         with self.assertRaises(ValueError):
@@ -494,6 +740,168 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         self.assertAlmostEqual(parsed["latest_kpis"]["net_income_bn"], 22.236, places=3)
         self.assertEqual(parsed["current_segments"][0]["name"], "iPhone")
 
+    def test_parse_official_materials_microsoft_can_fall_back_to_sec_only_for_segments(self) -> None:
+        sec_path = self._write_temp_text(
+            "microsoft-sec-only-history.txt",
+            (
+                "Total revenue 32,471 28,918 "
+                "Total cost of revenue 11,127 10,234 "
+                "Research and development 4,068 3,759 "
+                "Sales and marketing 4,776 4,148 "
+                "General and administrative 1,323 1,279 "
+                "Operating income 13,891 10,258 "
+                "Productivity and Business Processes 11,833 10,101 "
+                "Intelligent Cloud 11,869 9,379 "
+                "More Personal Computing 13,211 12,991 "
+                "Revenue, classified by the major geographic areas in which our customers were located, was as follows: "
+                "(In millions) Three Months Ended December 31 2019 2018 Six Months Ended December 31 2019 2018 "
+                "United States (a) 18,113 16,081 35,221 31,945 "
+                "Other countries 18,793 16,390 35,700 31,547 "
+            ),
+        )
+        parsed = parse_official_materials(
+            get_company("microsoft"),
+            {"fiscal_label": "2020Q2", "calendar_quarter": "2019Q4", "coverage_notes": []},
+            [
+                {"label": "Microsoft Form 10-Q", "kind": "sec_filing", "status": "cached", "text_path": sec_path},
+            ],
+        )
+        self.assertEqual([item["name"] for item in parsed["current_segments"]], ["More Personal Computing", "Intelligent Cloud", "Productivity and Business Processes"])
+        self.assertEqual([item["name"] for item in parsed["current_geographies"]], ["Other countries", "United States"])
+        self.assertAlmostEqual(parsed["latest_kpis"]["revenue_bn"], 32.471, places=3)
+
+    def test_parse_official_materials_alphabet_historical_can_fall_back_without_release(self) -> None:
+        sec_path = self._write_temp_text(
+            "alphabet-historical-sec-only.txt",
+            (
+                "Total revenues 46,075 55,314 "
+                "Google Search & other 31,879 39,545 "
+                "YouTube ads 4,038 6,005 "
+                "Google Network Members' properties 5,195 6,800 "
+                "Google Cloud 2,777 4,047 "
+                "Google other 5,449 6,494 "
+                "Other Bets revenues 135 198 "
+                "United States revenues (GAAP) 21,711 25,895 19 % "
+                "EMEA revenues (GAAP) 14,391 17,030 18 % "
+                "APAC revenues (GAAP) 6,929 8,157 18 % "
+                "Other Americas revenues (GAAP) 3,044 4,232 39 % "
+            ),
+        )
+        parsed = parse_official_materials(
+            get_company("alphabet"),
+            {"fiscal_label": "2021Q1", "calendar_quarter": "2021Q1", "coverage_notes": []},
+            [
+                {"label": "Alphabet Form 10-Q", "kind": "sec_filing", "status": "cached", "text_path": sec_path},
+            ],
+        )
+        self.assertTrue(parsed["current_segments"])
+        self.assertIn("Google Search & other", [item["name"] for item in parsed["current_segments"]])
+        self.assertTrue(parsed["current_geographies"])
+        self.assertIn("United States", [item["name"] for item in parsed["current_geographies"]])
+
+    def test_parse_official_materials_alphabet_legacy_business_mix_uses_google_properties_taxonomy(self) -> None:
+        release_path = self._write_temp_text(
+            "alphabet-legacy-release.txt",
+            (
+                "Segment revenues and operating results "
+                "Three Months Ended September 30, 2017 "
+                "Three Months Ended September 30, 2018 "
+                "Google properties revenues $19,723 $24,054 "
+                "Google Network Members' properties revenues 4,342 4,900 "
+                "Google advertising revenues 24,065 28,954 "
+                "Google other revenues 3,590 4,640 "
+                "Google segment revenues $27,655 $33,594 "
+                "Other Bets revenues $117 $146 "
+                "United States revenues (GAAP) $15,523 $12,930 16.7% "
+                "EMEA revenues (GAAP) $10,961 $9,097 17.0% "
+                "APAC revenues (GAAP) $5,426 $4,199 22.6% "
+                "Other Americas revenues (GAAP) $1,835 $1,546 15.7% "
+                "Total revenues $27,772 $33,740 "
+            ),
+        )
+        parsed = parse_official_materials(
+            get_company("alphabet"),
+            {"fiscal_label": "2018Q3", "calendar_quarter": "2018Q3", "coverage_notes": [], "latest_kpis": {"revenue_bn": 33.740}},
+            [
+                {"label": "Alphabet release", "kind": "official_release", "status": "cached", "text_path": release_path},
+            ],
+        )
+        self.assertEqual(
+            [item["name"] for item in parsed["current_segments"]],
+            ["Google properties", "Google Network", "Google other", "Other Bets"],
+        )
+        self.assertEqual([item["name"] for item in parsed["current_geographies"][:2]], ["United States", "EMEA"])
+
+    def test_normalize_segment_items_alphabet_legacy_report_keeps_business_and_geography_distinct(self) -> None:
+        parsed = {
+            "current_segments": [
+                {"name": "Google properties", "value_bn": 24.054},
+                {"name": "Google Network", "value_bn": 4.900},
+                {"name": "Google other", "value_bn": 4.640},
+                {"name": "Other Bets", "value_bn": 0.146},
+            ],
+            "current_geographies": [
+                {"name": "United States", "value_bn": 12.930},
+                {"name": "EMEA", "value_bn": 9.097},
+                {"name": "Asia Pacific", "value_bn": 4.199},
+                {"name": "Americas Excluding U.S.", "value_bn": 1.546},
+            ],
+        }
+        normalized_segments = _normalize_segment_items(get_company("alphabet"), parsed["current_segments"])
+        self.assertEqual(
+            [item["name"] for item in normalized_segments],
+            ["Google properties", "Google Network", "Google subscriptions, platforms, and devices", "Other Bets"],
+        )
+        self.assertEqual(
+            [item["name"] for item in parsed["current_geographies"]],
+            ["United States", "EMEA", "Asia Pacific", "Americas Excluding U.S."],
+        )
+        self.assertNotEqual(
+            [item["name"] for item in normalized_segments],
+            [item["name"] for item in parsed["current_geographies"][:4]],
+        )
+
+    @patch("app.services.official_source_resolver._fetch_text")
+    def test_discover_default_sitemap_urls_uses_robots_and_common_paths(self, mock_fetch_text: object) -> None:
+        def fake_fetch(url: str) -> str:
+            if url == "https://abc.xyz/robots.txt":
+                return "User-agent: *\nSitemap: https://abc.xyz/sitemap.xml\nSitemap: https://abc.xyz/investor/sitemap-news.xml\n"
+            raise RuntimeError("unexpected fetch")
+
+        mock_fetch_text.side_effect = fake_fetch
+        urls = _discover_default_sitemap_urls("https://abc.xyz/investor/")
+        self.assertIn("https://abc.xyz/sitemap.xml", urls)
+        self.assertIn("https://abc.xyz/investor/sitemap.xml", urls)
+        self.assertIn("https://abc.xyz/investor/sitemap-news.xml", urls)
+
+    @patch("app.services.official_source_resolver._fetch_text")
+    def test_discover_sitemap_sources_expands_nested_sitemap_index(self, mock_fetch_text: object) -> None:
+        sitemap_index = """
+        <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+          <sitemap><loc>https://example.com/investor-news.xml</loc></sitemap>
+        </sitemapindex>
+        """
+        sitemap_leaf = """
+        <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+          <url><loc>https://example.com/investor/news/2021/0202/alphabet-announces-fourth-quarter-and-fiscal-year-2020-results/</loc></url>
+          <url><loc>https://example.com/investor/events/2021/q4-2020-earnings-call-webcast/</loc></url>
+        </urlset>
+        """
+
+        def fake_fetch(url: str) -> str:
+            if url == "https://example.com/sitemap.xml":
+                return sitemap_index
+            if url == "https://example.com/investor-news.xml":
+                return sitemap_leaf
+            raise RuntimeError(f"unexpected fetch: {url}")
+
+        mock_fetch_text.side_effect = fake_fetch
+        company = get_company("alphabet")
+        discovered = _discover_sitemap_sources(company, "2020Q4", "2020-12-31", "https://example.com/sitemap.xml")
+        roles = {str(item.get("role") or "") for item in discovered}
+        self.assertIn("earnings_release", roles)
+        self.assertIn("earnings_call", roles)
+
     def test_quarter_fallback_for_structure_keeps_metric_baseline(self) -> None:
         fallback = _quarter_fallback_for_structure(
             {
@@ -569,6 +977,35 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         self.assertEqual(parsed["current_geographies"][0]["name"], "United States")
         self.assertAlmostEqual(parsed["latest_kpis"]["gaap_gross_margin_pct"], 47.57, places=1)
         self.assertAlmostEqual(parsed["latest_kpis"]["gaap_eps"], 3.9, places=1)
+
+    def test_parse_official_materials_tsmc_extracts_ending_equity_from_balance_sheet_presentation(self) -> None:
+        presentation_path = self._write_temp_text(
+            "tsmc-quarterly-presentation-equity.txt",
+            (
+                "Balance Sheets & Key Indices "
+                "Selected Items from Balance Sheets "
+                "(In NT$ billions) Amount % Amount % Amount % "
+                "Total Assets 7,006.35 100.0% 7,133.29 100.0% 5,982.36 100.0% "
+                "Total Liabilities 2,389.72 34.1% 2,531.66 35.5% 2,162.22 36.1% "
+                "Total Shareholders' Equity 4,616.63 65.9% 4,601.63 64.5% 3,820.14 63.9% "
+            ),
+        )
+
+        parsed = parse_official_materials(
+            get_company("tsmc"),
+            {
+                "fiscal_label": "2025Q2",
+                "calendar_quarter": "2025Q2",
+                "period_end": "2025-06-30",
+                "coverage_months": ["2025-04", "2025-05", "2025-06"],
+                "latest_kpis": {"revenue_bn": 30.07, "net_income_bn": 12.83},
+            },
+            [
+                {"label": "TSMC earnings presentation", "kind": "presentation", "status": "cached", "text_path": presentation_path},
+            ],
+        )
+
+        self.assertAlmostEqual(parsed["latest_kpis"]["ending_equity_bn"], 4_616.63, places=2)
 
     def test_parse_official_materials_tsmc_legacy_application_mix_maps_to_platform_segments(self) -> None:
         presentation_path = self._write_temp_text(
@@ -1897,6 +2334,22 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
             ["Walmart U.S.", "Walmart International", "Sam's Club U.S."],
         )
 
+    def test_normalize_segment_items_maps_historical_aliases_to_canonical_taxonomy(self) -> None:
+        company = get_company("apple")
+        unordered = [
+            {"name": "Software, service and other sales", "value_bn": 5.0},
+            {"name": "iPad and related products and services", "value_bn": 4.0},
+            {"name": "Total Macintosh net sales", "value_bn": 3.0},
+            {"name": "iPhone and related products and services", "value_bn": 12.0},
+        ]
+
+        normalized = _normalize_segment_items(company, unordered)
+
+        self.assertEqual(
+            [item["name"] for item in normalized],
+            ["iPhone", "Mac", "iPad", "Services"],
+        )
+
     def test_quarter_reference_terms_use_fiscal_quarter_for_non_calendar_year_companies(self) -> None:
         company = get_company("apple")
 
@@ -1990,7 +2443,6 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
             self.assertIn(expected, income_svg)
             self.assertIn(expected, translation_svg)
         self.assertIn("Other Bets", income_svg)
-
 
 if __name__ == "__main__":
     unittest.main()

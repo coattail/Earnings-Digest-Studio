@@ -122,6 +122,7 @@ def _read_cached_submissions(path: Path) -> Optional[dict[str, Any]]:
 
 
 def _write_cached_submissions(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return payload
 
@@ -845,6 +846,8 @@ def _ir_role_keywords_match(link: dict[str, str], role: str) -> bool:
     if role == "earnings_release":
         if "to announce" in tokens:
             return False
+        if any(keyword in tokens for keyword in ("earnings call", "conference call", "webcast", "transcript", "prepared remarks", "presentation", "slides", "deck", "/events/")):
+            return False
         return any(keyword in tokens for keyword in ("earnings", "financial results", "quarterly results", "press release", "results"))
     return True
 
@@ -1069,34 +1072,81 @@ def _discover_sitemap_sources(
     *,
     required_roles: Optional[set[str]] = None,
 ) -> list[dict[str, Any]]:
-    try:
-        payload = _fetch_text(sitemap_url)
-    except Exception:
-        return []
-    try:
-        root = ET.fromstring(payload)
-    except ET.ParseError:
-        return []
+    def _dedupe_urls(urls: list[str]) -> list[str]:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in urls:
+            normalized = str(item or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            deduped.append(normalized)
+            seen.add(normalized)
+        return deduped
 
-    namespace = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-    loc_nodes = root.findall(".//sm:loc", namespace) or root.findall(".//loc")
-    if not loc_nodes:
-        return []
+    def _sitemap_discovery_score(url: str) -> int:
+        tokens = _document_tokens(url)
+        score = 0
+        for keyword in (
+            "investor",
+            "earnings",
+            "results",
+            "quarter",
+            "financial",
+            "press",
+            "news",
+            "presentation",
+            "events",
+        ):
+            if keyword in tokens:
+                score += 8
+        if tokens.endswith(".xml"):
+            score += 3
+        if any(keyword in tokens for keyword in ("image", "video", "product", "support", "store")):
+            score -= 6
+        return score
+
+    def _sitemap_links_from_url(target_url: str, depth: int = 0) -> list[dict[str, str]]:
+        try:
+            payload = _fetch_text(target_url)
+        except Exception:
+            return []
+        try:
+            root = ET.fromstring(payload)
+        except ET.ParseError:
+            return []
+
+        namespace = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+        loc_nodes = root.findall(".//sm:loc", namespace) or root.findall(".//loc")
+        if not loc_nodes:
+            return []
+
+        root_tag = str(root.tag or "").lower()
+        loc_values = _dedupe_urls([str(node.text or "").strip() for node in loc_nodes if str(node.text or "").strip()])
+        if "sitemapindex" in root_tag and depth < 1:
+            child_urls = sorted(loc_values, key=_sitemap_discovery_score, reverse=True)[:8]
+            nested_links: list[dict[str, str]] = []
+            seen_nested: set[str] = set()
+            for child_url in child_urls:
+                for link in _sitemap_links_from_url(child_url, depth + 1):
+                    link_url = str(link.get("url") or "")
+                    if not link_url or link_url in seen_nested:
+                        continue
+                    nested_links.append(link)
+                    seen_nested.add(link_url)
+            return nested_links
+
+        return [{"url": loc, "text": _url_slug_text(loc)} for loc in loc_values]
 
     calendar_terms, fiscal_terms, target_years, allowed_quarters = _quarter_reference_terms(company, calendar_quarter, period_end)
     roles = required_roles or {"earnings_release", "earnings_call", "earnings_presentation", "earnings_commentary"}
+    sitemap_links = _sitemap_links_from_url(sitemap_url)
+    if not sitemap_links:
+        return []
     discovered: list[dict[str, Any]] = []
     for role in roles:
         best_link: Optional[dict[str, str]] = None
         best_score = 0
-        for node in loc_nodes:
-            loc = str(node.text or "").strip()
-            if not loc:
-                continue
-            link = {
-                "url": loc,
-                "text": _url_slug_text(loc),
-            }
+        for link in sitemap_links:
             if not _ir_role_keywords_match(link, role):
                 continue
             if not _ir_temporal_alignment(link, target_years=target_years, allowed_quarters=allowed_quarters):
@@ -1125,6 +1175,50 @@ def _discover_sitemap_sources(
             }
         )
     return discovered
+
+
+def _discover_default_sitemap_urls(ir_url: str) -> list[str]:
+    parsed = urlparse(str(ir_url or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return []
+
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    path = parsed.path.rstrip("/")
+    base_urls = [origin]
+    if path:
+        base_urls.append(f"{origin}{path}")
+
+    candidates: list[str] = []
+    for base_url in base_urls:
+        candidates.extend(
+            [
+                f"{base_url}/sitemap.xml",
+                f"{base_url}/sitemap_index.xml",
+                f"{base_url}/sitemap-index.xml",
+            ]
+        )
+
+    try:
+        robots_text = _fetch_text(f"{origin}/robots.txt")
+    except Exception:
+        robots_text = ""
+    if robots_text:
+        for line in robots_text.splitlines():
+            if not line.lower().startswith("sitemap:"):
+                continue
+            robots_sitemap_url = str(line.split(":", 1)[1] or "").strip()
+            if robots_sitemap_url:
+                candidates.append(robots_sitemap_url)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = str(candidate or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        deduped.append(normalized)
+        seen.add(normalized)
+    return deduped
 
 
 def _series_fallback_source(company: dict[str, Any], calendar_quarter: str) -> Optional[dict[str, Any]]:
@@ -1306,10 +1400,14 @@ def resolve_official_sources(
         for role in {"earnings_release", "earnings_call", "earnings_presentation"}
         if role not in resolved_roles or (role == "earnings_release" and ir_url and not has_ir_release)
     }
-    if missing_roles and sitemap_urls:
+    auto_sitemap_urls: list[str] = []
+    if missing_roles and ir_url:
+        auto_sitemap_urls = _discover_default_sitemap_urls(ir_url)
+    sitemap_candidates = list(dict.fromkeys(sitemap_urls + auto_sitemap_urls))
+    if missing_roles and sitemap_candidates:
         notify(0.78, "正在扫描公司官方 sitemap，定位历史财报与电话会页面...")
         sitemap_sources: list[dict[str, Any]] = []
-        for sitemap_url in sitemap_urls:
+        for sitemap_url in sitemap_candidates:
             sitemap_sources.extend(
                 _discover_sitemap_sources(
                     company,

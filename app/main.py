@@ -17,6 +17,7 @@ from .services.reports import (
     company_quarters,
     create_report,
     create_report_job,
+    ensure_report_payload_defaults,
     get_report,
     get_report_job,
     resolve_canonical_report_id,
@@ -46,7 +47,7 @@ def _asset_version() -> str:
 
 
 def _report_context(record: dict[str, Any], show_toolbar: bool) -> dict[str, Any]:
-    payload = record["payload"]
+    payload = ensure_report_payload_defaults(record["payload"])
     css_text = (STATIC_DIR / "app.css").read_text(encoding="utf-8")
     return {
         "app_title": APP_TITLE,

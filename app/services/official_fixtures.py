@@ -18,10 +18,12 @@ BRAND_SEGMENT_COLOR_UPDATES = {
         "Service and other revenue": "#14B8A6",
     },
     "alphabet": {
+        "Google properties": "#1A73E8",
         "Google Services": "#2563EB",
         "Google Search & other": "#2563EB",
         "YouTube ads": "#DC2626",
         "Google Network": "#F59E0B",
+        "Google other": "#0F9D58",
         "Google subscriptions, platforms, and devices": "#0F9D58",
         "Google Cloud": "#1A73E8",
         "Other Bets": "#64748B",

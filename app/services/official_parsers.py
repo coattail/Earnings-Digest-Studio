@@ -830,6 +830,73 @@ def _extract_pct_metric(flat_text: str, labels: list[str]) -> Optional[float]:
     return None
 
 
+def _extract_scaled_label_value(
+    text: str,
+    labels: list[str],
+    *,
+    scale: float,
+) -> Optional[float]:
+    for label in labels:
+        match = _search(
+            rf"{_table_label_pattern(label)}"
+            r"\s+\$?\s*([0-9,]+(?:\.[0-9]+)?)",
+            text,
+        )
+        if not match:
+            continue
+        parsed = _parse_number(match.group(1))
+        if parsed is not None:
+            return float(parsed) * scale
+    return None
+
+
+def _extract_ending_equity_bn(materials: list[dict[str, Any]]) -> Optional[float]:
+    labels = [
+        "Total stockholders' equity",
+        "Total stockholders equity",
+        "Total shareholders' equity",
+        "Total shareholders equity",
+        "Total equity",
+        "Stockholders' equity",
+        "Shareholders' equity",
+        "Equity attributable to shareholders of the parent",
+        "Equity attributable to owners of the company",
+        "Equity attributable to owners of parent",
+    ]
+    for material in _ordered_narrative_materials(materials):
+        raw_text = str(material.get("raw_text") or "")
+        flat_text = str(material.get("flat_text") or raw_text)
+        if not flat_text:
+            continue
+        lowered = flat_text.lower()
+        if not any(
+            marker in lowered
+            for marker in (
+                "balance sheets",
+                "balance sheet",
+                "financial position",
+                "selected items from balance sheets",
+            )
+        ):
+            continue
+        for text in (raw_text, flat_text):
+            if not text:
+                continue
+            if _search(r"in\s+(?:nt\$|us\$)?\s*billions", text) or _search(r"\(in\s+billions\)", text):
+                equity_bn = _extract_scaled_label_value(text, labels, scale=1.0)
+                if equity_bn is not None:
+                    return equity_bn
+            if _search(r"in\s+millions", text) or _search(r"\(millions\)", text):
+                equity_bn = _extract_scaled_label_value(text, labels, scale=0.001)
+                if equity_bn is not None:
+                    return equity_bn
+            if _search(r"in\s+thousands", text):
+                equity_bn = _extract_scaled_label_value(text, labels, scale=0.000001)
+                if equity_bn is not None:
+                    return equity_bn
+    return None
+
+
 def _is_annual_material(material: Optional[dict[str, Any]]) -> bool:
     if material is None:
         return False
@@ -864,9 +931,11 @@ COMPANY_SEGMENT_PROFILES: dict[str, list[dict[str, Any]]] = {
         {"name": "Software, service, and other sales", "labels": ["Software, service, and other sales", "Software, service and other sales", "Software, service, and other sales (h)"]},
     ],
     "alphabet": [
+        {"name": "Google properties", "labels": ["Google properties", "Google properties revenues"]},
         {"name": "Google Search & other", "labels": ["Google Search & other", "Google Search and other"]},
         {"name": "YouTube ads", "labels": ["YouTube ads", "YouTube advertising"]},
         {"name": "Google Network", "labels": ["Google Network"]},
+        {"name": "Google other", "labels": ["Google other", "Google other revenues"]},
         {
             "name": "Google subscriptions, platforms, and devices",
             "labels": [
@@ -883,6 +952,13 @@ COMPANY_SEGMENT_PROFILES: dict[str, list[dict[str, Any]]] = {
         {"name": "North America", "labels": ["North America"]},
         {"name": "International", "labels": ["International"]},
         {"name": "AWS", "labels": ["AWS", "Amazon Web Services"]},
+    ],
+    "berkshire": [
+        {"name": "Insurance underwriting", "labels": ["Insurance underwriting", "Insurance-underwriting"]},
+        {"name": "Insurance investment income", "labels": ["Insurance investment income", "Insurance-investment income"]},
+        {"name": "BNSF", "labels": ["BNSF", "BNSF Railway"]},
+        {"name": "Berkshire Hathaway Energy", "labels": ["Berkshire Hathaway Energy", "Berkshire Hathaway Energy Company"]},
+        {"name": "Manufacturing, service and retailing", "labels": ["Manufacturing, service and retailing", "Manufacturing", "Service", "Retailing"]},
     ],
     "meta": [
         {"name": "Family of Apps", "labels": ["Family of Apps"]},
@@ -2474,6 +2550,7 @@ def _finalize(
             "free_cash_flow_bn": facts.get("free_cash_flow_bn"),
             "gaap_eps": facts.get("gaap_eps"),
             "non_gaap_eps": facts.get("non_gaap_eps", facts.get("gaap_eps")),
+            "ending_equity_bn": facts.get("ending_equity_bn"),
         }
     )
 
@@ -3051,12 +3128,12 @@ def _parse_microsoft(
 ) -> dict[str, Any]:
     release = _pick_material(materials, kind="official_release")
     sec = _pick_material(materials, kind="sec_filing")
-    if release is None or sec is None:
+    if release is None and sec is None:
         return {}
 
-    release_flat = release["flat_text"]
-    sec_flat = sec["flat_text"]
-    sec_raw = sec["raw_text"]
+    release_flat = str(release.get("flat_text") or "") if release else ""
+    sec_flat = str(sec.get("flat_text") or "") if sec else ""
+    sec_raw = str(sec.get("raw_text") or "") if sec else ""
     money_symbol = company["money_symbol"]
 
     product_revenue_match = _search(r"Revenue:\s+Product\s+\$?\s*([0-9,]+)\s+\$?\s*([0-9,]+)", sec_flat)
@@ -3107,7 +3184,7 @@ def _parse_microsoft(
     prior_service_revenue_bn = _bn_from_millions(service_revenue_match.group(2)) if service_revenue_match else None
     product_cost_bn = _bn_from_millions(product_cost_match.group(1)) if product_cost_match else None
     service_cost_bn = _bn_from_millions(service_cost_match.group(1)) if service_cost_match else None
-    geographies = _microsoft_geographies(sec_flat)
+    geographies = _microsoft_geographies(sec_flat) if sec_flat else []
     if total_revenue_bn is not None and total_cost_of_revenue_bn is not None:
         gross_margin_pct = (float(total_revenue_bn) - float(total_cost_of_revenue_bn)) / float(total_revenue_bn) * 100
 
@@ -3128,6 +3205,8 @@ def _parse_microsoft(
             _directional_pct(mpc_match.group(2) or mpc_match.group(4), mpc_match.group(3)) if mpc_match else None,
         ),
     )
+    if not segments:
+        segments = _extract_company_segments(str(company["id"]), materials)
     segment_margin_matches = {
         "Productivity and Business Processes": _search(
             r"Productivity and Business Processes\s+Revenue\s+\$?\s*([0-9,]+).*?Operating income\s+\$?\s*([0-9,]+)",
@@ -3159,10 +3238,47 @@ def _parse_microsoft(
     if service_revenue_bn not in (None, 0) and service_cost_bn is not None:
         service_margin_pct = (float(service_revenue_bn) - float(service_cost_bn)) / float(service_revenue_bn) * 100
 
+    primary_label = release["label"] if release is not None else sec["label"]
+    structure_label = release["label"] if release is not None else sec["label"]
+    guidance = _extract_generic_guidance(release or sec) if (release or sec) is not None else {}
+    quotes = _extract_quote_cards(release) or _extract_quote_cards(sec)
+    top_segment = _top_segment(segments)
+    fastest_segment = _fastest_segment(segments)
+    driver_parts: list[str] = []
+    if top_segment is not None:
+        driver_parts.append(f"{top_segment['name']} 仍是核心收入支柱")
+    if cloud_match is not None:
+        driver_parts.append(f"Microsoft Cloud 达到 {format_money_bn(_bn_from_billions(cloud_match.group(1)), money_symbol)}")
+    if fastest_segment is not None and fastest_segment.get("yoy_pct") is not None:
+        driver_parts.append(f"{fastest_segment['name']} 同比 {format_pct(float(fastest_segment['yoy_pct']), signed=True)}")
+    driver = "；".join(driver_parts) if driver_parts else "Azure、Microsoft Cloud 与企业软件仍在同向放大 AI 变现"
+
+    income_sources: list[dict[str, Any]] = []
+    if product_revenue_bn is not None:
+        income_sources.append(
+            {
+                "name": "Product revenue",
+                "value_bn": round(product_revenue_bn, 3),
+                "yoy_pct": round(_pct_change(product_revenue_bn, prior_product_revenue_bn) or 0.0, 1) if prior_product_revenue_bn is not None else None,
+                "margin_pct": product_margin_pct,
+            }
+        )
+    if service_revenue_bn is not None:
+        income_sources.append(
+            {
+                "name": "Service and other revenue",
+                "value_bn": round(service_revenue_bn, 3),
+                "yoy_pct": round(_pct_change(service_revenue_bn, prior_service_revenue_bn) or 0.0, 1) if prior_service_revenue_bn is not None else None,
+                "margin_pct": service_margin_pct,
+            }
+        )
+    if not income_sources:
+        income_sources = list(segments)
+
     facts = {
-        "primary_source_label": release["label"],
-        "structure_source_label": release["label"],
-        "guidance_source_label": release["label"],
+        "primary_source_label": primary_label,
+        "structure_source_label": structure_label,
+        "guidance_source_label": primary_label,
         "revenue_bn": total_revenue_bn or (_bn_from_billions(revenue_match.group(1)) if revenue_match else None),
         "revenue_yoy_pct": _pct_value(revenue_match.group(2)) if revenue_match else _pct_change(total_revenue_bn, prior_total_revenue_bn),
         "gross_margin_pct": gross_margin_pct,
@@ -3174,28 +3290,26 @@ def _parse_microsoft(
         "non_gaap_eps": _parse_number(eps_match.group(3)) if eps_match else None,
         "segments": segments,
         "geographies": geographies,
-        "driver": "Azure、Microsoft Cloud 与企业软件仍在同向放大 AI 变现",
-        "guidance": {
+        "driver": driver,
+        "guidance": guidance or {
             "mode": "official_context",
             "commentary": (
-                "公司本次未给出 consolidated revenue 数值指引；但 Satya Nadella 强调 AI diffusion 仍在早期，"
-                "Amy Hood 明确指出 Microsoft Cloud 单季收入首次突破 500 亿美元，管理层语境继续偏积极。"
+                "公司本次未给出 consolidated revenue 数值指引；但管理层持续强调云与 AI 仍处扩散初期，"
+                "Microsoft Cloud 与 Azure 仍是最重要的兑现锚点。"
             ),
         },
-        "quotes": [
-            _quote_card(
-                "Satya Nadella",
-                "We are only at the beginning phases of AI diffusion and already Microsoft has built an AI business that is larger than some of our biggest franchises.",
-                "管理层把 AI 定义为仍处早期渗透阶段，但体量已经足够大，这对后续估值与增长持续性都很关键。",
-                release["label"],
-            ),
-            _quote_card(
-                "Amy Hood",
-                "Microsoft Cloud revenue crossed $50 billion this quarter, reflecting the strong demand for our portfolio of services.",
-                "这句原话把云业务需求强度与整体收入超预期直接绑定，是当前季度最重要的官方经营锚点之一。",
-                release["label"],
-            ),
-        ],
+        "quotes": quotes or (
+            [
+                _quote_card(
+                    "Satya Nadella",
+                    "We are innovating across every layer of our differentiated technology stack and leading in key secular areas that are critical to our customers' success.",
+                    "即使旧年份口径下，管理层也把平台层创新和企业客户价值作为季度主线。",
+                    primary_label,
+                )
+            ]
+            if release is not None
+            else []
+        ),
         "management_theme_items": [
             _theme("Azure 与 AI 供需共振", 92, f"Azure 及其他云服务收入同比增长 {format_pct(_pct_value(azure_match.group(1)) if azure_match else None, signed=True)}。"),
             _theme("Microsoft Cloud 体量上台阶", 86, f"Microsoft Cloud 单季收入 {format_money_bn(_bn_from_billions(cloud_match.group(1)) if cloud_match else None, money_symbol)}。"),
@@ -3218,10 +3332,7 @@ def _parse_microsoft(
         ],
         "income_statement": {
             "subtitle": "利润表页改用业务集团桥接收入，并向下串联 Microsoft 官方成本与经营费用科目。",
-            "sources": [
-                {"name": "Product revenue", "value_bn": round(product_revenue_bn or 0.0, 3), "yoy_pct": round(_pct_change(product_revenue_bn, prior_product_revenue_bn) or 0.0, 1), "margin_pct": product_margin_pct},
-                {"name": "Service and other revenue", "value_bn": round(service_revenue_bn or 0.0, 3), "yoy_pct": round(_pct_change(service_revenue_bn, prior_service_revenue_bn) or 0.0, 1), "margin_pct": service_margin_pct},
-            ],
+            "sources": income_sources,
             "opex_breakdown": [
                 {"name": "Research and development", "value_bn": round(r_and_d_bn or 0.0, 3), "pct_of_revenue": round((r_and_d_bn or 0.0) / (total_revenue_bn or 1) * 100, 1), "color": "#E11D48"},
                 {"name": "Sales and marketing", "value_bn": round(sales_marketing_bn or 0.0, 3), "pct_of_revenue": round((sales_marketing_bn or 0.0) / (total_revenue_bn or 1) * 100, 1), "color": "#F43F5E"},
@@ -3260,12 +3371,19 @@ def _parse_alphabet_historical(
 ) -> dict[str, Any]:
     parsed = _parse_generic(company, fallback, materials) or {}
     release = _pick_material(materials, kind="official_release") or _pick_material(materials, kind="call_summary")
-    if release is None:
+    sec = _pick_material(materials, kind="sec_filing")
+    primary = release or sec
+    if primary is None:
         return parsed
 
-    flat = release["flat_text"]
+    flat = primary["flat_text"]
     money_symbol = company["money_symbol"]
-    segments = _segment_list(
+    latest_kpis = dict(parsed.get("latest_kpis") or {})
+    segment_revenue_bn = _coalesce_number(
+        dict(fallback.get("latest_kpis") or {}).get("revenue_bn"),
+        latest_kpis.get("revenue_bn"),
+    )
+    detailed_segments = _segment_list(
         _alphabet_historical_segment(flat, "Google Search & other", "Google Search & other"),
         _alphabet_historical_segment(flat, "YouTube ads", "YouTube ads"),
         _alphabet_historical_segment(flat, "Google Network Members' properties", "Google Network"),
@@ -3273,10 +3391,24 @@ def _parse_alphabet_historical(
         _alphabet_historical_segment(flat, "Google other", "Google subscriptions, platforms, and devices"),
         _alphabet_historical_segment(flat, "Other Bets revenues", "Other Bets"),
     )
+    legacy_segments = _segment_list(
+        _alphabet_historical_segment(flat, "Google properties revenues", "Google properties"),
+        _alphabet_historical_segment(flat, "Google Network Members' properties revenues", "Google Network"),
+        _alphabet_historical_segment(flat, "Google other revenues", "Google other"),
+        _alphabet_historical_segment(flat, "Other Bets revenues", "Other Bets"),
+    )
+    segments = detailed_segments
+    if not _segments_reasonable_for_revenue(segments, segment_revenue_bn):
+        if _segments_reasonable_for_revenue(legacy_segments, segment_revenue_bn):
+            segments = legacy_segments
+        elif len(legacy_segments) > len(segments):
+            segments = legacy_segments
+    if not segments:
+        segments = legacy_segments
+    segments = segments or list(parsed.get("current_segments") or []) or _extract_company_segments(str(company["id"]), materials)
     if not segments:
         return parsed
 
-    latest_kpis = dict(parsed.get("latest_kpis") or {})
     segment_revenue_bn = sum(float(item.get("value_bn") or 0.0) for item in segments) or None
     revenue_bn = _coalesce_number(
         dict(fallback.get("latest_kpis") or {}).get("revenue_bn"),
@@ -3328,7 +3460,7 @@ def _parse_alphabet_historical(
         return (None, None, None)
 
     current_us_match = _search(r"United States revenues \(GAAP\)\s+\$?\s*([0-9,]+(?:\.[0-9]+)?)\s+\$?\s*([0-9,]+(?:\.[0-9]+)?)", flat)
-    current_geographies: list[dict[str, Any]] = []
+    current_geographies: list[dict[str, Any]] = list(parsed.get("current_geographies") or [])
     detailed_geo_rows = [
         ("United States",) + _historical_geo_row("United States"),
         ("EMEA",) + _historical_geo_row("EMEA"),
@@ -3394,6 +3526,7 @@ def _parse_alphabet_historical(
         {
             "current_segments": segments,
             "current_geographies": current_geographies,
+            "call_quote_cards": _extract_quote_cards(release or sec),
             "management_themes": [
                 _theme(
                     "搜索仍是主引擎",
@@ -3456,7 +3589,17 @@ def _parse_alphabet_historical(
                     if current_geographies and len(current_geographies) >= 3
                     else ""
                 )
-            ],
+            ]
+            + (
+                ["若当季仍处于旧披露阶段，业务结构会自动切换到 Google properties / Google Network / Google other / Other Bets 官方口径。"] 
+                if any(str(item.get("name") or "") == "Google properties" for item in segments)
+                else []
+            )
+            + (
+                ["若 release 页面暂未稳定发现，系统会退回到 SEC filing 与通用分部抽取逻辑，优先维持业务口径连续性。"]
+                if release is None
+                else []
+            ),
         }
     )
     return _merge_parsed_payload(updates, parsed)
@@ -4759,6 +4902,10 @@ def _parse_tsmc(
         statement_metrics.get("gaap_eps_yoy_pct"),
         fallback_latest_kpis.get("gaap_eps_yoy_pct"),
     )
+    ending_equity_bn = _coalesce_number(
+        _extract_ending_equity_bn(materials),
+        fallback_latest_kpis.get("ending_equity_bn"),
+    )
     primary_material = presentation or release or (materials[0] if materials else None)
     guidance_material = release or presentation or primary_material
     net_income_bn = _coalesce_number(
@@ -4786,6 +4933,7 @@ def _parse_tsmc(
         "gaap_eps": statement_eps,
         "gaap_eps_yoy_pct": statement_eps_yoy,
         "non_gaap_eps": statement_eps,
+        "ending_equity_bn": ending_equity_bn,
         "segments": segments,
         "geographies": quarterly_geographies,
         "guidance": _extract_generic_guidance(guidance_material) or dict(fallback.get("guidance") or {}),
@@ -4817,6 +4965,8 @@ def _parse_tsmc(
             latest_kpis.setdefault("non_gaap_eps", float(statement_eps))
         if statement_eps_yoy is not None and latest_kpis.get("gaap_eps_yoy_pct") is None:
             latest_kpis["gaap_eps_yoy_pct"] = float(statement_eps_yoy)
+        if ending_equity_bn is not None and latest_kpis.get("ending_equity_bn") is None:
+            latest_kpis["ending_equity_bn"] = float(ending_equity_bn)
         parsed["latest_kpis"] = latest_kpis
 
     coverage_notes = list(parsed.get("coverage_notes") or [])
@@ -5268,6 +5418,10 @@ def _parse_generic(
             gaap_eps, prior_eps = _per_share_row(sec_flat, "Diluted")
             gaap_eps_yoy_pct = _pct_change(gaap_eps, prior_eps)
 
+    ending_equity_bn = _extract_ending_equity_bn(metric_materials)
+    if ending_equity_bn is None and sec is not None:
+        ending_equity_bn = _extract_ending_equity_bn([sec])
+
     segments = _extract_company_segments(company["id"], materials)
     if not segments:
         annual_materials = _load_nearby_annual_materials(company, fallback, materials)
@@ -5308,6 +5462,7 @@ def _parse_generic(
         "free_cash_flow_bn": free_cash_flow_bn,
         "gaap_eps": gaap_eps,
         "gaap_eps_yoy_pct": gaap_eps_yoy_pct,
+        "ending_equity_bn": ending_equity_bn,
         "segments": segments,
         "geographies": geographies,
         "guidance": guidance,
