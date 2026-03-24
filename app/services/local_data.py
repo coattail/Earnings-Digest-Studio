@@ -72,6 +72,16 @@ def _sort_periods(periods: List[str]) -> List[str]:
     return sorted(periods, key=_parse_period)
 
 
+def _shift_period(period: str, delta: int) -> str:
+    year, quarter = _parse_period(period)
+    if not year:
+        return period
+    index = year * 4 + (quarter - 1) + int(delta)
+    shifted_year = index // 4
+    shifted_quarter = index % 4 + 1
+    return f"{shifted_year}Q{shifted_quarter}"
+
+
 def _remap_period_label(period: str, mode: str) -> str:
     year, quarter = _parse_period(period)
     if not year:
@@ -314,15 +324,28 @@ def _load_companyfacts(company: dict[str, Any], refresh: bool = False) -> Option
     return payload
 
 
-def _concept_unit_items(payload: dict[str, Any], concept_name: str) -> list[dict[str, Any]]:
+def _concept_unit_items(
+    payload: dict[str, Any],
+    concept_name: str,
+    preferred_currency_code: Optional[str] = None,
+) -> list[dict[str, Any]]:
     concept = payload.get("facts", {}).get("us-gaap", {}).get(concept_name)
     if not isinstance(concept, dict):
         return []
     items: list[dict[str, Any]] = []
     units = concept.get("units", {})
-    for unit_name, values in units.items():
-        if not str(unit_name).upper().startswith("USD"):
-            continue
+    preferred = str(preferred_currency_code or "").upper().strip()
+    candidate_units: list[str] = []
+    if preferred and preferred in units:
+        candidate_units.append(preferred)
+    candidate_units.extend(
+        unit_name
+        for unit_name in units.keys()
+        if re.fullmatch(r"[A-Z]{3}", str(unit_name).upper().strip())
+        and unit_name not in candidate_units
+    )
+    for unit_name in candidate_units:
+        values = units.get(unit_name)
         if isinstance(values, list):
             items.extend(value for value in values if isinstance(value, dict))
     return items
@@ -347,10 +370,14 @@ def _fact_quarter_label(item: dict[str, Any]) -> Optional[str]:
     return _calendar_quarter_from_period_end(end)
 
 
-def _instant_concept_map(payload: dict[str, Any], concept_names: list[str]) -> dict[str, dict[str, Any]]:
+def _instant_concept_map(
+    payload: dict[str, Any],
+    concept_names: list[str],
+    preferred_currency_code: Optional[str] = None,
+) -> dict[str, dict[str, Any]]:
     selected: dict[str, dict[str, Any]] = {}
     for concept_name in concept_names:
-        for item in _concept_unit_items(payload, concept_name):
+        for item in _concept_unit_items(payload, concept_name, preferred_currency_code=preferred_currency_code):
             period = _fact_quarter_label(item)
             value = item.get("val")
             if period is None or value is None:
@@ -405,10 +432,14 @@ def _compute_ttm_roe_series(periods: list[str], earnings: dict[str, int], equity
     return roe
 
 
-def _quarterly_concept_map(payload: dict[str, Any], concept_names: list[str]) -> dict[str, dict[str, Any]]:
+def _quarterly_concept_map(
+    payload: dict[str, Any],
+    concept_names: list[str],
+    preferred_currency_code: Optional[str] = None,
+) -> dict[str, dict[str, Any]]:
     selected: dict[str, dict[str, Any]] = {}
     for concept_name in concept_names:
-        for item in _concept_unit_items(payload, concept_name):
+        for item in _concept_unit_items(payload, concept_name, preferred_currency_code=preferred_currency_code):
             period = _fact_quarter_label(item)
             duration_days = _fact_duration_days(item)
             value = item.get("val")
@@ -445,19 +476,132 @@ def _quarterly_concept_map(payload: dict[str, Any], concept_names: list[str]) ->
     return selected
 
 
-def _build_companyfacts_series(payload: dict[str, Any]) -> dict[str, Any]:
+def _annual_concept_map(
+    payload: dict[str, Any],
+    concept_names: list[str],
+    preferred_currency_code: Optional[str] = None,
+) -> dict[str, dict[str, Any]]:
+    selected: dict[str, dict[str, Any]] = {}
+    for concept_name in concept_names:
+        for item in _concept_unit_items(payload, concept_name, preferred_currency_code=preferred_currency_code):
+            period = _fact_quarter_label(item)
+            duration_days = _fact_duration_days(item)
+            value = item.get("val")
+            if period is None or value is None or duration_days is None:
+                continue
+            if duration_days < 320:
+                continue
+            score = 0
+            frame = str(item.get("frame") or "")
+            if re.fullmatch(r"CY\d{4}", frame):
+                score += 25
+            if str(item.get("fp") or "").upper() == "FY":
+                score += 10
+            score -= _fact_form_priority(str(item.get("form") or "")) * 3
+            filed = str(item.get("filed") or "")
+            candidate = dict(item)
+            candidate["_score"] = score
+            candidate["_concept"] = concept_name
+            current = selected.get(period)
+            if current is None:
+                selected[period] = candidate
+                continue
+            current_key = (
+                int(current.get("_score") or 0),
+                str(current.get("filed") or ""),
+                -_fact_form_priority(str(current.get("form") or "")),
+            )
+            candidate_key = (
+                int(candidate.get("_score") or 0),
+                filed,
+                -_fact_form_priority(str(candidate.get("form") or "")),
+            )
+            if candidate_key > current_key:
+                selected[period] = candidate
+    return selected
+
+
+def _apply_annual_delta_fill(
+    metric_map: dict[str, int],
+    annual_map: dict[str, dict[str, Any]],
+    period_meta: dict[str, dict[str, str]],
+) -> None:
+    for period, annual_item in annual_map.items():
+        if metric_map.get(period) is not None:
+            continue
+        annual_value = annual_item.get("val")
+        if annual_value is None:
+            continue
+        prev_periods = [_shift_period(period, -offset) for offset in (1, 2, 3)]
+        prev_values = [metric_map.get(token) for token in prev_periods]
+        if any(value is None for value in prev_values):
+            continue
+        derived = float(annual_value) - sum(float(value) for value in prev_values if value is not None)
+        if abs(derived) < 0.5:
+            derived = 0.0
+        annual_abs = abs(float(annual_value))
+        if annual_abs > 0 and abs(derived) > annual_abs * 1.4:
+            continue
+        metric_map[period] = int(round(derived))
+        period_meta.setdefault(
+            period,
+            {
+                "date_key": str(annual_item.get("end") or ""),
+                "filed": str(annual_item.get("filed") or ""),
+                "form": str(annual_item.get("form") or ""),
+                "accn": str(annual_item.get("accn") or ""),
+                "derived_from_annual": "1",
+            },
+        )
+
+
+def _build_companyfacts_series(
+    payload: dict[str, Any],
+    preferred_currency_code: Optional[str] = None,
+) -> dict[str, Any]:
     revenue_candidates = _quarterly_concept_map(
         payload,
         [
             "RevenueFromContractWithCustomerExcludingAssessedTax",
             "RevenueFromContractWithCustomerIncludingAssessedTax",
             "SalesRevenueNet",
+            "SalesRevenueGoodsNet",
+            "SalesRevenueServicesNet",
+            "RevenuesNetOfInterestExpense",
             "Revenues",
             "Revenue",
         ],
+        preferred_currency_code=preferred_currency_code,
     )
-    earnings_candidates = _quarterly_concept_map(payload, ["NetIncomeLoss", "ProfitLoss"])
-    gross_profit_candidates = _quarterly_concept_map(payload, ["GrossProfit"])
+    earnings_candidates = _quarterly_concept_map(
+        payload,
+        ["NetIncomeLoss", "ProfitLoss"],
+        preferred_currency_code=preferred_currency_code,
+    )
+    gross_profit_candidates = _quarterly_concept_map(
+        payload,
+        ["GrossProfit"],
+        preferred_currency_code=preferred_currency_code,
+    )
+    annual_revenue_candidates = _annual_concept_map(
+        payload,
+        [
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "RevenueFromContractWithCustomerIncludingAssessedTax",
+            "SalesRevenueNet",
+            "SalesRevenueGoodsNet",
+            "SalesRevenueServicesNet",
+            "RevenuesNetOfInterestExpense",
+            "Revenues",
+            "Revenue",
+        ],
+        preferred_currency_code=preferred_currency_code,
+    )
+    annual_earnings_candidates = _annual_concept_map(
+        payload,
+        ["NetIncomeLoss", "ProfitLoss", "NetIncomeLossAvailableToCommonStockholdersBasic"],
+        preferred_currency_code=preferred_currency_code,
+    )
     equity_candidates = _instant_concept_map(
         payload,
         [
@@ -466,6 +610,7 @@ def _build_companyfacts_series(payload: dict[str, Any]) -> dict[str, Any]:
             "CommonStockholdersEquity",
             "PartnersCapitalIncludingPortionAttributableToNoncontrollingInterest",
         ],
+        preferred_currency_code=preferred_currency_code,
     )
 
     revenue: dict[str, int] = {}
@@ -499,6 +644,8 @@ def _build_companyfacts_series(payload: dict[str, Any]) -> dict[str, Any]:
                 "accn": str(item.get("accn") or ""),
             },
         )
+    _apply_annual_delta_fill(revenue, annual_revenue_candidates, period_meta)
+    _apply_annual_delta_fill(earnings, annual_earnings_candidates, period_meta)
     for period, item in gross_profit_candidates.items():
         gross_profit_value = item.get("val")
         revenue_value = revenue.get(period)
@@ -629,12 +776,16 @@ def get_company_series(company_id: str) -> tuple[list[str], dict[str, Any]]:
         series["currency_code"] = company.get("currency_code", "USD")
         companyfacts_payload = _load_companyfacts(company)
         if companyfacts_payload:
-            official_series = _build_companyfacts_series(companyfacts_payload)
+            official_series = _build_companyfacts_series(
+                companyfacts_payload,
+                preferred_currency_code=str(company.get("currency_code") or "USD"),
+            )
             periods, series = _merge_official_series(list(periods), series, official_series)
         series["roe"] = _compute_ttm_roe_series(_sort_periods(list(periods)), dict(series.get("earnings") or {}), dict(series.get("equity") or {}))
-        available_periods = [period for period in periods if period in series["revenue"]]
+        available_periods = [period for period in periods if _quarter_has_core_metrics(period, series)]
         if company.get("quarter_label_mode") not in (None, "natural"):
             available_periods, series = _remap_series_labels(available_periods, series, str(company["quarter_label_mode"]))
+            available_periods = [period for period in available_periods if _quarter_has_core_metrics(period, series)]
         return available_periods, series
 
     cached = _load_cached_remote_series(company_id)
@@ -644,11 +795,15 @@ def get_company_series(company_id: str) -> tuple[list[str], dict[str, Any]]:
     series["equity"] = dict(series.get("equity") or {})
     companyfacts_payload = _load_companyfacts(company)
     if companyfacts_payload:
-        official_series = _build_companyfacts_series(companyfacts_payload)
+        official_series = _build_companyfacts_series(
+            companyfacts_payload,
+            preferred_currency_code=str(company.get("currency_code") or "USD"),
+        )
         periods, series = _merge_official_series(periods, series, official_series)
     series["roe"] = _compute_ttm_roe_series(_sort_periods(list(periods)), dict(series.get("earnings") or {}), dict(series.get("equity") or {}))
     if company.get("quarter_label_mode") not in (None, "natural"):
         periods, series = _remap_series_labels(periods, series, str(company["quarter_label_mode"]))
+    periods = [period for period in _sort_periods(list(dict.fromkeys(periods))) if _quarter_has_core_metrics(period, series)]
     return periods, series
 
 
@@ -673,12 +828,46 @@ def get_supported_quarters(
     history_window: int = 12,
     fetch_missing: bool = True,
 ) -> list[str]:
-    periods = get_company_periods(company_id, fetch_missing=fetch_missing)
+    periods, series = get_company_series(company_id) if fetch_missing else (get_company_periods(company_id, fetch_missing=False), {})
+    periods = _sort_periods(list(dict.fromkeys(periods)))
     if history_window <= 1:
-        return periods
+        return [period for period in periods if _quarter_has_core_metrics(period, series)]
     if len(periods) < history_window:
         return []
-    return periods[history_window - 1 :]
+    candidates = periods[history_window - 1 :]
+    return [period for period in candidates if _quarter_is_report_ready(period, periods, series, history_window)]
+
+
+def _quarter_has_core_metrics(period: str, series: dict[str, Any]) -> bool:
+    if not series:
+        return True
+    revenue = series.get("revenue", {}).get(period)
+    earnings = series.get("earnings", {}).get(period)
+    return revenue is not None and earnings is not None
+
+
+def _quarter_is_report_ready(
+    period: str,
+    periods: list[str],
+    series: dict[str, Any],
+    history_window: int,
+) -> bool:
+    if not _quarter_has_core_metrics(period, series):
+        return False
+    if not series:
+        return True
+    if period not in periods:
+        return False
+    end_index = periods.index(period)
+    start_index = max(0, end_index - history_window + 1)
+    window = periods[start_index : end_index + 1]
+    if len(window) < history_window:
+        return False
+    complete_count = sum(1 for item in window if _quarter_has_core_metrics(item, series))
+    # For one-click report stability, only expose quarters whose historical
+    # window has complete revenue + net-income coverage.
+    required_count = history_window
+    return complete_count >= required_count
 
 
 @lru_cache(maxsize=4)

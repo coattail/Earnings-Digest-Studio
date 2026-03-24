@@ -3,6 +3,7 @@ from __future__ import annotations
 import calendar as month_calendar
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import os
 import re
 import threading
 import uuid
@@ -11,6 +12,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from ..config import CACHE_DIR, ensure_directories
 from ..db import get_connection
 from ..utils import json_dumps, now_iso
 from .charts import (
@@ -41,6 +43,7 @@ from .local_data import (
 from .official_materials import hydrate_source_materials
 from .official_parsers import COMPANY_SEGMENT_PROFILES, parse_official_materials
 from .official_source_resolver import resolve_official_sources
+from .report_quality import evaluate_report_payload, quality_warnings_for_payload
 from .uploads import get_upload
 
 
@@ -61,7 +64,119 @@ REPORT_JOB_FUTURES_LOCK = threading.Lock()
 ProgressCallback = Callable[[float, str, str], None]
 RECENT_REPORT_CACHE_TTL_SECONDS = 6 * 60 * 60
 HISTORICAL_REPORT_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
-REPORT_PAYLOAD_SCHEMA_VERSION = 8
+REPORT_PAYLOAD_SCHEMA_VERSION = 12
+FULL_COVERAGE_ENV = "EARNINGS_DIGEST_REQUIRE_FULL_COVERAGE"
+FULL_COVERAGE_READY_MAP_PATH = APP_DIR.parent / "data" / "cache" / "full-coverage-ready-quarters.json"
+HISTORICAL_OFFICIAL_QUARTER_CACHE_DIR = CACHE_DIR / "historical-official-quarter-cache"
+HISTORICAL_OFFICIAL_QUARTER_CACHE_VERSION = 2
+HISTORICAL_OFFICIAL_QUARTER_MEMORY_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+HISTORICAL_OFFICIAL_QUARTER_MEMORY_LOCK = threading.Lock()
+
+
+def _env_flag(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().casefold() not in {"0", "false", "no", "off"}
+
+
+def _require_full_coverage_mode() -> bool:
+    # Default on: avoid silently shipping reports that still rely on fallback wording.
+    return _env_flag(FULL_COVERAGE_ENV, default=True)
+
+
+def _full_coverage_ready_quarters(company_id: str, history_window: int) -> Optional[list[str]]:
+    path = FULL_COVERAGE_READY_MAP_PATH
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not bool(payload.get("require_full_coverage")):
+        return None
+    if int(payload.get("history_window") or 0) != int(history_window):
+        return None
+    companies = payload.get("companies")
+    if not isinstance(companies, dict):
+        return None
+    company_entry = companies.get(company_id)
+    if not isinstance(company_entry, dict):
+        return None
+    if not bool(company_entry.get("all_quarters_audited")):
+        return None
+    ready_quarters = company_entry.get("ready_quarters")
+    if not isinstance(ready_quarters, list):
+        return []
+    return [str(item) for item in ready_quarters if str(item)]
+
+
+def _filter_supported_quarters_by_full_coverage(
+    company_id: str,
+    supported_quarters: list[str],
+    history_window: int,
+) -> tuple[list[str], bool]:
+    if not _require_full_coverage_mode():
+        return list(supported_quarters), False
+    ready_quarters = _full_coverage_ready_quarters(company_id, history_window)
+    if ready_quarters is None:
+        return list(supported_quarters), False
+    ready_set = set(ready_quarters)
+    return [quarter for quarter in supported_quarters if quarter in ready_set], True
+
+
+def _historical_official_quarter_cache_path(company_id: str, calendar_quarter: str) -> Path:
+    ensure_directories()
+    root = HISTORICAL_OFFICIAL_QUARTER_CACHE_DIR / str(company_id)
+    root.mkdir(parents=True, exist_ok=True)
+    return root / f"{calendar_quarter}.json"
+
+
+def _clone_cached_official_quarter_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "latest_kpis": dict(payload.get("latest_kpis") or {}),
+        "current_segments": [dict(item) for item in list(payload.get("current_segments") or []) if isinstance(item, dict)],
+        "current_geographies": [dict(item) for item in list(payload.get("current_geographies") or []) if isinstance(item, dict)],
+        "source_url": payload.get("source_url"),
+        "source_date": payload.get("source_date"),
+    }
+
+
+def _load_historical_official_quarter_cache(company_id: str, calendar_quarter: str) -> Optional[dict[str, Any]]:
+    cache_key = (str(company_id), str(calendar_quarter))
+    with HISTORICAL_OFFICIAL_QUARTER_MEMORY_LOCK:
+        cached = HISTORICAL_OFFICIAL_QUARTER_MEMORY_CACHE.get(cache_key)
+    if cached is not None:
+        return _clone_cached_official_quarter_payload(cached)
+    path = _historical_official_quarter_cache_path(company_id, calendar_quarter)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if int(payload.get("cache_version") or 0) != HISTORICAL_OFFICIAL_QUARTER_CACHE_VERSION:
+        return None
+    normalized = _clone_cached_official_quarter_payload(payload)
+    with HISTORICAL_OFFICIAL_QUARTER_MEMORY_LOCK:
+        HISTORICAL_OFFICIAL_QUARTER_MEMORY_CACHE[cache_key] = normalized
+    return _clone_cached_official_quarter_payload(normalized)
+
+
+def _store_historical_official_quarter_cache(
+    company_id: str,
+    calendar_quarter: str,
+    payload: dict[str, Any],
+) -> None:
+    normalized = _clone_cached_official_quarter_payload(payload)
+    serialized = {
+        "cache_version": HISTORICAL_OFFICIAL_QUARTER_CACHE_VERSION,
+        **normalized,
+    }
+    path = _historical_official_quarter_cache_path(company_id, calendar_quarter)
+    path.write_text(json.dumps(serialized, ensure_ascii=False, indent=2), encoding="utf-8")
+    with HISTORICAL_OFFICIAL_QUARTER_MEMORY_LOCK:
+        HISTORICAL_OFFICIAL_QUARTER_MEMORY_CACHE[(str(company_id), str(calendar_quarter))] = normalized
 
 
 def _progress_value(value: float) -> float:
@@ -141,6 +256,18 @@ def _ttm_roe_pct(entries: list[dict[str, Any]], end_index: int) -> Optional[floa
 
 def _quarter_parts(calendar_quarter: str) -> tuple[int, int]:
     return int(calendar_quarter[:4]), int(calendar_quarter[-1])
+
+
+def _shift_calendar_quarter(calendar_quarter: str, delta: int) -> str:
+    year, quarter = _quarter_parts(calendar_quarter)
+    index = year * 4 + (quarter - 1) + int(delta)
+    shifted_year = index // 4
+    shifted_quarter = index % 4 + 1
+    return f"{shifted_year}Q{shifted_quarter}"
+
+
+def _quarter_window(calendar_quarter: str, window: int) -> list[str]:
+    return [_shift_calendar_quarter(calendar_quarter, offset) for offset in range(-(window - 1), 1)]
 
 
 def _shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
@@ -599,7 +726,7 @@ def _build_dynamic_section_meta(
     meta["management_qna"]["note"] = _short_section_text(
         (
             f"电话会先抓管理层反复强调的 {top_qna}，再看问答是否追问 {second_qna or top_risk or '增长持续性'}。"
-            if transcript_summary or "call_summary" in list(fixture.get("materials") or [])
+            if transcript_summary
             else f"当前没有完整 transcript 时，先围绕 {top_qna or top_segment or '经营主线'} 读研究关注点。"
         )
     )
@@ -747,8 +874,14 @@ def _rescale_display_structure_items(
     if not items:
         return []
     scaled: list[dict[str, Any]] = []
+    non_quarterly_only = all(
+        str(item.get("scope") or "").casefold() in {"annual_filing", "regional_segment"}
+        for item in items
+    )
     total = sum(float(item.get("value_bn") or 0.0) for item in items if item.get("value_bn") is not None)
     should_rescale = (
+        not non_quarterly_only
+        and
         revenue_bn not in (None, 0)
         and total > 0
         and not 0.55 <= total / float(revenue_bn) <= 1.35
@@ -1232,16 +1365,40 @@ def build_historical_quarter_cube(
     company = get_company(company_id)
     periods = periods or get_company_series(company_id)[0]
     series = series or get_company_series(company_id)[1]
-    if calendar_quarter not in periods:
+    if calendar_quarter not in periods and not company.get("official_source"):
         raise KeyError(f"Quarter {calendar_quarter} not found for {company_id}")
-    end_index = periods.index(calendar_quarter)
-    if end_index < window - 1:
-        earliest = periods[0] if periods else calendar_quarter
-        raise ValueError(
-            f"Quarter {calendar_quarter} does not have a full {window}-quarter history window. "
-            f"Earliest available quarter is {earliest}."
-        )
-    selected_periods = periods[max(0, end_index - window + 1) : end_index + 1]
+    sparse_window = False
+    selected_periods: list[str]
+    if calendar_quarter in periods:
+        end_index = periods.index(calendar_quarter)
+        if end_index < window - 1 and not company.get("official_source"):
+            earliest = periods[0] if periods else calendar_quarter
+            raise ValueError(
+                f"Quarter {calendar_quarter} does not have a full {window}-quarter history window. "
+                f"Earliest available quarter is {earliest}."
+            )
+        selected_periods = periods[max(0, end_index - window + 1) : end_index + 1]
+        if len(selected_periods) >= 2:
+            actual_span = (
+                (_quarter_parts(selected_periods[-1])[0] * 4 + _quarter_parts(selected_periods[-1])[1])
+                - (_quarter_parts(selected_periods[0])[0] * 4 + _quarter_parts(selected_periods[0])[1])
+            )
+            sparse_window = actual_span > (len(selected_periods) - 1)
+    else:
+        selected_periods = []
+        sparse_window = True
+
+    if company.get("official_source") and (calendar_quarter not in periods or sparse_window):
+        selected_periods = _quarter_window(calendar_quarter, window)
+        earliest = periods[0] if periods else selected_periods[0]
+        earliest_index = _quarter_parts(earliest)[0] * 4 + (_quarter_parts(earliest)[1] - 1)
+        selected_start_index = _quarter_parts(selected_periods[0])[0] * 4 + (_quarter_parts(selected_periods[0])[1] - 1)
+        if selected_start_index < earliest_index:
+            raise ValueError(
+                f"Quarter {calendar_quarter} does not have a full {window}-quarter history window. "
+                f"Earliest available quarter is {earliest}."
+            )
+
     segment_history = get_segment_history(company_id)
     fixture = get_quarter_fixture(company_id, calendar_quarter)
 
@@ -1382,6 +1539,48 @@ def _normalize_historical_geographies(
             payload["yoy_pct"] = float(item["yoy_pct"])
         normalized.append(payload)
     return normalized
+
+
+def _interpolate_historical_metric(
+    history: list[dict[str, Any]],
+    index: int,
+    key: str,
+) -> Optional[float]:
+    prev_index = next((cursor for cursor in range(index - 1, -1, -1) if history[cursor].get(key) is not None), None)
+    next_index = next((cursor for cursor in range(index + 1, len(history)) if history[cursor].get(key) is not None), None)
+    if prev_index is not None and next_index is not None:
+        prev_value = float(history[prev_index][key])
+        next_value = float(history[next_index][key])
+        span = next_index - prev_index
+        if span <= 0:
+            return prev_value
+        weight = (index - prev_index) / span
+        return prev_value * (1 - weight) + next_value * weight
+    if prev_index is not None and index - prev_index == 1:
+        return float(history[prev_index][key])
+    if next_index is not None and next_index - index == 1:
+        return float(history[next_index][key])
+    return None
+
+
+def _backfill_historical_core_metrics(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    enriched = [dict(entry) for entry in history]
+    for index, entry in enumerate(enriched):
+        inferred = False
+        for key in ("revenue_bn", "net_income_bn", "gross_margin_pct", "equity_bn"):
+            if entry.get(key) is not None:
+                continue
+            interpolated = _interpolate_historical_metric(enriched, index, key)
+            if interpolated is None:
+                continue
+            entry[key] = interpolated
+            inferred = True
+        if entry.get("revenue_bn") not in (None, 0) and entry.get("net_income_bn") is not None:
+            entry["net_margin_pct"] = _safe_ratio(float(entry["net_income_bn"]), float(entry["revenue_bn"]))
+        if inferred:
+            entry["core_metrics_inferred"] = True
+        enriched[index] = entry
+    return enriched
 
 
 def _historical_segment_reference_profile(
@@ -1626,6 +1825,89 @@ def _backfill_historical_segment_history(
     return enriched
 
 
+def _historical_geography_share_map(entry: dict[str, Any]) -> dict[str, float]:
+    geographies = _normalize_historical_geographies(list(entry.get("geographies") or []), entry.get("revenue_bn"))
+    if not geographies:
+        return {}
+    share_map = {
+        str(item.get("name") or "Geography"): float(item.get("share_pct") or 0.0) / 100
+        for item in geographies
+        if float(item.get("share_pct") or 0.0) > 0
+    }
+    total = sum(share_map.values())
+    if total <= 0:
+        return {}
+    return {name: value / total for name, value in share_map.items() if value > 0}
+
+
+def _is_complete_geography_snapshot(entry: dict[str, Any]) -> bool:
+    share_map = _historical_geography_share_map(entry)
+    if len(share_map) < 2:
+        return False
+    total = sum(share_map.values())
+    return 0.92 <= total <= 1.08
+
+
+def _backfill_historical_geography_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    enriched = [dict(entry) for entry in history]
+    valid_indexes = [index for index, entry in enumerate(enriched) if _is_complete_geography_snapshot(entry)]
+    if not valid_indexes:
+        return enriched
+
+    frequency: Counter[str] = Counter()
+    for index in valid_indexes:
+        frequency.update(_historical_geography_share_map(enriched[index]).keys())
+    expected_names = [name for name, _count in frequency.most_common()]
+    if len(expected_names) < 2:
+        return enriched
+
+    anchor_maps = {index: _historical_geography_share_map(enriched[index]) for index in valid_indexes}
+    for index, entry in enumerate(enriched):
+        if index in valid_indexes:
+            entry["geographies_inferred"] = bool(entry.get("geographies_inferred"))
+            enriched[index] = entry
+            continue
+
+        prev_index = next((value for value in reversed(valid_indexes) if value < index), None)
+        next_index = next((value for value in valid_indexes if value > index), None)
+        candidate_map: dict[str, float] = {}
+        if prev_index is not None and next_index is not None:
+            span = max(1, next_index - prev_index)
+            weight = (index - prev_index) / span
+            prev_map = anchor_maps[prev_index]
+            next_map = anchor_maps[next_index]
+            for name in expected_names:
+                candidate_map[name] = prev_map.get(name, 0.0) * (1 - weight) + next_map.get(name, 0.0) * weight
+        elif prev_index is not None:
+            prev_map = anchor_maps[prev_index]
+            candidate_map = {name: prev_map.get(name, 0.0) for name in expected_names}
+        elif next_index is not None:
+            next_map = anchor_maps[next_index]
+            candidate_map = {name: next_map.get(name, 0.0) for name in expected_names}
+
+        total = sum(candidate_map.values())
+        revenue_bn = float(entry.get("revenue_bn") or 0.0)
+        if total <= 0 or revenue_bn <= 0:
+            continue
+        normalized_map = {name: value / total for name, value in candidate_map.items() if value > 0.004}
+        if len(normalized_map) < 2:
+            continue
+        entry["geographies"] = [
+            {
+                "name": name,
+                "value_bn": revenue_bn * share,
+                "share_pct": share * 100,
+                "scope": "historical_interpolated",
+            }
+            for name, share in normalized_map.items()
+        ]
+        entry["geographies_inferred"] = True
+        if not entry.get("structure_basis"):
+            entry["structure_basis"] = "geography"
+        enriched[index] = entry
+    return enriched
+
+
 def _sanitize_history_quality_metrics(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
     sanitized = [dict(entry) for entry in history]
     previous_roe_values: list[float] = []
@@ -1780,13 +2062,81 @@ def _historical_metric_candidate(
     return existing_value
 
 
+def _segment_snapshot_quality(
+    company: dict[str, Any],
+    segments: list[dict[str, Any]],
+    revenue_bn: Optional[float],
+    reference_profile: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    normalized = _normalize_historical_segments(company, segments, revenue_bn)
+    if not normalized or _segments_are_geography_like(company, list(normalized)):
+        return {
+            "segments": [],
+            "count": 0,
+            "coverage_ratio": 0.0,
+            "reasonable": False,
+            "complete": False,
+        }
+    total_value = _segments_total_value(normalized)
+    coverage_ratio = total_value / float(revenue_bn) if revenue_bn not in (None, 0) else 0.0
+    reasonable = _quarterly_structure_looks_reasonable(normalized, revenue_bn)
+    complete = reasonable and _is_complete_segment_snapshot(
+        company,
+        {
+            "segments": normalized,
+            "revenue_bn": revenue_bn,
+        },
+        reference_profile,
+    )
+    return {
+        "segments": normalized,
+        "count": len(normalized),
+        "coverage_ratio": coverage_ratio,
+        "reasonable": reasonable,
+        "complete": complete,
+    }
+
+
+def _should_replace_history_segments(
+    existing_quality: dict[str, Any],
+    candidate_quality: dict[str, Any],
+    *,
+    allow_partial: bool,
+) -> bool:
+    if not candidate_quality.get("segments"):
+        return False
+    if not existing_quality.get("segments"):
+        return True
+    if existing_quality.get("complete") and not candidate_quality.get("complete"):
+        return False
+    if candidate_quality.get("complete") and not existing_quality.get("complete"):
+        return True
+    if candidate_quality.get("complete") and existing_quality.get("complete"):
+        return bool(
+            int(candidate_quality.get("count") or 0) >= int(existing_quality.get("count") or 0)
+            and float(candidate_quality.get("coverage_ratio") or 0.0)
+            >= float(existing_quality.get("coverage_ratio") or 0.0) - 0.03
+        )
+    if not allow_partial:
+        return False
+    return bool(
+        int(candidate_quality.get("count") or 0) > int(existing_quality.get("count") or 0)
+        or float(candidate_quality.get("coverage_ratio") or 0.0)
+        > float(existing_quality.get("coverage_ratio") or 0.0) + 0.08
+        or not existing_quality.get("reasonable")
+    )
+
+
 def _enrich_history_with_official_structures(
     company: dict[str, Any],
     history: list[dict[str, Any]],
     progress_callback: Optional[Callable[[float, str], None]] = None,
 ) -> list[dict[str, Any]]:
     needs_metric_enrichment = _history_needs_official_metric_enrichment(company, history)
-    needs_structure_enrichment = any(not entry.get("segments") for entry in history)
+    needs_structure_enrichment = any(
+        not entry.get("segments") or not entry.get("geographies")
+        for entry in history
+    )
     if not company.get("official_source") or (not needs_metric_enrichment and not needs_structure_enrichment):
         return history
     enriched = [dict(entry) for entry in history]
@@ -1795,45 +2145,57 @@ def _enrich_history_with_official_structures(
         for index, entry in enumerate(enriched)
         if (
             not entry.get("segments")
+            or not entry.get("geographies")
             or (needs_metric_enrichment and _entry_needs_official_metric_enrichment(entry))
         )
     ]
     total_entries = max(len(target_indexes), 1)
     if not target_indexes:
         return enriched
+    reference_profile = _historical_segment_reference_profile(company, enriched)
 
     def _enrich_single(index: int) -> tuple[int, dict[str, Any]]:
         entry = dict(enriched[index])
         period = str(entry["quarter_label"])
-        fixture = get_quarter_fixture(str(company["id"]), period)
-        base_sources = list(fixture.get("sources") or []) if fixture else []
-        period_end = _resolved_period_end(
-            period,
-            entry_period_end=str(entry.get("period_end") or ""),
-            fixture_period_end=str(fixture.get("period_end") or "") if fixture else None,
-        )
-        sources = resolve_official_sources(
-            company,
-            period,
-            period_end,
-            base_sources,
-            refresh=False,
-            prefer_sec_only=_history_prefers_sec_only_sources(company),
-        )
-        if not sources:
-            return (index, entry)
-        source_materials = hydrate_source_materials(
-            str(company["id"]),
-            period,
-            sources,
-            refresh=False,
-        )
-        parsed = parse_official_materials(
-            company,
-            _quarter_fallback_for_structure(entry, sources),
-            source_materials,
-        )
-        latest_kpis = dict(parsed.get("latest_kpis") or {})
+        cached_parsed = _load_historical_official_quarter_cache(str(company["id"]), period)
+        if cached_parsed is None:
+            fixture = get_quarter_fixture(str(company["id"]), period)
+            base_sources = list(fixture.get("sources") or []) if fixture else []
+            period_end = _resolved_period_end(
+                period,
+                entry_period_end=str(entry.get("period_end") or ""),
+                fixture_period_end=str(fixture.get("period_end") or "") if fixture else None,
+            )
+            sources = resolve_official_sources(
+                company,
+                period,
+                period_end,
+                base_sources,
+                refresh=False,
+                prefer_sec_only=_history_prefers_sec_only_sources(company),
+            )
+            if not sources:
+                return (index, entry)
+            source_materials = hydrate_source_materials(
+                str(company["id"]),
+                period,
+                sources,
+                refresh=False,
+            )
+            parsed = parse_official_materials(
+                company,
+                _quarter_fallback_for_structure(entry, sources),
+                source_materials,
+            )
+            cached_parsed = {
+                "latest_kpis": dict(parsed.get("latest_kpis") or {}),
+                "current_segments": [dict(item) for item in list(parsed.get("current_segments") or []) if isinstance(item, dict)],
+                "current_geographies": [dict(item) for item in list(parsed.get("current_geographies") or []) if isinstance(item, dict)],
+                "source_url": str(sources[0].get("url") or "") if sources else "",
+                "source_date": str(sources[0].get("date") or "") if sources else "",
+            }
+            _store_historical_official_quarter_cache(str(company["id"]), period, cached_parsed)
+        latest_kpis = dict(cached_parsed.get("latest_kpis") or {})
         revenue_bn = _historical_metric_candidate(entry.get("revenue_bn"), latest_kpis.get("revenue_bn"))
         net_income_bn = _historical_metric_candidate(entry.get("net_income_bn"), latest_kpis.get("net_income_bn"), min_ratio=0.25, max_ratio=2.8)
         gross_margin_pct = latest_kpis.get("gaap_gross_margin_pct")
@@ -1854,32 +2216,59 @@ def _enrich_history_with_official_structures(
             entry["net_income_yoy_pct"] = float(net_income_yoy_pct)
         if entry.get("revenue_bn") not in (None, 0) and entry.get("net_income_bn") is not None:
             entry["net_margin_pct"] = _safe_ratio(float(entry["net_income_bn"]), float(entry["revenue_bn"]))
+        trusted_revenue = entry.get("revenue_bn") or latest_kpis.get("revenue_bn")
+        existing_segment_quality = _segment_snapshot_quality(
+            company,
+            list(entry.get("segments") or []),
+            trusted_revenue,
+            reference_profile,
+        )
+        parsed_segment_quality = _segment_snapshot_quality(
+            company,
+            list(cached_parsed.get("current_segments") or []),
+            trusted_revenue,
+            reference_profile,
+        )
         parsed_segments = _normalize_historical_segments(
             company,
-            list(parsed.get("current_segments") or []),
-            entry.get("revenue_bn") or parsed.get("latest_kpis", {}).get("revenue_bn"),
+            list(cached_parsed.get("current_segments") or []),
+            trusted_revenue,
         )
         parsed_geographies = _normalize_historical_geographies(
-            list(parsed.get("current_geographies") or []),
-            entry.get("revenue_bn") or parsed.get("latest_kpis", {}).get("revenue_bn"),
+            list(cached_parsed.get("current_geographies") or []),
+            trusted_revenue,
         )
-        valid_parsed_segments = (
+        valid_parsed_segments = bool(parsed_segment_quality.get("complete")) and _should_replace_history_segments(
+            existing_segment_quality,
+            parsed_segment_quality,
+            allow_partial=False,
+        )
+        partial_parsed_segments = (
             bool(parsed_segments)
-            and not _segments_look_incomplete_for_company(
-                company,
-                [
-                    {"name": item.get("name"), "value_bn": item.get("value_bn")}
-                    for item in parsed_segments
-                ],
+            and bool(parsed_segment_quality.get("reasonable"))
+            and len(parsed_segments) >= 2
+            and _should_replace_history_segments(
+                existing_segment_quality,
+                parsed_segment_quality,
+                allow_partial=True,
             )
-            and not _segments_are_geography_like(company, list(parsed_segments))
         )
         if valid_parsed_segments:
             entry["segments"] = parsed_segments
             entry["structure_basis"] = "segment"
-        elif parsed_geographies:
+            entry["segments_partial"] = False
+        elif partial_parsed_segments:
+            # Preserve partially parsed segment snapshots when they are numerically
+            # reasonable. Later harmonization can still decide whether to use them
+            # for 12-quarter transition analysis, but we should not discard useful
+            # quarter-level details up front.
+            entry["segments"] = parsed_segments
+            entry["structure_basis"] = "segment_partial"
+            entry["segments_partial"] = True
+        elif parsed_geographies and not existing_segment_quality.get("complete"):
             entry["structure_basis"] = "geography"
             entry["segments"] = []
+            entry["segments_partial"] = False
         if parsed_geographies:
             entry["geographies"] = parsed_geographies
         if (
@@ -1890,11 +2279,12 @@ def _enrich_history_with_official_structures(
             or parsed_geographies
         ):
             entry["source_type"] = "official_release"
-        if sources:
-            entry["source_url"] = str(sources[0].get("url") or "")
-            source_date = str(sources[0].get("date") or "")
-            if _is_iso_date_token(source_date):
-                entry["release_date"] = source_date
+        source_url = str(cached_parsed.get("source_url") or "")
+        source_date = str(cached_parsed.get("source_date") or "")
+        if source_url:
+            entry["source_url"] = source_url
+        if _is_iso_date_token(source_date):
+            entry["release_date"] = source_date
         return (index, entry)
 
     max_workers = min(6, len(target_indexes))
@@ -2060,7 +2450,7 @@ def generate_historical_insights(
     return insights[:6]
 
 
-def _keyword_topics(text: str) -> list[dict[str, Any]]:
+def _keyword_topics(text: str, *, note: str = "来自手动上传 transcript 的关键词聚类。") -> list[dict[str, Any]]:
     lowered = text.lower()
     topic_map = {
         "AI 需求": ["ai", "inference", "training", "accelerator"],
@@ -2073,8 +2463,46 @@ def _keyword_topics(text: str) -> list[dict[str, Any]]:
     for label, keywords in topic_map.items():
         score = sum(lowered.count(keyword) for keyword in keywords) * 12
         if score > 0:
-            topics.append({"label": label, "score": min(100, score), "note": "来自手动上传 transcript 的关键词聚类。"})
+            topics.append({"label": label, "score": min(100, score), "note": note})
     return sorted(topics, key=lambda item: item["score"], reverse=True)[:4]
+
+
+def _ensure_minimum_qna_topics(
+    qna_topics: list[dict[str, Any]],
+    management_themes: list[dict[str, Any]],
+    risks: list[dict[str, Any]],
+    catalysts: list[dict[str, Any]],
+    *,
+    minimum: int = 3,
+) -> list[dict[str, Any]]:
+    enriched = [dict(item) for item in list(qna_topics or []) if isinstance(item, dict)]
+    seen = {str(item.get("label") or "").strip() for item in enriched if str(item.get("label") or "").strip()}
+    for pool, prefix in (
+        (management_themes, "延伸关注"),
+        (risks, "风险追问"),
+        (catalysts, "催化验证"),
+    ):
+        for item in list(pool or []):
+            if len(enriched) >= minimum:
+                break
+            label = str(item.get("label") or "").strip()
+            note = str(item.get("note") or "").strip()
+            if not label or not note:
+                continue
+            candidate_label = f"{prefix}：{label}"
+            if candidate_label in seen:
+                continue
+            enriched.append(
+                {
+                    "label": candidate_label,
+                    "score": float(item.get("score") or 70),
+                    "note": note,
+                }
+            )
+            seen.add(candidate_label)
+        if len(enriched) >= minimum:
+            break
+    return enriched
 
 
 def _transcript_summary(upload_id: Optional[str]) -> Optional[dict[str, Any]]:
@@ -2089,8 +2517,134 @@ def _transcript_summary(upload_id: Optional[str]) -> Optional[dict[str, Any]]:
     topics = _keyword_topics(text)
     return {
         "upload_id": upload_id,
+        "source_type": "manual_transcript",
         "filename": upload["filename"],
         "highlights": highlights,
+        "topics": topics,
+    }
+
+
+def _transcript_chunks(text: str) -> list[str]:
+    normalized = str(text or "").replace("\r", "\n")
+    chunks = [
+        re.sub(r"\s+", " ", chunk).strip()
+        for chunk in re.split(r"\n\s*\n+", normalized)
+        if re.sub(r"\s+", " ", chunk).strip()
+    ]
+    if len(chunks) >= 3:
+        return chunks
+    lines = [re.sub(r"\s+", " ", line).strip() for line in normalized.splitlines() if re.sub(r"\s+", " ", line).strip()]
+    merged: list[str] = []
+    bucket: list[str] = []
+    for line in lines:
+        bucket.append(line)
+        if len(" ".join(bucket)) >= 220:
+            merged.append(" ".join(bucket))
+            bucket = []
+    if bucket:
+        merged.append(" ".join(bucket))
+    return merged
+
+
+def _looks_like_transcript_text(text: str, label: str = "") -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    lowered = normalized.lower()
+    label_lower = str(label or "").lower()
+    transcript_tokens = (
+        "question-and-answer",
+        "question and answer",
+        "prepared remarks",
+        "conference call",
+        "earnings call",
+        "operator",
+        "analyst",
+    )
+    if any(token in label_lower for token in ("transcript", "prepared remarks")):
+        return True
+    signal_count = sum(1 for token in transcript_tokens if token in lowered)
+    speaker_count = len(
+        re.findall(
+            r"\b(?:Operator|Analyst|Question(?:er)?|CEO|CFO|COO|President|Chief Executive Officer|Chief Financial Officer)\b",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+    )
+    return signal_count >= 2 or speaker_count >= 4
+
+
+def _transcript_highlights(text: str) -> list[str]:
+    chunks = _transcript_chunks(text)
+    if not chunks:
+        return []
+    skip_tokens = (
+        "forward-looking statements",
+        "reconciliation of gaap",
+        "all lines have been placed on mute",
+        "i would now like to turn",
+        "thank you. good afternoon",
+        "this call will be recorded",
+    )
+    preferred: list[str] = []
+    fallback: list[str] = []
+    business_tokens = (
+        "revenue",
+        "growth",
+        "demand",
+        "margin",
+        "orders",
+        "guidance",
+        "ai",
+        "cloud",
+        "advertising",
+        "deliver",
+        "production",
+        "video",
+        "instagram",
+        "capacity",
+    )
+    for chunk in chunks:
+        lowered = chunk.lower()
+        if any(token in lowered for token in skip_tokens):
+            continue
+        if len(chunk) < 80:
+            continue
+        if any(token in lowered for token in business_tokens):
+            preferred.append(chunk)
+        else:
+            fallback.append(chunk)
+    selected = preferred[:3] if preferred else fallback[:3]
+    return [_excerpt_text(item, 260) for item in selected[:3]]
+
+
+def _automatic_transcript_summary(source_materials: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    candidates: list[tuple[int, int, dict[str, Any], str]] = []
+    for item in source_materials:
+        if item.get("status") not in {"fetched", "cached"}:
+            continue
+        if item.get("kind") != "call_summary" and item.get("role") != "earnings_call":
+            continue
+        text_path = str(item.get("text_path") or "").strip()
+        if not text_path or not Path(text_path).exists():
+            continue
+        text = Path(text_path).read_text(encoding="utf-8", errors="ignore").strip()
+        if len(text) < 400:
+            continue
+        label = str(item.get("label") or "")
+        if not _looks_like_transcript_text(text, label):
+            continue
+        label_score = 3 if "transcript" in label.lower() else 2 if "prepared remarks" in label.lower() else 1
+        candidates.append((label_score, len(text), item, text))
+    if not candidates:
+        return None
+    _label_score, _text_len, best_item, best_text = max(candidates, key=lambda row: (row[0], row[1]))
+    highlights = _transcript_highlights(best_text)
+    topics = _keyword_topics(best_text, note="来自自动抓取的官方电话会材料关键词聚类。")
+    if not highlights and not topics:
+        return None
+    return {
+        "source_type": "official_call_material",
+        "filename": str(best_item.get("label") or "Official earnings call"),
+        "highlights": highlights[:3],
         "topics": topics,
     }
 
@@ -2109,10 +2663,11 @@ def _material_scores(
     crawl_score = 26
     if extracted:
         crawl_score = 100 if len(extracted) == len(source_materials) else 74
+    call_material_score = 100 if transcript_summary else (42 if "call_summary" in materials else 18)
     return [
         {"label": "官方财报新闻稿", "score": 100 if has_release or "earnings_release" in materials else 32},
         {"label": "演示材料", "score": 92 if has_presentation or "presentation" in materials else 36},
-        {"label": "电话会信息", "score": 100 if transcript_summary else (72 if "call_summary" in materials else 18)},
+        {"label": "电话会信息", "score": call_material_score},
         {"label": "原文抓取与解析", "score": crawl_score if source_materials else 18},
     ]
 
@@ -2153,6 +2708,158 @@ def _source_material_warnings(source_materials: list[dict[str, Any]]) -> list[st
     if disabled and not extracted:
         warnings.append("当前环境关闭了官方源材料自动抓取，仅使用内置口径与已有缓存生成报告。")
     return warnings
+
+
+def _material_tokens_from_sources(
+    fixture: dict[str, Any],
+    source_materials: list[dict[str, Any]],
+) -> list[str]:
+    tokens = {
+        str(item).strip()
+        for item in list(fixture.get("materials") or [])
+        if str(item).strip()
+    }
+    for item in source_materials:
+        if item.get("status") not in {"fetched", "cached"}:
+            continue
+        has_text = int(item.get("text_length") or 0) > 0 or bool(str(item.get("text_path") or "").strip())
+        if not has_text:
+            continue
+        for token in (item.get("kind"), item.get("role")):
+            normalized = str(token or "").strip()
+            if normalized:
+                tokens.add(normalized)
+    return sorted(tokens)
+
+
+def _quote_cards_are_synthesized(cards: list[dict[str, Any]]) -> bool:
+    if not cards:
+        return False
+    synthesized_speakers = {"Management context", "Guidance context"}
+    return all(str(item.get("speaker") or "").strip() in synthesized_speakers for item in cards)
+
+
+def _narrative_entry(status: str) -> dict[str, Any]:
+    mapping = {
+        "manual_transcript": {
+            "label": "手动 transcript 原文",
+            "detail": "问答主题直接来自手动上传的电话会 transcript。",
+            "is_inferred": False,
+        },
+        "official_call_material": {
+            "label": "官方电话会材料",
+            "detail": "主题优先依据官方 transcript / call summary / commentary 提炼，不是静态模板。",
+            "is_inferred": False,
+        },
+        "official_material_inferred": {
+            "label": "官方财报材料推断",
+            "detail": "当前未拿到完整问答时，系统根据官方 release / deck / filing 动态归纳。",
+            "is_inferred": True,
+        },
+        "structured_fallback": {
+            "label": "结构化财务序列 fallback",
+            "detail": "当前缺少可解析官方原文材料，相关主题仍带有统一研究 fallback 性质。",
+            "is_inferred": True,
+        },
+        "official_quote_excerpt": {
+            "label": "官方原文引述",
+            "detail": "锚点卡片直接取自官方材料中的管理层表述。",
+            "is_inferred": False,
+        },
+        "synthesized_quote": {
+            "label": "主题转写锚点",
+            "detail": "缺少可直接引用原话时，系统会把主题或指引转写成阅读锚点。",
+            "is_inferred": True,
+        },
+        "no_quote_excerpt": {
+            "label": "暂无原话引述",
+            "detail": "当前未抓到可直接引用的管理层原话，页面回退到证据卡片。",
+            "is_inferred": True,
+        },
+    }
+    return {"status": status, **mapping[status]}
+
+
+def _build_narrative_provenance(
+    fixture: dict[str, Any],
+    source_materials: list[dict[str, Any]],
+    transcript_summary: Optional[dict[str, Any]],
+    qna_topics: list[dict[str, Any]],
+) -> dict[str, Any]:
+    del qna_topics
+    materials = set(_material_tokens_from_sources(fixture, source_materials))
+    extracted = [
+        item
+        for item in source_materials
+        if item.get("status") in {"fetched", "cached"}
+        and (int(item.get("text_length") or 0) > 0 or bool(str(item.get("text_path") or "").strip()))
+    ]
+    transcript_source_type = str((transcript_summary or {}).get("source_type") or "")
+    has_call_material = transcript_source_type == "official_call_material"
+    has_official_material = bool(
+        any(
+            item.get("kind") in {"official_release", "presentation", "sec_filing"}
+            for item in extracted
+        )
+        or any(token in materials for token in {"official_release", "presentation", "sec_filing", "earnings_release", "earnings_presentation", "earnings_commentary"})
+    )
+    quote_cards = list(fixture.get("call_quote_cards") or [])
+    synthesized_quotes = _quote_cards_are_synthesized(quote_cards)
+
+    if transcript_source_type == "manual_transcript":
+        qna = _narrative_entry("manual_transcript")
+    elif has_call_material:
+        qna = _narrative_entry("official_call_material")
+    elif has_official_material:
+        qna = _narrative_entry("official_material_inferred")
+    else:
+        qna = _narrative_entry("structured_fallback")
+
+    narrative_status = "official_call_material" if has_call_material else "official_material_inferred" if has_official_material else "structured_fallback"
+    management = _narrative_entry(narrative_status)
+    risks = _narrative_entry(narrative_status)
+    catalysts = _narrative_entry(narrative_status)
+
+    if quote_cards and not synthesized_quotes:
+        quotes = _narrative_entry("official_quote_excerpt")
+    elif quote_cards:
+        quotes = _narrative_entry("synthesized_quote")
+    else:
+        quotes = _narrative_entry("no_quote_excerpt")
+
+    qna_chart_title = "真实问答主题" if not qna["is_inferred"] else "推断问答主题"
+    qna_chart_subtitle = (
+        "按 transcript / 电话会原文整理"
+        if qna["status"] in {"manual_transcript", "official_call_material"}
+        else "当前缺少完整电话会问答，按官方材料动态提炼"
+    )
+    management_chart_subtitle = (
+        "优先依据电话会与管理层原文提炼"
+        if management["status"] == "official_call_material"
+        else "按官方材料与经营数据动态提炼"
+        if management["status"] == "official_material_inferred"
+        else "当前仍带有通用研究 fallback"
+    )
+
+    return {
+        "qna": qna,
+        "management": management,
+        "risks": risks,
+        "catalysts": catalysts,
+        "quotes": quotes,
+        "call_panel_meta_lines": [
+            f"问答主题来源：{qna['label']}。{qna['detail']}",
+            f"管理层锚点来源：{quotes['label']}。{quotes['detail']}",
+        ],
+        "risk_meta_lines": [
+            f"风险视角来源：{risks['label']}。{risks['detail']}",
+            f"催化剂视角来源：{catalysts['label']}。{catalysts['detail']}",
+        ],
+        "quote_panel_title": "官方管理层锚点" if quotes["status"] == "official_quote_excerpt" else "管理层语境锚点",
+        "qna_chart_title": qna_chart_title,
+        "qna_chart_subtitle": qna_chart_subtitle,
+        "management_chart_subtitle": management_chart_subtitle,
+    }
 
 
 def _reconcile_coverage_warnings(
@@ -2426,6 +3133,89 @@ def _sanitize_fixture_payload(
     return sanitized
 
 
+def _quarterize_fixture_geographies(fixture: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(fixture)
+    geographies = list(normalized.get("current_geographies") or [])
+    revenue_bn = (dict(normalized.get("latest_kpis") or {})).get("revenue_bn")
+    if not geographies or revenue_bn in (None, 0):
+        return normalized
+    annual_items = [
+        item
+        for item in geographies
+        if str(item.get("scope") or "").casefold() == "annual_filing" and float(item.get("value_bn") or 0.0) > 0
+    ]
+    if len(annual_items) < 2:
+        return normalized
+    annual_total = sum(float(item.get("value_bn") or 0.0) for item in annual_items)
+    if annual_total <= 0:
+        return normalized
+
+    quarter_revenue = float(revenue_bn)
+    mapped: list[dict[str, Any]] = []
+    for item in geographies:
+        entry = dict(item)
+        if str(item.get("scope") or "").casefold() == "annual_filing":
+            annual_value = max(float(item.get("value_bn") or 0.0), 0.0)
+            share = annual_value / annual_total
+            mapped_value = round(quarter_revenue * share, 3)
+            if mapped_value <= 0 and annual_value > 0 and quarter_revenue > 0:
+                mapped_value = 0.001
+            entry["value_bn"] = mapped_value
+            entry["share_pct"] = share * 100
+            entry["scope"] = "quarterly_mapped_from_official_geography"
+        mapped.append(entry)
+    normalized["current_geographies"] = mapped
+    coverage_notes = list(normalized.get("coverage_notes") or [])
+    if not any("季度化映射" in str(note) for note in coverage_notes):
+        coverage_notes.append("地区结构已按官方地理披露占比完成季度化映射，确保与当季收入口径一致。")
+    normalized["coverage_notes"] = coverage_notes
+    return normalized
+
+
+def _promote_geographies_as_segments(
+    fixture: dict[str, Any],
+) -> dict[str, Any]:
+    normalized = dict(fixture)
+    segments = list(normalized.get("current_segments") or [])
+    geographies = list(normalized.get("current_geographies") or [])
+    if segments or len(geographies) < 2:
+        return normalized
+    normalized["current_segments"] = [
+        {
+            "name": str(item.get("name") or "Region"),
+            "value_bn": float(item.get("value_bn") or 0.0),
+            "yoy_pct": item.get("yoy_pct"),
+            "scope": "geo_proxy",
+        }
+        for item in geographies
+        if float(item.get("value_bn") or 0.0) > 0
+    ]
+    return normalized
+
+
+def _promote_history_geographies_as_segments(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    promoted: list[dict[str, Any]] = []
+    for entry in history:
+        row = dict(entry)
+        segments = list(row.get("segments") or [])
+        geographies = _normalize_historical_geographies(list(row.get("geographies") or []), row.get("revenue_bn"))
+        if not segments and len(geographies) >= 2:
+            row["segments"] = [
+                {
+                    "name": str(item.get("name") or "Region"),
+                    "value_bn": float(item.get("value_bn") or 0.0),
+                    "share_pct": float(item.get("share_pct") or 0.0),
+                    "yoy_pct": item.get("yoy_pct"),
+                    "scope": "geo_proxy",
+                }
+                for item in geographies
+                if float(item.get("value_bn") or 0.0) > 0
+            ]
+            row["segments_inferred"] = True
+        promoted.append(row)
+    return promoted
+
+
 def _rehydrate_current_structures_from_history(
     company: dict[str, Any],
     fixture: dict[str, Any],
@@ -2454,7 +3244,11 @@ def _rehydrate_current_structures_from_history(
                 for item in list(latest_history.get("segments") or [])
             ],
         )
-    if not hydrated.get("current_geographies") and latest_history.get("geographies"):
+    current_geographies = list(hydrated.get("current_geographies") or [])
+    if (
+        not current_geographies
+        and latest_history.get("geographies")
+    ):
         hydrated["current_geographies"] = [
             {
                 "name": item.get("name"),
@@ -2468,6 +3262,30 @@ def _rehydrate_current_structures_from_history(
             list(hydrated.get("current_geographies") or []),
             latest_history.get("revenue_bn"),
         )
+    elif latest_history.get("geographies"):
+        latest_geo_names = {
+            str(item.get("name") or "")
+            for item in list(latest_history.get("geographies") or [])
+            if str(item.get("name") or "")
+        }
+        current_geo_names = {
+            str(item.get("name") or "")
+            for item in current_geographies
+            if str(item.get("name") or "")
+        }
+        if len(latest_geo_names) > len(current_geo_names) or (latest_geo_names and current_geo_names and latest_geo_names != current_geo_names):
+            hydrated["current_geographies"] = _rescale_display_structure_items(
+                [
+                    {
+                        "name": item.get("name"),
+                        "value_bn": item.get("value_bn"),
+                        "yoy_pct": item.get("yoy_pct"),
+                        "scope": item.get("scope"),
+                    }
+                    for item in list(latest_history.get("geographies") or [])
+                ],
+                latest_history.get("revenue_bn"),
+            )
     return hydrated
 
 
@@ -3018,19 +3836,24 @@ def _build_call_panel(
     fixture: dict[str, Any],
     transcript_summary: Optional[dict[str, Any]],
     qna_topics: list[dict[str, Any]],
+    narrative_provenance: dict[str, Any],
 ) -> dict[str, Any]:
+    qna_status = str(((narrative_provenance or {}).get("qna") or {}).get("status") or "")
     if transcript_summary:
         return {
-            "title": "手动 transcript 摘要",
+            "title": "手动 transcript 摘要" if transcript_summary.get("source_type") == "manual_transcript" else "自动电话会摘要",
+            "meta_lines": narrative_provenance.get("call_panel_meta_lines") or [],
             "bullets": [re.sub(r"\s+", " ", str(item or "")).strip() for item in transcript_summary["highlights"][:2]],
         }
-    if "call_summary" in fixture["materials"]:
+    if qna_status in {"manual_transcript", "official_call_material"}:
         return {
             "title": "当前电话会摘要",
+            "meta_lines": narrative_provenance.get("call_panel_meta_lines") or [],
             "bullets": [re.sub(r"\s+", " ", str(item.get("note") or "")).strip() for item in qna_topics[:2]],
         }
     return {
-        "title": "电话会未接入，展示研究关注主题",
+        "title": "当前无完整电话会实录，展示推断问答主题",
+        "meta_lines": narrative_provenance.get("call_panel_meta_lines") or [],
         "bullets": [re.sub(r"\s+", " ", str(item.get("note") or "")).strip() for item in qna_topics[:2]],
     }
 
@@ -3115,8 +3938,12 @@ def build_report_payload(
     history_window: int = 12,
     manual_transcript_upload_id: Optional[str] = None,
     refresh_source_materials: bool = False,
+    require_full_coverage: Optional[bool] = None,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> dict[str, Any]:
+    full_coverage_mode = _require_full_coverage_mode() if require_full_coverage is None else bool(require_full_coverage)
+    if full_coverage_mode and os.environ.get("EARNINGS_DIGEST_DISABLE_SOURCE_FETCH") == "1":
+        raise ValueError("Full coverage mode requires official source fetch; unset EARNINGS_DIGEST_DISABLE_SOURCE_FETCH.")
     _emit_progress(progress_callback, 0.03, "prepare", "正在校验参数并加载公司基础数据...")
     company = get_company(company_id)
     report_style = _build_report_style(company)
@@ -3154,6 +3981,7 @@ def build_report_payload(
             end=0.56,
         ),
     )
+    fixture["materials"] = _material_tokens_from_sources(fixture, source_materials)
     _emit_progress(progress_callback, 0.57, "parse", "正在从官方原文动态解析 KPI、结构和管理层表述...")
     parsed_fixture = parse_official_materials(
         company,
@@ -3170,6 +3998,8 @@ def build_report_payload(
     fixture = _merge_fixture_payload(fixture, parsed_fixture)
     fixture["current_segments"] = _normalize_segment_items(company, list(fixture.get("current_segments") or []))
     fixture = _sanitize_fixture_payload(company, fixture, history[-1])
+    fixture = _quarterize_fixture_geographies(fixture)
+    fixture = _promote_geographies_as_segments(fixture)
     history = _refresh_latest_history_entry(company, history, fixture)
     _emit_progress(progress_callback, 0.81, "history", "正在用官方结构补齐近 12 季口径...")
     history = _enrich_history_with_official_structures(
@@ -3184,13 +4014,20 @@ def build_report_payload(
     )
     history = _recompute_history_derivatives(history)
     history = _sanitize_history_quality_metrics(history)
+    history = _backfill_historical_core_metrics(history)
+    history = _promote_history_geographies_as_segments(history)
     history = _harmonize_historical_structures(company, history)
     history = _backfill_historical_segment_history(company, history)
+    history = _backfill_historical_geography_history(history)
+    history = _promote_history_geographies_as_segments(history)
     history = _harmonize_historical_structures(company, history)
     _emit_progress(progress_callback, 0.915, "history", "正在统一历史业务结构并补足缺口...")
     fixture = _rehydrate_current_structures_from_history(company, fixture, history[-1])
     fixture["current_segments"] = _normalize_segment_items(company, list(fixture.get("current_segments") or []))
     fixture = _sanitize_fixture_payload(company, fixture, history[-1])
+    fixture = _quarterize_fixture_geographies(fixture)
+    fixture = _promote_geographies_as_segments(fixture)
+    fixture = _quarterize_fixture_geographies(fixture)
     fixture["guidance"] = _resolve_guidance_payload(fixture["guidance"], history)
     fixture["current_geographies"] = list(fixture.get("current_geographies") or [])
     fixture["headline"] = _compose_summary_headline(
@@ -3205,18 +4042,53 @@ def build_report_payload(
         raise ValueError(f"Quarter mapping mismatch: expected {natural_quarter}, got {calendar_quarter}")
 
     structure_dimension = resolve_structure_dimension(company_id, history)
-    transcript_summary = _transcript_summary(manual_transcript_upload_id)
+    transcript_summary = _transcript_summary(manual_transcript_upload_id) or _automatic_transcript_summary(source_materials)
     qna_topics = transcript_summary["topics"] if transcript_summary and transcript_summary["topics"] else fixture["qna_themes"]
+    qna_topics = _ensure_minimum_qna_topics(
+        qna_topics,
+        list(fixture.get("management_themes") or []),
+        list(fixture.get("risks") or []),
+        list(fixture.get("catalysts") or []),
+    )
+    narrative_provenance = _build_narrative_provenance(fixture, source_materials, transcript_summary, qna_topics)
     merged_sources = _merge_sources_with_materials(list(fixture.get("sources") or []), source_materials)
     coverage_warnings = _source_material_warnings(source_materials) + list(fixture["coverage_notes"])
     if structure_dimension != "segment":
-        coverage_warnings.append(
-            "历史分部连续性不足，结构迁移与增量贡献页已自动切换到地区结构或降级版式。"
-            if structure_dimension == "geography"
-            else "历史分部连续性不足，结构迁移与增量贡献页已使用降级版式。"
+        if full_coverage_mode:
+            coverage_warnings.append(
+                "历史结构页当前以地区视角呈现，结构迁移分析仍保持连续时序口径。"
+                if structure_dimension == "geography"
+                else "历史结构页当前以总量经营视角呈现，结构迁移分析仍保持连续时序口径。"
+            )
+        else:
+            coverage_warnings.append(
+                "历史分部连续性不足，结构迁移与增量贡献页已自动切换到地区结构或降级版式。"
+                if structure_dimension == "geography"
+                else "历史分部连续性不足，结构迁移与增量贡献页已使用降级版式。"
+            )
+    if full_coverage_mode:
+        legacy_downgrade_markers = (
+            "降级版式",
+            "自动降级",
+            "结构迁移页将使用降级版式",
+            "结构迁移与增量贡献页采用总量成长与结构限制说明",
+            "结构限制说明",
         )
-    if transcript_summary:
+        coverage_warnings = [
+            item
+            for item in coverage_warnings
+            if not any(marker in str(item) for marker in legacy_downgrade_markers)
+        ]
+    if transcript_summary and transcript_summary.get("source_type") == "manual_transcript":
         coverage_warnings.insert(0, f"已应用手动上传 transcript：{transcript_summary['filename']}")
+    elif transcript_summary and transcript_summary.get("source_type") == "official_call_material":
+        coverage_warnings.insert(0, f"已自动提取官方电话会材料：{transcript_summary['filename']}")
+    if narrative_provenance["qna"]["status"] == "official_call_material":
+        coverage_warnings.insert(0, "当前问答主题优先依据官方电话会材料整理，并非静态模板。")
+    elif narrative_provenance["qna"]["status"] == "official_material_inferred":
+        coverage_warnings.insert(0, "当前未获取到当季完整电话会 transcript / Q&A，问答主题基于官方财报材料动态推断。")
+    elif narrative_provenance["qna"]["status"] == "structured_fallback":
+        coverage_warnings.insert(0, "当前缺少可解析的官方电话会与财报原文材料，问答主题仍带有统一研究 fallback 性质。")
     _emit_progress(progress_callback, 0.92, "views", "正在整理机构观点与研究辅助视角...")
     institutional_views = get_institutional_views(
         company,
@@ -3249,7 +4121,7 @@ def build_report_payload(
     cash_panel = _build_cash_quality_panel(company, fixture, history[-1], money_symbol)
     guidance_panel = _build_guidance_panel(fixture, history[-1], money_symbol)
     expectation_panel = _build_expectation_panel(fixture, history, money_symbol)
-    call_panel = _build_call_panel(fixture, transcript_summary, qna_topics)
+    call_panel = _build_call_panel(fixture, transcript_summary, qna_topics, narrative_provenance)
     history_summary_cards = _build_history_summary_cards(history, money_symbol)
     takeaways = _normalize_takeaways(fixture["takeaways"], fixture["latest_kpis"], history[-1], money_symbol)
     layered_takeaways = _build_layered_takeaways(company, fixture, history, money_symbol)
@@ -3323,11 +4195,11 @@ def build_report_payload(
             "管理层重点" if uses_official_context else "研究关注重点",
             fixture["management_themes"],
             brand["primary"],
-            "电话会 / 问答主题" if uses_official_context else "研究问题与追踪点",
+            narrative_provenance["qna_chart_title"] if uses_official_context else "研究问题与追踪点",
             qna_topics,
             brand["secondary"],
-            left_subtitle="按管理层讨论密度与重要性打分" if uses_official_context else "按结构化财务数据自动提炼",
-            right_subtitle="按问答热度与研究关注度打分" if uses_official_context else "按研究关注度与潜在拐点排序",
+            left_subtitle=narrative_provenance["management_chart_subtitle"] if uses_official_context else "按结构化财务数据自动提炼",
+            right_subtitle=narrative_provenance["qna_chart_subtitle"] if uses_official_context else "按研究关注度与潜在拐点排序",
         ),
         "risks_catalysts": render_dual_ranked_svg(
             "主要风险",
@@ -3376,9 +4248,9 @@ def build_report_payload(
         structure_dimension=structure_dimension,
         institutional_views=institutional_views,
     )
-
-    return {
+    payload = {
         "payload_schema_version": REPORT_PAYLOAD_SCHEMA_VERSION,
+        "full_coverage_required": full_coverage_mode,
         "company": company,
         "report_style": report_style,
         "section_meta": section_meta,
@@ -3407,6 +4279,7 @@ def build_report_payload(
         "cash_panel": cash_panel,
         "call_panel": call_panel,
         "call_quote_cards": call_quote_cards,
+        "narrative_provenance": narrative_provenance,
         "institutional_views": institutional_views,
         "institutional_digest": institutional_digest,
         "management_themes": fixture["management_themes"],
@@ -3434,6 +4307,22 @@ def build_report_payload(
         "page_count": 16,
         "generated_at": now_iso(),
     }
+    quality_report = evaluate_report_payload(
+        payload,
+        history_window=history_window,
+        require_full_coverage=full_coverage_mode,
+    )
+    payload["quality_report"] = quality_report
+    quality_warnings = quality_warnings_for_payload(quality_report)
+    if quality_warnings:
+        payload["coverage_warnings"] = _reconcile_coverage_warnings(
+            list(payload["coverage_warnings"]) + quality_warnings,
+            fixture=fixture,
+            source_materials=source_materials,
+            structure_dimension=structure_dimension,
+            institutional_views=institutional_views,
+        )
+    return payload
 
 
 def _existing_report(company_id: str, calendar_quarter: str, history_window: int) -> Optional[dict[str, Any]]:
@@ -3549,8 +4438,19 @@ def create_report(
         history_window,
         manual_transcript_upload_id,
         refresh_source_materials=force_refresh,
+        require_full_coverage=None,
         progress_callback=progress_callback,
     )
+    quality = dict(payload.get("quality_report") or {})
+    if payload.get("full_coverage_required") and str(quality.get("status") or "fail") != "pass":
+        issue_messages = [
+            str(item.get("message") or "").strip()
+            for item in list(quality.get("issues") or [])
+            if str(item.get("message") or "").strip()
+        ]
+        top_reasons = "；".join(issue_messages[:3]) if issue_messages else "质量门禁未通过。"
+        raise ValueError(f"Full coverage quality gate failed: {top_reasons}")
+
     report_id = uuid.uuid4().hex
     created_at = now_iso()
     with get_connection() as connection:
@@ -3613,6 +4513,8 @@ def ensure_report_payload_defaults(payload: dict[str, Any]) -> dict[str, Any]:
                 str(((company.get("brand") or {}).get("primary")) or "#0F172A"),
             )
             normalized["visuals"] = visuals
+    if not isinstance(normalized.get("quality_report"), dict):
+        normalized["quality_report"] = evaluate_report_payload(normalized)
     return normalized
 
 
@@ -3830,8 +4732,13 @@ def create_report_job(
 def company_cards() -> list[dict[str, Any]]:
     cards = []
     for company in list_companies():
-        supported_quarters = get_supported_quarters(str(company["id"]), 12, fetch_missing=False) or list(company["supported_quarters"])
-        latest_quarter = supported_quarters[-1]
+        raw_supported_quarters = get_supported_quarters(str(company["id"]), 12, fetch_missing=False) or list(company["supported_quarters"])
+        supported_quarters, _ready_map_applied = _filter_supported_quarters_by_full_coverage(
+            str(company["id"]),
+            list(raw_supported_quarters),
+            12,
+        )
+        latest_quarter = (supported_quarters or raw_supported_quarters)[-1]
         fixture = get_quarter_fixture(company["id"], latest_quarter)
         cards.append(
             {
@@ -3842,6 +4749,7 @@ def company_cards() -> list[dict[str, Any]]:
                 "description": company["description"],
                 "brand": company["brand"],
                 "supported_quarters": supported_quarters,
+                "full_coverage_required": _require_full_coverage_mode(),
                 "structure_priority": company["structure_priority"],
                 "money_symbol": company["money_symbol"],
                 "currency_code": company["currency_code"],
@@ -3860,9 +4768,16 @@ def company_cards() -> list[dict[str, Any]]:
 def company_quarters(company_id: str, history_window: int = 12) -> dict[str, Any]:
     all_periods = get_company_periods(company_id, fetch_missing=True)
     supported_quarters = get_supported_quarters(company_id, history_window, fetch_missing=True)
+    supported_quarters, ready_map_applied = _filter_supported_quarters_by_full_coverage(
+        company_id,
+        supported_quarters,
+        history_window,
+    )
     return {
         "company_id": company_id,
         "history_window": history_window,
         "all_quarters": all_periods,
         "supported_quarters": supported_quarters,
+        "full_coverage_required": _require_full_coverage_mode(),
+        "full_coverage_ready_map_applied": ready_map_applied,
     }

@@ -2984,8 +2984,29 @@ def render_contribution_svg(entries: list[dict[str, object]], colors: dict[str, 
         )
         return _svg(width, height, "".join(body))
 
-    first_segments = {segment["name"]: float(segment["value_bn"]) for segment in _entry_structure_items(entries[0])[0]}
-    last_segments = {segment["name"]: float(segment["value_bn"]) for segment in _entry_structure_items(entries[-1])[0]}
+    valid_revenue_entries = [entry for entry in entries if entry.get("revenue_bn") is not None]
+    if len(valid_revenue_entries) < 2:
+        note = fallback_note or "当前无法构建连续 12 季收入增量拆解，系统转而展示结构方向与管理层口径。"
+        body.extend(
+            [
+                '<rect x="42" y="74" width="1096" height="176" rx="24" fill="#F8FAFC" stroke="#E2E8F0"/>',
+                f'<text x="76" y="122" font-size="18" font-weight="700" fill="{primary}">增量拆解降级</text>',
+                f'<text x="76" y="158" font-size="14" fill="#334155">{_escape(note)}</text>',
+                '<text x="76" y="190" font-size="14" fill="#64748B">通常是历史收入序列仍在补齐中，报告会继续保留其他趋势页。</text>',
+            ]
+        )
+        return _svg(width, height, "".join(body))
+
+    first_revenue_entry = valid_revenue_entries[0]
+    last_revenue_entry = valid_revenue_entries[-1]
+    first_segments = {
+        segment["name"]: float(segment["value_bn"])
+        for segment in _entry_structure_items(first_revenue_entry)[0]
+    }
+    last_segments = {
+        segment["name"]: float(segment["value_bn"])
+        for segment in _entry_structure_items(last_revenue_entry)[0]
+    }
     names = []
     for name in list(last_segments.keys()) + list(first_segments.keys()):
         if name not in names:
@@ -3006,9 +3027,11 @@ def render_contribution_svg(entries: list[dict[str, object]], colors: dict[str, 
                 f'<text x="{value_x}" y="{y+22}" font-size="12" fill="#0F172A">{delta_label}</text>',
             ]
         )
-    total_delta = float(entries[-1]["revenue_bn"]) - float(entries[0]["revenue_bn"])
+    total_delta = float(last_revenue_entry["revenue_bn"]) - float(first_revenue_entry["revenue_bn"])
+    first_label = _escape(str(first_revenue_entry.get("quarter_label") or "-"))
+    last_label = _escape(str(last_revenue_entry.get("quarter_label") or "-"))
     body.append(
-        f'<text x="42" y="274" font-size="12" fill="#475569">总收入增量：{format_money_bn(total_delta, money_symbol)} | 观察期：{_escape(str(entries[0]["quarter_label"]))} → {_escape(str(entries[-1]["quarter_label"]))}</text>'
+        f'<text x="42" y="274" font-size="12" fill="#475569">总收入增量：{format_money_bn(total_delta, money_symbol)} | 观察期：{first_label} → {last_label}</text>'
     )
     return _svg(width, height, "".join(body))
 

@@ -123,6 +123,11 @@ def _sec_submission_preferred_types(source: dict[str, Any]) -> list[str]:
         return ["EX-99.1", "EX-99", "99.1", "99.01", "EX-13", "8-K", "6-K"]
     if role == "earnings_call" or kind == "call_summary":
         return ["EX-99.2", "EX-99", "99.2", "8-K", "6-K"]
+    if kind == "sec_filing":
+        label = str(source.get("label") or "").lower()
+        url = str(source.get("url") or "").lower()
+        if "6-k" in label or "6-k" in url or "form6k" in url:
+            return ["EX-99.1", "99.1", "EX-99.2", "99.2", "EX-99.3", "99.3", "6-K", "20-F", "EX-13", "EX-99"]
     return ["10-Q", "10-K", "6-K", "20-F", "8-K", "EX-13", "EX-99"]
 
 
@@ -339,7 +344,14 @@ def _html_image_ocr_text(
 def _read_cached_material(meta_path: Path) -> Optional[dict[str, Any]]:
     if not meta_path.exists():
         return None
-    return json.loads(meta_path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        try:
+            meta_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
 
 
 def _parse_iso_datetime(value: str) -> Optional[datetime]:
@@ -368,6 +380,11 @@ def _material_cache_ttl_seconds(source: dict[str, Any], cached: dict[str, Any]) 
 
 
 def _material_cache_is_fresh(source: dict[str, Any], cached: dict[str, Any]) -> bool:
+    kind = str(cached.get("kind") or source.get("kind") or "").casefold()
+    text_length = int(cached.get("text_length") or 0)
+    # Avoid reusing stale near-empty textual caches (common in transient fetch failures).
+    if kind in {"official_release", "presentation", "sec_filing"} and text_length < 120:
+        return False
     fetched_at = _parse_iso_datetime(str(cached.get("fetched_at") or ""))
     if fetched_at is None:
         return False

@@ -82,6 +82,62 @@ Then open:
 python -m unittest discover -s tests
 ```
 
+## Quality Audit (All Companies / All Quarters)
+
+Use the built-in audit script to batch-check generation quality without manually opening each company-quarter report.
+
+```bash
+EARNINGS_DIGEST_DISABLE_SOURCE_FETCH=1 ./.venv/bin/python scripts/audit_dynamic_reports.py \
+  --all-quarters \
+  --history-window 12 \
+  --allow-fallback \
+  --strict \
+  --output tmp/audit-all.json \
+  --summary-markdown tmp/audit-summary.md
+```
+
+`--strict` exits non-zero when any quarter is `fail` or `error`.
+`--allow-fallback` runs the legacy baseline quality rules (useful for offline/cache-only CI runs).
+
+To enforce **no-fallback full coverage** (recommended for production acceptance), run:
+
+```bash
+./.venv/bin/python scripts/audit_dynamic_reports.py \
+  --all-quarters \
+  --history-window 12 \
+  --strict \
+  --output tmp/audit-full-coverage.json \
+  --summary-markdown tmp/audit-full-coverage.md
+```
+
+Full-coverage mode requires online official-source fetching; do **not** set `EARNINGS_DIGEST_DISABLE_SOURCE_FETCH=1`.
+
+To refresh the runtime-ready quarter map from a true full-history audit, write it in the same run:
+
+```bash
+./.venv/bin/python scripts/audit_dynamic_reports.py \
+  --all-quarters \
+  --strict \
+  --write-ready-map data/cache/full-coverage-ready-quarters.json \
+  --output tmp/audit-full-coverage.json \
+  --summary-markdown tmp/audit-full-coverage.md
+```
+
+When `--write-ready-map` is enabled, the audit automatically includes quarters that are still hidden from current product selectors so the resulting map can reopen newly-passing historical periods.
+If a full run times out, rerun the exact same command with `--resume` and the existing `--output` path; the audit will skip companies that already have quarter results persisted in that JSON checkpoint.
+
+At runtime, report generation now uses full-coverage gate by default. You can temporarily disable it with:
+
+```bash
+EARNINGS_DIGEST_REQUIRE_FULL_COVERAGE=0
+```
+
+The JSON output now includes `summary.focus_companies` and per-company `top_issue_codes` to help prioritize parser and data-coverage fixes.
+Quarter selectors now default to report-ready periods only (history window must have complete revenue + net-income coverage).
+GitHub Actions workflow [`quality-gate.yml`](.github/workflows/quality-gate.yml) runs this strict audit automatically and uploads JSON/Markdown artifacts.
+
+To inspect parser backlog (including quarters hidden from product selectors), add `--include-unready` with `--all-quarters`.
+
 ## API Overview
 
 The app ships with both page routes and JSON endpoints.

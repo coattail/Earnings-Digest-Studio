@@ -23,6 +23,7 @@ RECENT_SUBMISSIONS_TTL_SECONDS = 12 * 60 * 60
 HISTORICAL_SUBMISSIONS_TTL_SECONDS = 30 * 24 * 60 * 60
 ARCHIVE_SUBMISSIONS_TTL_SECONDS = 90 * 24 * 60 * 60
 IR_DISCOVERY_TTL_SECONDS = 14 * 24 * 60 * 60
+SITEMAP_DISCOVERY_TTL_SECONDS = 14 * 24 * 60 * 60
 DEFAULT_RELEASE_HINTS = (
     "press release",
     "earnings release",
@@ -84,6 +85,7 @@ ATTACHMENT_BINARY_SUFFIXES = {
 }
 SourceProgressCallback = Callable[[float, str], None]
 RESOLVED_SOURCES_MEMORY_CACHE: dict[tuple[str, str, str, bool, tuple[tuple[str, str, str, str, str], ...]], list[dict[str, Any]]] = {}
+SITEMAP_LINKS_MEMORY_CACHE: dict[str, list[dict[str, str]]] = {}
 
 
 def _cache_path(company_id: str) -> Path:
@@ -103,6 +105,13 @@ def _ir_cache_path(company_id: str, calendar_quarter: str) -> Path:
     ensure_directories()
     OFFICIAL_SOURCES_DIR.mkdir(parents=True, exist_ok=True)
     return OFFICIAL_SOURCES_DIR / f"{company_id}-{calendar_quarter}-ir-discovery.json"
+
+
+def _sitemap_cache_path(company_id: str, sitemap_url: str) -> Path:
+    ensure_directories()
+    OFFICIAL_SOURCES_DIR.mkdir(parents=True, exist_ok=True)
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "-", sitemap_url).strip("-")[:96] or "sitemap"
+    return OFFICIAL_SOURCES_DIR / f"{company_id}-{stem}-sitemap-links.json"
 
 
 def _parse_date(value: str) -> Optional[date]:
@@ -294,6 +303,7 @@ def _filing_score(
     form = str(row.get("form") or "")
     if form not in forms:
         return -10_000
+    document_tokens = _document_tokens(row.get("primaryDocument"), row.get("primaryDocDescription"))
     score += max(0, 200 - forms.index(form) * 30)
     filing_date = _parse_date(str(row.get("filingDate") or ""))
     if filing_date and target_date:
@@ -310,10 +320,14 @@ def _filing_score(
     if release_mode and form == "8-K" and "2.02" not in str(row.get("items") or ""):
         return -10_000
     score += _score_document_tokens(
-        _document_tokens(row.get("primaryDocument"), row.get("primaryDocDescription")),
+        document_tokens,
         hints=document_hints,
         excludes=document_excludes,
     )
+    if document_hints and not any(hint in document_tokens for hint in document_hints):
+        score -= 120
+    if document_excludes and any(token in document_tokens for token in document_excludes):
+        score -= 160
     return score
 
 
@@ -426,6 +440,8 @@ def _attachment_score(
         score -= 220
     if suffix in {".htm", ".html", ".pdf", ".txt"}:
         score += 8
+    if "form6k" in lower_name:
+        score -= 18
     if lower_name.endswith("-index.html") or lower_name.endswith("-index-headers.html"):
         score -= 220
     if lower_name in {"index.html", "index.htm", "index.json"}:
@@ -438,13 +454,21 @@ def _attachment_score(
         score -= 120
     if any(token in lower_name for token in ("pressrelease", "earningsrelease", "financialresults", "results", "withguidance")):
         score += 28
+    if any(token in lower_name for token in ("quarterlyresul", "q1results", "q2results", "q3results", "q4results")):
+        score += 24
     if any(token in lower_name for token in ("exhibit991", "exhibit99", "99-1", "99_1", "ex99")):
         score += 24
     if any(token in lower_name for token in ("presentation", "slides", "deck")):
         score += 22
+    if any(token in lower_name for token in ("presentat", "presq", "presq1", "presq2", "presq3", "presq4")):
+        score += 22
     if any(token in lower_name for token in ("commentary", "cfo", "supplement")):
         score += 26
     if any(token in lower_name for token in ("exhibit992", "99-2", "99_2")):
+        score += 18
+    if re.search(r"d[a-z0-9]+dex99(?:1|01)\b", lower_name):
+        score += 24
+    if re.search(r"d[a-z0-9]+dex99(?:2|02)\b", lower_name):
         score += 18
     return score
 
@@ -469,19 +493,55 @@ def _best_attachment(
     return (best_url, best_text, best_score)
 
 
+def _wrapper_document_score(
+    wrapper_url: str,
+    *,
+    hints: tuple[str, ...],
+    excludes: tuple[str, ...],
+) -> int:
+    parsed = urlparse(wrapper_url)
+    name = Path(parsed.path).name.lower()
+    tokens = _document_tokens(wrapper_url, _url_slug_text(wrapper_url), name)
+    score = _score_document_tokens(tokens, hints=hints, excludes=excludes)
+    if name.endswith((".htm", ".html", ".pdf", ".txt")):
+        score += 8
+    if name.endswith(("-index.html", "-index-headers.html", "index.html", "index.htm", "index.json")):
+        score -= 220
+    if any(token in name for token in ("header", "xbrl", "schema", "instance", "ex101", "graphic", "image")):
+        score -= 120
+    return score
+
+
 def _discover_attachment_url(
     wrapper_url: str,
     *,
     hints: tuple[str, ...],
     excludes: tuple[str, ...],
 ) -> tuple[str, str]:
+    def _prefer_attachment_over_wrapper(candidate_url: str, candidate_score: int) -> bool:
+        wrapper_name = Path(urlparse(wrapper_url).path).name.lower()
+        candidate_name = Path(urlparse(candidate_url).path).name.lower()
+        return (
+            candidate_url != wrapper_url
+            and candidate_score >= wrapper_score
+            and any(token in candidate_name for token in ("pressreleasequarterlyresul", "financialstatements", "presentat", "presq"))
+            and any(token in wrapper_name for token in ("form6k", "quarterlyfilings"))
+        )
+
+    wrapper_score = _wrapper_document_score(
+        wrapper_url,
+        hints=hints,
+        excludes=excludes,
+    )
     directory_choice = _best_attachment(
         _directory_attachment_rows(wrapper_url),
         wrapper_url=wrapper_url,
         hints=hints,
         excludes=excludes,
     )
-    if directory_choice[2] > 0 and directory_choice[0] != wrapper_url:
+    if _prefer_attachment_over_wrapper(directory_choice[0], directory_choice[2]):
+        return (directory_choice[0], directory_choice[1])
+    if directory_choice[2] > wrapper_score + 6 and directory_choice[0] != wrapper_url:
         return (directory_choice[0], directory_choice[1])
     try:
         wrapper_html = _fetch_text(wrapper_url)
@@ -493,7 +553,34 @@ def _discover_attachment_url(
         hints=hints,
         excludes=excludes,
     )
-    if best_score > 0:
+    attachment_name = Path(urlparse(best_url).path).name.lower()
+    attachment_tokens = _document_tokens(best_url, best_text, _url_slug_text(best_url))
+    generic_exhibit_without_quarter_signal = (
+        wrapper_score >= 35
+        and re.search(r"d[a-z0-9]+dex99(?:1|01|2|02)\b", attachment_name) is not None
+        and not any(
+            token in attachment_tokens
+            for token in (
+                "quarter",
+                "result",
+                "financial",
+                "q1",
+                "q2",
+                "q3",
+                "q4",
+                "presentation",
+                "commentary",
+                "supplement",
+                "webcast",
+                "transcript",
+            )
+        )
+    )
+    if generic_exhibit_without_quarter_signal:
+        return (wrapper_url, "")
+    if _prefer_attachment_over_wrapper(best_url, best_score):
+        return (best_url, best_text)
+    if best_score > wrapper_score + 6:
         return (best_url, best_text)
     return (wrapper_url, "")
 
@@ -576,9 +663,15 @@ def _merge_sources(existing_sources: list[dict[str, Any]], resolved_sources: lis
         source.get("kind") in {"official_release", "sec_filing", "presentation"} and source.get("url")
         for source in resolved_sources
     )
+    has_resolved_release = any(str(source.get("kind") or "") == "official_release" for source in resolved_sources)
+    has_resolved_filing = any(str(source.get("kind") or "") == "sec_filing" for source in resolved_sources)
     ordered = list(resolved_sources)
     for source in existing_sources:
         if has_official and source.get("kind") == "investor_relations":
+            continue
+        if has_resolved_release and source.get("kind") == "official_release":
+            continue
+        if has_resolved_filing and source.get("kind") == "sec_filing":
             continue
         ordered.append(source)
     def _source_priority(source: dict[str, Any]) -> tuple[int, int]:
@@ -608,6 +701,30 @@ def _merge_sources(existing_sources: list[dict[str, Any]], resolved_sources: lis
         merged.append(source)
         seen.add(url)
     return merged
+
+
+def _quarter_sort_key(calendar_quarter: str) -> tuple[int, int]:
+    match = re.fullmatch(r"(\d{4})Q([1-4])", str(calendar_quarter or ""))
+    if not match:
+        return (0, 0)
+    return (int(match.group(1)), int(match.group(2)))
+
+
+def _sec_cik_for_calendar_quarter(source_config: dict[str, Any], calendar_quarter: str) -> str:
+    default_cik = str(source_config.get("sec_cik") or "").strip()
+    quarter_key = _quarter_sort_key(calendar_quarter)
+    if quarter_key == (0, 0):
+        return default_cik
+    for item in list(source_config.get("historical_sec_ciks") or []):
+        if not isinstance(item, dict):
+            continue
+        override_cik = str(item.get("sec_cik") or "").strip()
+        through_quarter = str(item.get("through") or "").strip()
+        if not override_cik or not through_quarter:
+            continue
+        if quarter_key <= _quarter_sort_key(through_quarter):
+            return override_cik
+    return default_cik
 
 
 def _normalize_href(base_url: str, href: str) -> Optional[str]:
@@ -840,7 +957,14 @@ def _ir_role_keywords_match(link: dict[str, str], role: str) -> bool:
     if role == "earnings_presentation":
         if any(keyword in tokens for keyword in ("events and presentations", "past events", "upcoming events", "quarterly results")):
             return False
-        return any(keyword in tokens for keyword in ("presentation", "slides", "deck", "supplement", ".pdf", "download"))
+        if any(keyword in tokens for keyword in ("how to", "tutorial", "template", "training", "pitch deck")):
+            return False
+        has_asset_hint = any(keyword in tokens for keyword in ("presentation", "slides", "deck", "supplement", ".pdf", "download"))
+        has_earnings_context = any(
+            keyword in tokens
+            for keyword in ("earnings", "financial results", "quarterly results", "fiscal", "q1", "q2", "q3", "q4", "investor")
+        )
+        return has_asset_hint and has_earnings_context
     if role == "earnings_commentary":
         return any(keyword in tokens for keyword in ("commentary", "supplement", "prepared remarks"))
     if role == "earnings_release":
@@ -1070,6 +1194,7 @@ def _discover_sitemap_sources(
     period_end: str,
     sitemap_url: str,
     *,
+    refresh: bool = False,
     required_roles: Optional[set[str]] = None,
 ) -> list[dict[str, Any]]:
     def _dedupe_urls(urls: list[str]) -> list[str]:
@@ -1105,6 +1230,38 @@ def _discover_sitemap_sources(
             score -= 6
         return score
 
+    def _cached_sitemap_links(target_url: str) -> list[dict[str, str]]:
+        cache_key = f"{company['id']}::{target_url}"
+        if not refresh and cache_key in SITEMAP_LINKS_MEMORY_CACHE:
+            return [dict(item) for item in SITEMAP_LINKS_MEMORY_CACHE[cache_key]]
+        cache_path = _sitemap_cache_path(str(company["id"]), target_url)
+        if not refresh and _cache_file_is_fresh(cache_path, SITEMAP_DISCOVERY_TTL_SECONDS):
+            cached = _read_cached_submissions(cache_path)
+            links = list(cached.get("links") or []) if isinstance(cached, dict) else []
+            normalized = [
+                {"url": str(item.get("url") or ""), "text": str(item.get("text") or "")}
+                for item in links
+                if str(item.get("url") or "")
+            ]
+            SITEMAP_LINKS_MEMORY_CACHE[cache_key] = normalized
+            return [dict(item) for item in normalized]
+        links = _sitemap_links_from_url(target_url)
+        normalized = [
+            {"url": str(item.get("url") or ""), "text": str(item.get("text") or "")}
+            for item in links
+            if str(item.get("url") or "")
+        ]
+        _write_cached_submissions(
+            cache_path,
+            {
+                "company_id": company["id"],
+                "sitemap_url": target_url,
+                "links": normalized,
+            },
+        )
+        SITEMAP_LINKS_MEMORY_CACHE[cache_key] = normalized
+        return [dict(item) for item in normalized]
+
     def _sitemap_links_from_url(target_url: str, depth: int = 0) -> list[dict[str, str]]:
         try:
             payload = _fetch_text(target_url)
@@ -1139,7 +1296,7 @@ def _discover_sitemap_sources(
 
     calendar_terms, fiscal_terms, target_years, allowed_quarters = _quarter_reference_terms(company, calendar_quarter, period_end)
     roles = required_roles or {"earnings_release", "earnings_call", "earnings_presentation", "earnings_commentary"}
-    sitemap_links = _sitemap_links_from_url(sitemap_url)
+    sitemap_links = _cached_sitemap_links(sitemap_url)
     if not sitemap_links:
         return []
     discovered: list[dict[str, Any]] = []
@@ -1223,7 +1380,7 @@ def _discover_default_sitemap_urls(ir_url: str) -> list[str]:
 
 def _series_fallback_source(company: dict[str, Any], calendar_quarter: str) -> Optional[dict[str, Any]]:
     source_config = dict(company.get("official_source") or {})
-    sec_cik = str(source_config.get("sec_cik") or "")
+    sec_cik = _sec_cik_for_calendar_quarter(source_config, calendar_quarter)
     if not sec_cik:
         return None
     try:
@@ -1283,7 +1440,7 @@ def resolve_official_sources(
         notify(1.0, "已复用进程内官方源发现缓存。")
         return copy.deepcopy(RESOLVED_SOURCES_MEMORY_CACHE[cache_key])
     source_config = dict(company.get("official_source") or {})
-    sec_cik = str(source_config.get("sec_cik") or "")
+    sec_cik = _sec_cik_for_calendar_quarter(source_config, calendar_quarter)
     sitemap_urls = [str(item).strip() for item in list(source_config.get("discovery_sitemaps") or []) if str(item).strip()]
     if os.environ.get(DISABLE_FETCH_ENV) == "1":
         notify(1.0, "当前公司未启用在线官方源解析，直接沿用现有来源。")
@@ -1372,6 +1529,25 @@ def resolve_official_sources(
 
     if filing_row:
         filing_url = _archive_url(sec_cik, str(filing_row["accessionNumber"]), str(filing_row["primaryDocument"]))
+        if str(filing_row.get("form") or "").upper() == "6-K":
+            filing_attachment_url, _filing_attachment_text = _discover_attachment_url(
+                filing_url,
+                hints=(
+                    "99.3",
+                    "99_3",
+                    "summary",
+                    "financial statements",
+                    "press release",
+                    "presentation",
+                    "quarterly results",
+                    "earnings",
+                    "99.1",
+                    "99.2",
+                ),
+                excludes=filing_document_excludes,
+            )
+            if filing_attachment_url and filing_attachment_url != filing_url:
+                filing_url = filing_attachment_url
         if not any(str(source.get("url") or "") == filing_url for source in resolved):
             resolved.append(
                 {
@@ -1395,11 +1571,13 @@ def resolve_official_sources(
         and _same_domain(ir_url, str(item.get("url") or ""))
         for item in resolved
     )
-    missing_roles = {
-        role
-        for role in {"earnings_release", "earnings_call", "earnings_presentation"}
-        if role not in resolved_roles or (role == "earnings_release" and ir_url and not has_ir_release)
-    }
+    missing_roles: set[str] = set()
+    if not prefer_sec_only:
+        missing_roles = {
+            role
+            for role in {"earnings_release", "earnings_call", "earnings_presentation"}
+            if role not in resolved_roles or (role == "earnings_release" and ir_url and not has_ir_release)
+        }
     auto_sitemap_urls: list[str] = []
     if missing_roles and ir_url:
         auto_sitemap_urls = _discover_default_sitemap_urls(ir_url)
@@ -1414,6 +1592,7 @@ def resolve_official_sources(
                     calendar_quarter,
                     period_end,
                     sitemap_url,
+                    refresh=refresh,
                     required_roles=missing_roles,
                 )
             )

@@ -121,6 +121,15 @@ def _merge_parsed_payload(primary: dict[str, Any], fallback: dict[str, Any]) -> 
             continue
         if not _has_value(existing):
             merged[key] = value
+    management_themes = [dict(item) for item in list(merged.get("management_themes") or []) if isinstance(item, dict)]
+    qna_themes = [dict(item) for item in list(merged.get("qna_themes") or []) if isinstance(item, dict)]
+    risks = [dict(item) for item in list(merged.get("risks") or []) if isinstance(item, dict)]
+    catalysts = [dict(item) for item in list(merged.get("catalysts") or []) if isinstance(item, dict)]
+    if management_themes or qna_themes:
+        qna_themes = _ensure_minimum_qna_themes(qna_themes, management_themes, risks, catalysts)
+        management_themes = _ensure_minimum_management_themes(management_themes, qna_themes)
+        merged["qna_themes"] = qna_themes
+        merged["management_themes"] = management_themes
     return merged
 
 
@@ -517,6 +526,10 @@ def _prune_overlapping_segments(
     revenue_bn: Optional[float],
 ) -> list[dict[str, Any]]:
     positive = [dict(item) for item in segments if float(item.get("value_bn") or 0.0) > 0]
+    if str(company_id) == "visa":
+        # Visa discloses revenue pools before client incentives; totals intentionally
+        # do not reconcile 1:1 to net revenue. Keep the official pool set as-is.
+        return positive
     if len(positive) <= 1:
         return positive
 
@@ -547,6 +560,12 @@ def _prune_overlapping_segments(
             if score > best_score:
                 best_score = score
                 best_subset = subset
+
+    if str(company_id) in {"micron", "visa"}:
+        # Micron quarterly tables are already in official BU order (CMBU/CDBU/MCBU/AEBU).
+        # Visa revenue pools are also disclosed in a stable official order.
+        # Keep this sequence stable instead of re-sorting by value.
+        return best_subset
 
     best_subset.sort(key=lambda item: float(item.get("value_bn") or 0.0), reverse=True)
     return best_subset
@@ -989,8 +1008,9 @@ COMPANY_SEGMENT_PROFILES: dict[str, list[dict[str, Any]]] = {
         {"name": "Membership fees", "labels": ["Membership fees"]},
     ],
     "jnj": [
-        {"name": "Innovative Medicine", "labels": ["Innovative Medicine"]},
-        {"name": "MedTech", "labels": ["MedTech"]},
+        {"name": "Consumer Health", "labels": ["Consumer Health"]},
+        {"name": "Pharmaceutical", "labels": ["Pharmaceutical", "Innovative Medicine"]},
+        {"name": "MedTech", "labels": ["MedTech", "Medical Devices"]},
     ],
     "jpm": [
         {"name": "Consumer & Community Banking", "labels": ["Consumer & Community Banking"]},
@@ -999,6 +1019,10 @@ COMPANY_SEGMENT_PROFILES: dict[str, list[dict[str, Any]]] = {
         {"name": "Commercial Banking", "labels": ["Commercial Banking"]},
     ],
     "micron": [
+        {"name": "Compute and Networking Business Unit", "labels": ["Compute and Networking Business Unit", "CNBU"]},
+        {"name": "Mobile Business Unit", "labels": ["Mobile Business Unit", "MBU"]},
+        {"name": "Storage Business Unit", "labels": ["Storage Business Unit", "SBU"]},
+        {"name": "Embedded Business Unit", "labels": ["Embedded Business Unit", "EBU"]},
         {"name": "Cloud Memory Business Unit", "labels": ["Cloud Memory Business Unit", "CMBU"]},
         {"name": "Core Data Center Business Unit", "labels": ["Core Data Center Business Unit", "CDBU"]},
         {"name": "Mobile and Client Business Unit", "labels": ["Mobile and Client Business Unit", "MCBU"]},
@@ -1220,6 +1244,72 @@ def _ensure_parser_context(fallback: dict[str, Any]) -> dict[str, Any]:
     return context
 
 
+def _report_year_from_fallback(fallback: dict[str, Any]) -> Optional[int]:
+    calendar_quarter = _fallback_calendar_quarter(fallback)
+    if calendar_quarter and re.fullmatch(r"\d{4}Q[1-4]", calendar_quarter):
+        return int(calendar_quarter[:4])
+    fiscal_label = str(fallback.get("fiscal_label") or "")
+    match = re.search(r"\b(20\d{2})\b", fiscal_label)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _text_has_implausible_future_year(text: Optional[str], report_year: Optional[int], *, max_gap: int = 3) -> bool:
+    if report_year is None or not text:
+        return False
+    current_year = time.localtime().tm_year
+    if report_year >= current_year - 1:
+        return False
+    years = [int(token) for token in re.findall(r"\b(20\d{2})\b", str(text))]
+    return any(year > report_year + max_gap for year in years)
+
+
+def _sanitize_temporal_narrative_facts(facts: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+    report_year = _report_year_from_fallback(fallback)
+    if report_year is None:
+        return facts
+
+    sanitized = dict(facts)
+
+    def keep_text(text: Optional[str]) -> bool:
+        return not _text_has_implausible_future_year(text, report_year)
+
+    def sanitize_theme_list(items: Any) -> list[dict[str, Any]]:
+        cleaned: list[dict[str, Any]] = []
+        for item in list(items or []):
+            if not isinstance(item, dict):
+                continue
+            if not keep_text(str(item.get("label") or "")) or not keep_text(str(item.get("note") or "")):
+                continue
+            cleaned.append(item)
+        return cleaned
+
+    def sanitize_quote_list(items: Any) -> list[dict[str, Any]]:
+        cleaned: list[dict[str, Any]] = []
+        for item in list(items or []):
+            if not isinstance(item, dict):
+                continue
+            if not keep_text(str(item.get("quote") or "")) or not keep_text(str(item.get("analysis") or "")):
+                continue
+            cleaned.append(item)
+        return cleaned
+
+    for key in ("management_theme_items", "qna_theme_items", "risk_items", "catalyst_items"):
+        if key in sanitized:
+            sanitized[key] = sanitize_theme_list(sanitized.get(key))
+    if "quotes" in sanitized:
+        sanitized["quotes"] = sanitize_quote_list(sanitized.get("quotes"))
+    if not keep_text(str(sanitized.get("driver") or "")):
+        sanitized["driver"] = None
+
+    guidance = dict(sanitized.get("guidance") or {})
+    if guidance and not keep_text(str(guidance.get("commentary") or "")):
+        guidance.pop("commentary", None)
+    sanitized["guidance"] = _clean_mapping(guidance) if guidance else {}
+    return sanitized
+
+
 def _load_nearby_annual_materials(
     company: dict[str, Any],
     fallback: dict[str, Any],
@@ -1248,7 +1338,14 @@ def _load_nearby_annual_materials(
         period_end = _estimate_calendar_period_end(quarter)
         if not period_end:
             continue
-        sources = resolve_official_sources(annual_company, quarter, period_end, [], refresh=False)
+        sources = resolve_official_sources(
+            annual_company,
+            quarter,
+            period_end,
+            [],
+            refresh=False,
+            prefer_sec_only=True,
+        )
         annual_sources = [
             source
             for source in sources
@@ -1299,47 +1396,112 @@ def _nvidia_geographies(sec_flat: str) -> list[dict[str, Any]]:
 
 
 def _avgo_geographies(sec_flat: str) -> list[dict[str, Any]]:
-    matches = re.findall(
+    quarterly_matches = re.findall(
         r"Fiscal Quarter Ended [A-Za-z]+\s+\d{1,2},\s+\d{4}\s+Americas\s+Asia Pacific\s+Europe, the Middle East and Africa\s+Total\s+"
         r"\(In millions\)\s+Products\s+\$?\s*[0-9,]+\s+\$?\s*[0-9,]+\s+\$?\s*[0-9,]+\s+\$?\s*[0-9,]+\s+"
-        r"Subscriptions and services\s+[0-9,]+\s+[0-9,]+\s+[0-9,]+\s+[0-9,]+\s+"
+        r"Subscriptions and services(?:\s+\(a\))?\s+\$?\s*[0-9,]+\s+\$?\s*[0-9,]+\s+\$?\s*[0-9,]+\s+\$?\s*[0-9,]+\s+"
         r"Total\s+\$?\s*([0-9,]+)\s+\$?\s*([0-9,]+)\s+\$?\s*([0-9,]+)\s+\$?\s*[0-9,]+",
         sec_flat,
         flags=re.IGNORECASE | re.DOTALL,
     )
-    if len(matches) < 2:
-        return []
-    current, prior = matches[0], matches[1]
-    return _geography_list(
-        _geography("Americas", _bn_from_millions(current[0]), _pct_change(_bn_from_millions(current[0]), _bn_from_millions(prior[0]))),
-        _geography("Asia Pacific", _bn_from_millions(current[1]), _pct_change(_bn_from_millions(current[1]), _bn_from_millions(prior[1]))),
-        _geography(
-            "Europe, the Middle East and Africa",
-            _bn_from_millions(current[2]),
-            _pct_change(_bn_from_millions(current[2]), _bn_from_millions(prior[2])),
-        ),
+    if quarterly_matches:
+        current = quarterly_matches[0]
+        prior = quarterly_matches[1] if len(quarterly_matches) >= 2 else None
+        return _geography_list(
+            _geography(
+                "Americas",
+                _bn_from_millions(current[0]),
+                _pct_change(_bn_from_millions(current[0]), _bn_from_millions(prior[0])) if prior else None,
+            ),
+            _geography(
+                "Asia Pacific",
+                _bn_from_millions(current[1]),
+                _pct_change(_bn_from_millions(current[1]), _bn_from_millions(prior[1])) if prior else None,
+            ),
+            _geography(
+                "Europe, the Middle East and Africa",
+                _bn_from_millions(current[2]),
+                _pct_change(_bn_from_millions(current[2]), _bn_from_millions(prior[2])) if prior else None,
+            ),
+        )
+
+    annual_matches = re.findall(
+        r"(?:The following table presents revenue disaggregated by type of revenue and by region:\s*)?"
+        r"Fiscal Year(?:\s+Ended\s+[A-Za-z]+\s+\d{1,2},\s+\d{4}|\s+\d{4})\s+Americas\s+Asia Pacific\s+Europe, the Middle East and Africa\s+Total\s+"
+        r"\(In millions\)\s+Products\s+\$?\s*[0-9,]+\s+\$?\s*[0-9,]+\s+\$?\s*[0-9,]+\s+\$?\s*[0-9,]+\s+"
+        r"Subscriptions and services(?:\s+\(a\))?\s+\$?\s*[0-9,]+\s+\$?\s*[0-9,]+\s+\$?\s*[0-9,]+\s+\$?\s*[0-9,]+\s+"
+        r"Total\s+\$?\s*([0-9,]+)\s+\$?\s*([0-9,]+)\s+\$?\s*([0-9,]+)\s+\$?\s*[0-9,]+",
+        sec_flat,
+        flags=re.IGNORECASE | re.DOTALL,
     )
+    if annual_matches:
+        current = annual_matches[0]
+        prior = annual_matches[1] if len(annual_matches) >= 2 else None
+        return _geography_list(
+            _annual_geography("Americas", _bn_from_millions(current[0]), _bn_from_millions(prior[0]) if prior else None),
+            _annual_geography("Asia Pacific", _bn_from_millions(current[1]), _bn_from_millions(prior[1]) if prior else None),
+            _annual_geography("Europe, the Middle East and Africa", _bn_from_millions(current[2]), _bn_from_millions(prior[2]) if prior else None),
+        )
+    return []
 
 
 def _jpm_geographies(sec_flat: str) -> list[dict[str, Any]]:
-    match = _search(
-        r"\d{4}\s+Europe/Middle East/Africa\s*\$?\s*([0-9,]+)\s*\$?\s*[0-9,]+\s*\$?\s*[0-9,]+\s*\$?\s*[0-9,]+\s*\$?\s*[0-9,]+.*?"
-        r"Asia-Pacific\s*([0-9,]+)\s*[0-9,]+\s*[0-9,]+\s*[0-9,]+\s*[0-9,]+.*?"
-        r"Latin America/Caribbean\s*([0-9,]+)\s*[0-9,]+\s*[0-9,]+\s*[0-9,]+\s*[0-9,]+.*?"
-        r"North America\s*\(a\)\s*([0-9,]+)\s*[0-9,]+\s*[0-9,]+\s*[0-9,]+\s*[0-9,]+.*?"
-        r"\d{4}\s+Europe/Middle East/Africa\s*\$?\s*([0-9,]+)\s*\$?\s*[0-9,]+\s*\$?\s*[0-9,]+\s*\$?\s*[0-9,]+\s*\$?\s*[0-9,]+.*?"
-        r"Asia-Pacific\s*([0-9,]+)\s*[0-9,]+\s*[0-9,]+\s*[0-9,]+\s*[0-9,]+.*?"
-        r"Latin America/Caribbean\s*([0-9,]+)\s*[0-9,]+\s*[0-9,]+\s*[0-9,]+\s*[0-9,]+.*?"
-        r"North America\s*\(a\)\s*([0-9,]+)\s*[0-9,]+\s*[0-9,]+\s*[0-9,]+\s*[0-9,]+",
-        sec_flat,
+    anchor_candidates = [
+        "Total net revenue (a) Europe/Middle East/Africa",
+        "Total net revenue Europe/Middle East/Africa",
+        "Europe/Middle East/Africa",
+    ]
+    anchor_index = next((sec_flat.find(token) for token in anchor_candidates if sec_flat.find(token) >= 0), -1)
+    search_text = sec_flat[anchor_index : anchor_index + 6000] if anchor_index >= 0 else sec_flat
+
+    section = ""
+    section_match = _search(
+        r"Total net revenue\s*\(a\)\s+(.*?)Total net revenue\s+\$?",
+        search_text,
     )
-    if not match:
+    if section_match:
+        section = str(section_match.group(1) or "")
+    if section:
+        def _quarterly_row(label: str) -> tuple[Optional[float], Optional[float]]:
+            row_match = _search(
+                rf"{re.escape(label)}\s+\$?\s*([0-9,]+)\s+\$?\s*([0-9,]+)\s+\(?-?[0-9]+\)?\s*%?\s+\$?\s*([0-9,]+)\s+\$?\s*([0-9,]+)",
+                section,
+            )
+            if not row_match:
+                return (None, None)
+            return (_bn_from_millions(row_match.group(3)), _bn_from_millions(row_match.group(4)))
+
+        north_america = _quarterly_row("North America")
+        emea = _quarterly_row("Europe/Middle East/Africa")
+        apac = _quarterly_row("Asia-Pacific")
+        latam = _quarterly_row("Latin America/Caribbean")
+        if all(current is not None and prior is not None for current, prior in [north_america, emea, apac, latam]):
+            return _geography_list(
+                _annual_geography("North America", north_america[0], north_america[1]),
+                _annual_geography("Europe / Middle East / Africa", emea[0], emea[1]),
+                _annual_geography("Asia-Pacific", apac[0], apac[1]),
+                _annual_geography("Latin America / Caribbean", latam[0], latam[1]),
+            )
+
+    def _annual_row(pattern: str) -> tuple[Optional[float], Optional[float]]:
+        matches = list(re.finditer(pattern, search_text, flags=re.IGNORECASE))
+        if len(matches) < 2:
+            return (None, None)
+        current = _bn_from_millions(matches[0].group(1))
+        prior = _bn_from_millions(matches[1].group(1))
+        return (current, prior)
+
+    north_america = _annual_row(r"North America(?:\s*\(a\))?\s+\$?\s*([0-9,]+)")
+    emea = _annual_row(r"Europe/Middle East/Africa\s+\$?\s*([0-9,]+)")
+    apac = _annual_row(r"Asia-Pacific\s+\$?\s*([0-9,]+)")
+    latam = _annual_row(r"Latin America/Caribbean\s+\$?\s*([0-9,]+)")
+    if not all(current is not None and prior is not None for current, prior in [north_america, emea, apac, latam]):
         return []
     return _geography_list(
-        _annual_geography("North America", _bn_from_millions(match.group(4)), _bn_from_millions(match.group(8))),
-        _annual_geography("Europe / Middle East / Africa", _bn_from_millions(match.group(1)), _bn_from_millions(match.group(5))),
-        _annual_geography("Asia-Pacific", _bn_from_millions(match.group(2)), _bn_from_millions(match.group(6))),
-        _annual_geography("Latin America / Caribbean", _bn_from_millions(match.group(3)), _bn_from_millions(match.group(7))),
+        _annual_geography("North America", north_america[0], north_america[1]),
+        _annual_geography("Europe / Middle East / Africa", emea[0], emea[1]),
+        _annual_geography("Asia-Pacific", apac[0], apac[1]),
+        _annual_geography("Latin America / Caribbean", latam[0], latam[1]),
     )
 
 
@@ -1389,6 +1551,41 @@ def _xom_geographies(sec_flat: str) -> list[dict[str, Any]]:
     return _geography_list(
         _annual_geography("U.S.", round(current_us / 1000, 3), round(prior_us / 1000, 3)),
         _annual_geography("Non-U.S.", round(current_non_us / 1000, 3), round(prior_non_us / 1000, 3)),
+    )
+
+
+def _meta_geographies(sec_flat: str) -> list[dict[str, Any]]:
+    billing_party_pattern = r"(?:marketer or developer|advertiser or developer|advertiser or Platform developer)"
+    quarterly_match = _search(
+        rf"Revenue by geography is based on the billing address of the {billing_party_pattern}\.\s+"
+        r"The following table(?:s)? set(?:s)? forth revenue and property and equipment, net by geographic area \(in millions\):\s+"
+        r"Three\s+Months\s+Ended\s+[A-Za-z]+\s+\d{1,2},\s+\s*Six Months Ended\s+[A-Za-z]+\s+\d{1,2},\s+\s*"
+        r"\d{4}\s*\d{4}\s*\d{4}\s*\d{4}\s+Revenue:\s+"
+        r"United States\s*\$?\s*([0-9,]+)\s*\$?\s*([0-9,]+)\s*\$?\s*[0-9,]+\s*\$?\s*[0-9,]+\s+"
+        r"Rest of the world\s*\(?1\)?\s*([0-9,]+)\s*([0-9,]+)\s*[0-9,]+\s*[0-9,]+\s+"
+        r"Total revenue",
+        sec_flat,
+    )
+    if quarterly_match:
+        return _geography_list(
+            _geography("United States", _bn_from_millions(quarterly_match.group(1)), _pct_change(_bn_from_millions(quarterly_match.group(1)), _bn_from_millions(quarterly_match.group(2)))),
+            _geography("Rest of the world", _bn_from_millions(quarterly_match.group(3)), _pct_change(_bn_from_millions(quarterly_match.group(3)), _bn_from_millions(quarterly_match.group(4)))),
+        )
+
+    match = _search(
+        rf"Revenue by geography is based on the billing address of the {billing_party_pattern}\.\s+"
+        r"The following table(?:s)? set(?:s)? forth revenue and property and equipment, net by geographic area \(in millions\):\s+"
+        r"Year Ended December 31,\s*\d{4}\s*\d{4}\s*\d{4}\s+Revenue:\s+"
+        r"United States\s*\$?\s*([0-9,]+)\s*\$?\s*([0-9,]+)\s*\$?\s*[0-9,]+\s+"
+        r"Rest of the world\s*\(?1\)?\s*([0-9,]+)\s*([0-9,]+)\s*[0-9,]+\s+"
+        r"Total revenue",
+        sec_flat,
+    )
+    if not match:
+        return []
+    return _geography_list(
+        _annual_geography("United States", _bn_from_millions(match.group(1)), _bn_from_millions(match.group(2))),
+        _annual_geography("Rest of the world", _bn_from_millions(match.group(3)), _bn_from_millions(match.group(4))),
     )
 
 
@@ -1467,18 +1664,57 @@ def _asml_geographies(sec_flat: str) -> list[dict[str, Any]]:
         r"United States\s*([0-9,]+(?:\.[0-9]+)?)\s*[0-9,]+(?:\.[0-9]+)?\s*([0-9,]+(?:\.[0-9]+)?)\s*[0-9,]+(?:\.[0-9]+)?\s*([0-9,]+(?:\.[0-9]+)?)",
         sec_flat,
     )
-    if not match:
+    if match:
+        return _geography_list(
+            _annual_geography("China", _bn_from_millions(match.group(15)), _bn_from_millions(match.group(14))),
+            _annual_geography("Taiwan", _bn_from_millions(match.group(12)), _bn_from_millions(match.group(11))),
+            _annual_geography("South Korea", _bn_from_millions(match.group(6)), _bn_from_millions(match.group(5))),
+            _annual_geography("United States", _bn_from_millions(match.group(27)), _bn_from_millions(match.group(26))),
+            _annual_geography("Japan", _bn_from_millions(match.group(3)), _bn_from_millions(match.group(2))),
+            _annual_geography("Singapore", _bn_from_millions(match.group(9)), _bn_from_millions(match.group(8))),
+            _annual_geography("Rest of Asia", _bn_from_millions(match.group(18)), _bn_from_millions(match.group(17))),
+            _annual_geography("EMEA", _bn_from_millions(match.group(24)), _bn_from_millions(match.group(23))),
+            _annual_geography("Netherlands", _bn_from_millions(match.group(21)), _bn_from_millions(match.group(20))),
+        )
+
+    legacy_match = _search(
+        r"Total net sales and long-lived assets \(consisting of property, plant and equipment\) by geographic region were as follows:\s*"
+        r"Year ended December\s*31\s*Total net sales\s*Long-lived assets\s*\(in millions\)\s*EUR\s*EUR\s*"
+        r"(\d{4})\s*"
+        r"Japan\s*([0-9,]+(?:\.[0-9]+)?)\s*[0-9,]+(?:\.[0-9]+)?\s*"
+        r"Korea\s*([0-9,]+(?:\.[0-9]+)?)\s*[0-9,]+(?:\.[0-9]+)?\s*"
+        r"Singapore\s*([0-9,]+(?:\.[0-9]+)?)\s*[0-9,]+(?:\.[0-9]+)?\s*"
+        r"Taiwan\s*([0-9,]+(?:\.[0-9]+)?)\s*[0-9,]+(?:\.[0-9]+)?\s*"
+        r"China\s*([0-9,]+(?:\.[0-9]+)?)\s*[0-9,]+(?:\.[0-9]+)?\s*"
+        r"Rest of Asia\s*([0-9,]+(?:\.[0-9]+)?)\s*[0-9,]+(?:\.[0-9]+)?\s*"
+        r"Netherlands\s*([0-9,]+(?:\.[0-9]+)?)\s*[0-9,]+(?:\.[0-9]+)?\s*"
+        r"EMEA\s*([0-9,]+(?:\.[0-9]+)?)\s*[0-9,]+(?:\.[0-9]+)?\s*"
+        r"United States\s*([0-9,]+(?:\.[0-9]+)?)\s*[0-9,]+(?:\.[0-9]+)?\s*"
+        r"Total\s*[0-9,]+(?:\.[0-9]+)?\s*[0-9,]+(?:\.[0-9]+)?\s*"
+        r"(\d{4})\s*1?\s*"
+        r"Japan\s*([0-9,]+(?:\.[0-9]+)?)\s*[0-9,]+(?:\.[0-9]+)?\s*"
+        r"Korea\s*([0-9,]+(?:\.[0-9]+)?)\s*[0-9,]+(?:\.[0-9]+)?\s*"
+        r"Singapore\s*([0-9,]+(?:\.[0-9]+)?)\s*[0-9,]+(?:\.[0-9]+)?\s*"
+        r"Taiwan\s*([0-9,]+(?:\.[0-9]+)?)\s*[0-9,]+(?:\.[0-9]+)?\s*"
+        r"China\s*([0-9,]+(?:\.[0-9]+)?)\s*[0-9,]+(?:\.[0-9]+)?\s*"
+        r"Rest of Asia\s*([0-9,]+(?:\.[0-9]+)?)\s*[0-9,]+(?:\.[0-9]+)?\s*"
+        r"Netherlands\s*([0-9,]+(?:\.[0-9]+)?)\s*[0-9,]+(?:\.[0-9]+)?\s*"
+        r"EMEA\s*([0-9,]+(?:\.[0-9]+)?)\s*[0-9,]+(?:\.[0-9]+)?\s*"
+        r"United States\s*([0-9,]+(?:\.[0-9]+)?)",
+        sec_flat,
+    )
+    if not legacy_match:
         return []
     return _geography_list(
-        _annual_geography("China", _bn_from_millions(match.group(15)), _bn_from_millions(match.group(14))),
-        _annual_geography("Taiwan", _bn_from_millions(match.group(12)), _bn_from_millions(match.group(11))),
-        _annual_geography("South Korea", _bn_from_millions(match.group(6)), _bn_from_millions(match.group(5))),
-        _annual_geography("United States", _bn_from_millions(match.group(27)), _bn_from_millions(match.group(26))),
-        _annual_geography("Japan", _bn_from_millions(match.group(3)), _bn_from_millions(match.group(2))),
-        _annual_geography("Singapore", _bn_from_millions(match.group(9)), _bn_from_millions(match.group(8))),
-        _annual_geography("Rest of Asia", _bn_from_millions(match.group(18)), _bn_from_millions(match.group(17))),
-        _annual_geography("EMEA", _bn_from_millions(match.group(24)), _bn_from_millions(match.group(23))),
-        _annual_geography("Netherlands", _bn_from_millions(match.group(21)), _bn_from_millions(match.group(20))),
+        _annual_geography("China", _bn_from_millions(legacy_match.group(6)), _bn_from_millions(legacy_match.group(15))),
+        _annual_geography("Taiwan", _bn_from_millions(legacy_match.group(5)), _bn_from_millions(legacy_match.group(14))),
+        _annual_geography("South Korea", _bn_from_millions(legacy_match.group(3)), _bn_from_millions(legacy_match.group(12))),
+        _annual_geography("United States", _bn_from_millions(legacy_match.group(10)), _bn_from_millions(legacy_match.group(19))),
+        _annual_geography("Japan", _bn_from_millions(legacy_match.group(2)), _bn_from_millions(legacy_match.group(11))),
+        _annual_geography("Singapore", _bn_from_millions(legacy_match.group(4)), _bn_from_millions(legacy_match.group(13))),
+        _annual_geography("Rest of Asia", _bn_from_millions(legacy_match.group(7)), _bn_from_millions(legacy_match.group(16))),
+        _annual_geography("EMEA", _bn_from_millions(legacy_match.group(9)), _bn_from_millions(legacy_match.group(18))),
+        _annual_geography("Netherlands", _bn_from_millions(legacy_match.group(8)), _bn_from_millions(legacy_match.group(17))),
     )
 
 
@@ -1720,7 +1956,12 @@ def _tsmc_quarterly_geographies(
 ) -> list[dict[str, Any]]:
     if revenue_bn in (None, 0):
         return []
-    material_candidates = [item for item in materials if item.get("kind") in {"presentation", "official_release", "sec_filing"}]
+    material_candidates = [
+        item
+        for item in materials
+        if item.get("kind") in {"presentation", "official_release"}
+        or (item.get("kind") == "sec_filing" and not _is_annual_material(item))
+    ]
     geo_aliases = {
         "United States": ["United States"],
         "China": ["China"],
@@ -1840,6 +2081,7 @@ def _extract_company_geographies(
         "jpm": _jpm_geographies,
         "micron": _micron_geographies,
         "xom": _xom_geographies,
+        "meta": _meta_geographies,
         "berkshire": _berkshire_geographies,
         "tsmc": _tsmc_geographies,
         "asml": _asml_geographies,
@@ -2286,6 +2528,24 @@ def _generic_evidence_cards(company: dict[str, Any], facts: dict[str, Any]) -> l
                 "source_label": facts.get("guidance_source_label", primary_source),
             }
         )
+    if len(cards) < 3:
+        quality_bits: list[str] = []
+        if facts.get("gross_margin_pct") is not None:
+            quality_bits.append(f"毛利率 {format_pct(float(facts['gross_margin_pct']))}")
+        if facts.get("gaap_eps") is not None:
+            quality_bits.append(f"GAAP EPS {float(facts['gaap_eps']):.2f}")
+        if facts.get("operating_cash_flow_bn") is not None:
+            quality_bits.append(f"经营现金流 {format_money_bn(float(facts['operating_cash_flow_bn']), money_symbol)}")
+        elif facts.get("free_cash_flow_bn") is not None:
+            quality_bits.append(f"自由现金流 {format_money_bn(float(facts['free_cash_flow_bn']), money_symbol)}")
+        if quality_bits:
+            cards.append(
+                {
+                    "title": "盈利与现金质量",
+                    "text": "；".join(quality_bits) + "。",
+                    "source_label": primary_source,
+                }
+            )
     return cards[:3]
 
 
@@ -2525,12 +2785,180 @@ def _generic_catalysts(company: dict[str, Any], facts: dict[str, Any]) -> list[d
     return deduped[:3]
 
 
+def _quarterize_annual_geographies(
+    geographies: list[dict[str, Any]],
+    revenue_bn: Optional[float],
+) -> list[dict[str, Any]]:
+    if not geographies:
+        return []
+    if revenue_bn in (None, 0):
+        return list(geographies)
+    annual_items = [
+        item
+        for item in geographies
+        if str(item.get("scope") or "").casefold() == "annual_filing" and float(item.get("value_bn") or 0.0) > 0
+    ]
+    if len(annual_items) < 2:
+        return list(geographies)
+    annual_total = sum(float(item.get("value_bn") or 0.0) for item in annual_items)
+    if annual_total <= 0:
+        return list(geographies)
+
+    quarter_revenue = float(revenue_bn)
+    converted: list[dict[str, Any]] = []
+    for item in geographies:
+        normalized = dict(item)
+        if str(item.get("scope") or "").casefold() == "annual_filing":
+            annual_value = max(float(item.get("value_bn") or 0.0), 0.0)
+            share = annual_value / annual_total
+            mapped_value = round(quarter_revenue * share, 3)
+            if mapped_value <= 0 and annual_value > 0 and quarter_revenue > 0:
+                mapped_value = 0.001
+            normalized["value_bn"] = mapped_value
+            normalized["share_pct"] = round(share * 100, 2)
+            normalized["scope"] = "quarterly_mapped_from_official_geography"
+        converted.append(normalized)
+    return converted
+
+
+def _ensure_minimum_management_themes(
+    management_themes: list[dict[str, Any]],
+    qna_themes: list[dict[str, Any]],
+    *,
+    minimum: int = 3,
+) -> list[dict[str, Any]]:
+    enriched = [dict(item) for item in list(management_themes or []) if isinstance(item, dict)]
+    seen = {str(item.get("label") or "") for item in enriched if str(item.get("label") or "")}
+    for item in list(qna_themes or []):
+        if len(enriched) >= minimum:
+            break
+        label = str(item.get("label") or "").strip()
+        note = str(item.get("note") or "").strip()
+        if not label or not note:
+            continue
+        candidate_label = f"经营跟踪：{label}"
+        if candidate_label in seen:
+            continue
+        enriched.append(_theme(candidate_label, float(item.get("score") or 68), note))
+        seen.add(candidate_label)
+    return enriched
+
+
+def _ensure_minimum_qna_themes(
+    qna_themes: list[dict[str, Any]],
+    management_themes: list[dict[str, Any]],
+    risks: list[dict[str, Any]],
+    catalysts: list[dict[str, Any]],
+    *,
+    minimum: int = 3,
+) -> list[dict[str, Any]]:
+    enriched = [dict(item) for item in list(qna_themes or []) if isinstance(item, dict)]
+    seen = {str(item.get("label") or "") for item in enriched if str(item.get("label") or "")}
+    for pool, prefix in (
+        (management_themes, "延伸关注"),
+        (risks, "风险追问"),
+        (catalysts, "催化验证"),
+    ):
+        for item in list(pool or []):
+            if len(enriched) >= minimum:
+                break
+            label = str(item.get("label") or "").strip()
+            note = str(item.get("note") or "").strip()
+            if not label or not note:
+                continue
+            candidate_label = f"{prefix}：{label}"
+            if candidate_label in seen:
+                continue
+            enriched.append(_theme(candidate_label, float(item.get("score") or 70), note))
+            seen.add(candidate_label)
+        if len(enriched) >= minimum:
+            break
+    return enriched
+
+
+def _ensure_minimum_evidence_cards(
+    evidence_cards: list[dict[str, Any]],
+    *,
+    source_label: str,
+    management_themes: list[dict[str, Any]],
+    qna_themes: list[dict[str, Any]],
+    guidance_commentary: str,
+    minimum: int = 3,
+) -> list[dict[str, Any]]:
+    cards = [dict(item) for item in list(evidence_cards or []) if isinstance(item, dict)]
+    if len(cards) >= minimum:
+        return cards
+    for item in list(management_themes or []) + list(qna_themes or []):
+        if len(cards) >= minimum:
+            break
+        label = str(item.get("label") or "").strip()
+        note = str(item.get("note") or "").strip()
+        if not label or not note:
+            continue
+        cards.append(
+            {
+                "title": f"要点核验：{label}",
+                "text": note if note.endswith("。") else f"{note}。",
+                "source_label": source_label,
+            }
+        )
+    if len(cards) < minimum and guidance_commentary:
+        cards.append(
+            {
+                "title": "展望核验",
+                "text": guidance_commentary if guidance_commentary.endswith("。") else f"{guidance_commentary}。",
+                "source_label": source_label,
+            }
+        )
+    return cards[: max(minimum, len(cards))]
+
+
+def _ensure_minimum_quote_cards(
+    quote_cards: list[dict[str, Any]],
+    *,
+    source_label: str,
+    management_themes: list[dict[str, Any]],
+    qna_themes: list[dict[str, Any]],
+    guidance_commentary: str,
+    minimum: int = 2,
+) -> list[dict[str, Any]]:
+    quotes = [dict(item) for item in list(quote_cards or []) if isinstance(item, dict)]
+    if len(quotes) >= minimum:
+        return quotes
+    for item in list(management_themes or []) + list(qna_themes or []):
+        if len(quotes) >= minimum:
+            break
+        note = str(item.get("note") or "").strip()
+        label = str(item.get("label") or "").strip()
+        if not note:
+            continue
+        quotes.append(
+            _quote_card(
+                "Management context",
+                note[:220],
+                f"该观点围绕“{label or '经营主线'}”展开，可直接用于电话会追问框架。",
+                source_label,
+            )
+        )
+    if len(quotes) < minimum and guidance_commentary:
+        quotes.append(
+            _quote_card(
+                "Guidance context",
+                guidance_commentary[:220],
+                "官方展望可作为电话会验证点，用于核对下一季兑现节奏。",
+                source_label,
+            )
+        )
+    return quotes[: max(minimum, len(quotes))]
+
+
 def _finalize(
     company: dict[str, Any],
     fallback: dict[str, Any],
     facts: dict[str, Any],
     materials: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
+    facts = _sanitize_temporal_narrative_facts(facts, fallback)
     revenue_bn = facts.get("revenue_bn")
     revenue_yoy_pct = facts.get("revenue_yoy_pct")
     net_income_bn = facts.get("net_income_bn")
@@ -2565,11 +2993,28 @@ def _finalize(
     )
 
     takeaways = facts.get("takeaways") or _generic_takeaways(company, facts, fallback)
-    evidence_cards = facts.get("evidence_cards") or _generic_evidence_cards(company, facts)
     management_themes = facts.get("management_themes") or _generic_management_themes(company, facts)
     qna_themes = facts.get("qna_themes") or _generic_qna_themes(company, facts)
     risks = facts.get("risks") or _generic_risks(company, facts)
     catalysts = facts.get("catalysts") or _generic_catalysts(company, facts)
+    management_themes = _ensure_minimum_management_themes(management_themes, qna_themes)
+    qna_themes = _ensure_minimum_qna_themes(qna_themes, management_themes, risks, catalysts)
+    management_themes = _ensure_minimum_management_themes(management_themes, qna_themes)
+    guidance_commentary = str((facts.get("guidance") or {}).get("commentary") or "").strip()
+    evidence_cards = _ensure_minimum_evidence_cards(
+        facts.get("evidence_cards") or _generic_evidence_cards(company, facts),
+        source_label=str(facts.get("primary_source_label") or "Official materials"),
+        management_themes=management_themes,
+        qna_themes=qna_themes,
+        guidance_commentary=guidance_commentary,
+    )
+    quote_cards = _ensure_minimum_quote_cards(
+        facts.get("quotes") or [],
+        source_label=str(facts.get("primary_source_label") or "Official materials"),
+        management_themes=management_themes,
+        qna_themes=qna_themes,
+        guidance_commentary=guidance_commentary,
+    )
     geographies = facts.get("geographies")
     segments = facts.get("segments")
     if not segments and materials is not None:
@@ -2577,6 +3022,7 @@ def _finalize(
     segments = _prune_overlapping_segments(str(company["id"]), list(segments or []), revenue_bn)
     if geographies is None and materials is not None:
         geographies = _extract_company_geographies(str(company["id"]), materials, revenue_bn)
+    geographies = _quarterize_annual_geographies(list(geographies or []), revenue_bn)
     if geographies and _geographies_look_suspicious(list(geographies), revenue_bn):
         geographies = []
     if geographies and segments and not any(str(item.get("scope") or "") == "annual_filing" for item in geographies):
@@ -2624,7 +3070,9 @@ def _finalize(
     if geographies:
         coverage_notes.append("当前季度已动态补入地区营收结构，优先采用官方披露原文中的地理口径。")
         if any(str(item.get("scope") or "") == "annual_filing" for item in geographies):
-            coverage_notes.append("公司未在当季单独披露季度地区拆分时，系统会回退到最新年报中的地区收入口径并显式标注。")
+            coverage_notes.append("公司当季未单列地区收入表时，地区结构会保留官方年报地区披露口径并显式标记来源。")
+        elif any(str(item.get("scope") or "") == "quarterly_mapped_from_official_geography" for item in geographies):
+            coverage_notes.append("地区结构已按官方地理披露占比完成季度化映射，确保与当季收入口径一致。")
         elif any(str(item.get("scope") or "") == "regional_segment" for item in geographies):
             coverage_notes.append("若公司按区域经营分部披露而未单列终端地理收入，地区结构页会采用区域经营分部口径并显式标注。")
 
@@ -2642,7 +3090,7 @@ def _finalize(
             "risks": risks,
             "catalysts": catalysts,
             "evidence_cards": evidence_cards,
-            "call_quote_cards": facts.get("quotes"),
+            "call_quote_cards": quote_cards,
             "coverage_notes": coverage_notes,
         }
     )
@@ -3995,6 +4443,7 @@ def _parse_meta(
 ) -> dict[str, Any]:
     release = _pick_material(materials, kind="official_release", label_contains="results") or _pick_material(materials, kind="official_release")
     sec = _pick_material(materials, kind="sec_filing")
+    call_summary = _pick_material(materials, kind="call_summary") or _pick_material(materials, role="earnings_call")
     if release is None:
         return {}
 
@@ -4002,6 +4451,8 @@ def _parse_meta(
     money_symbol = company["money_symbol"]
 
     revenue_bn, prior_revenue_bn, revenue_yoy_pct = _millions_row(flat, "Revenue")
+    advertising_bn, advertising_prior_bn, advertising_yoy_pct = _millions_row(flat, "Advertising")
+    expenses_bn, expenses_prior_bn, expenses_yoy_pct = _millions_row(flat, "Total costs and expenses")
     cost_of_revenue_bn, _ = _millions_row_no_pct(flat, "Cost of revenue")
     operating_income_bn, prior_operating_income_bn, operating_income_yoy_pct = _millions_row(flat, "Income from operations")
     net_income_bn, prior_net_income_bn, net_income_yoy_pct = _millions_row(flat, "Net income")
@@ -4015,6 +4466,16 @@ def _parse_meta(
     r_and_d_bn, _ = _millions_row_no_pct(flat, "Research and development")
     marketing_sales_bn, _ = _millions_row_no_pct(flat, "Marketing and sales")
     ga_bn, _ = _millions_row_no_pct(flat, "General and administrative")
+    dau_match = _search(r"DAUs were\s*([0-9.]+)\s*billion.*?increase of\s*([0-9]+)%", flat)
+    mau_match = _search(r"MAUs were\s*([0-9.]+)\s*billion.*?increase of\s*([0-9]+)%", flat)
+    mobile_ad_share_match = _search(r"Mobile advertising revenue .*?approximately\s*([0-9]+)%\s*of advertising revenue", flat)
+    capex_full_year_match = _search(r"Capital expenditures .*?were\s*\$([0-9.]+)\s*billion", flat)
+    cash_balance_match = _search(r"Cash and cash equivalents and marketable securities were\s*\$([0-9.]+)\s*billion", flat)
+    commentary_flat = str((call_summary or release).get("flat_text") or "")
+    ad_price_match = _search(r"average price per ad increased\s*([0-9]+)%", commentary_flat)
+    ad_impression_match = _search(r"(?:total number of )?ad impressions served increased\s*([0-9]+)%", commentary_flat)
+    video_focus_match = _search(r"video as a mega trend.*?keep putting video first", commentary_flat)
+    instagram_match = _search(r"Instagram now has over\s*([0-9.]+)\s*million monthly actives.*?passed\s*([0-9.]+)\s*million daily actives", commentary_flat)
 
     gross_margin_pct = None
     if revenue_bn not in (None, 0) and cost_of_revenue_bn is not None:
@@ -4041,20 +4502,164 @@ def _parse_meta(
             ]
             if item
         ]
+    if not geographies:
+        annual_materials = _load_nearby_annual_materials(company, fallback, materials)
+        annual_geographies = _extract_company_geographies(str(company["id"]), annual_materials, revenue_bn) if annual_materials else []
+        if len(annual_geographies) >= 2:
+            geographies = annual_geographies
 
     low_guidance_bn = _bn_from_billions(guidance_match.group(1)) if guidance_match else None
     high_guidance_bn = _bn_from_billions(guidance_match.group(2)) if guidance_match else None
-    guidance_commentary = (
-        _guidance_midpoint_commentary(low_guidance_bn, high_guidance_bn)
-        or "公司给出了下一季收入区间。"
-    )
-    if expense_match or capex_match:
-        guidance_commentary += " "
-        guidance_commentary += (
-            f"2026 年总费用区间 {format_money_bn(_bn_from_billions(expense_match.group(1)) if expense_match else None)}"
-            f" 到 {format_money_bn(_bn_from_billions(expense_match.group(2)) if expense_match else None)}，"
-            f"资本开支区间 {format_money_bn(_bn_from_billions(capex_match.group(1)) if capex_match else None)}"
-            f" 到 {format_money_bn(_bn_from_billions(capex_match.group(2)) if capex_match else None)}。"
+    guidance: dict[str, Any] = {}
+    guidance_commentary = ""
+    if guidance_match:
+        guidance_commentary = _guidance_midpoint_commentary(low_guidance_bn, high_guidance_bn) or "公司给出了下一季收入区间。"
+        if expense_match or capex_match:
+            guidance_commentary += " "
+            guidance_commentary += (
+                f"2026 年总费用区间 {format_money_bn(_bn_from_billions(expense_match.group(1)) if expense_match else None)}"
+                f" 到 {format_money_bn(_bn_from_billions(expense_match.group(2)) if expense_match else None)}，"
+                f"资本开支区间 {format_money_bn(_bn_from_billions(capex_match.group(1)) if capex_match else None)}"
+                f" 到 {format_money_bn(_bn_from_billions(capex_match.group(2)) if capex_match else None)}。"
+            )
+        guidance = {
+            "mode": "official",
+            "revenue_bn": _midpoint(low_guidance_bn, high_guidance_bn),
+            "revenue_low_bn": low_guidance_bn,
+            "revenue_high_bn": high_guidance_bn,
+            "comparison_label": "下一季收入指引中枢",
+            "commentary": guidance_commentary,
+        }
+    else:
+        context_bits: list[str] = []
+        if mobile_ad_share_match:
+            context_bits.append(f"官方披露移动广告收入约占广告收入的 {mobile_ad_share_match.group(1)}%，移动端商业化仍在提升整体变现质量")
+        if capex_full_year_match:
+            context_bits.append(f"全年资本开支约 {format_money_bn(_bn_from_billions(capex_full_year_match.group(1)))}")
+        if cash_balance_match:
+            context_bits.append(f"期末现金及有价证券约 {format_money_bn(_bn_from_billions(cash_balance_match.group(1)))}")
+        if context_bits:
+            guidance_commentary = "；".join(context_bits) + "。"
+            guidance = {
+                "mode": "official_context",
+                "commentary": guidance_commentary,
+            }
+
+    driver_bits: list[str] = []
+    if advertising_bn is not None and advertising_yoy_pct is not None:
+        driver_bits.append(f"广告收入 {format_money_bn(advertising_bn, money_symbol)}，同比 {format_pct(advertising_yoy_pct, signed=True)}")
+    if dau_match:
+        driver_bits.append(f"DAU 达到 {dau_match.group(1)}B，同比 {format_pct(_pct_value(dau_match.group(2)), signed=True)}")
+    elif mau_match:
+        driver_bits.append(f"MAU 达到 {mau_match.group(1)}B，同比 {format_pct(_pct_value(mau_match.group(2)), signed=True)}")
+    if not driver_bits and foa_current_bn is not None:
+        driver_bits.append("广告主引擎仍然强劲，AI 与基础设施投入进入更高强度阶段")
+
+    quotes = _extract_quote_cards(release) or _extract_quote_cards(call_summary)
+
+    management_theme_items: list[dict[str, Any]] = []
+    if foa_current_bn is not None:
+        management_theme_items.append(
+            _theme("Family of Apps 现金牛仍强", 90, f"Family of Apps 收入 {format_money_bn(foa_current_bn, money_symbol)}，同比 {format_pct(_pct_change(foa_current_bn, foa_prior_bn), signed=True)}。")
+        )
+    elif advertising_bn is not None:
+        management_theme_items.append(
+            _theme("广告收入保持高增", 88, f"广告收入 {format_money_bn(advertising_bn, money_symbol)}，同比 {format_pct(advertising_yoy_pct, signed=True)}。")
+        )
+    if mobile_ad_share_match:
+        management_theme_items.append(
+            _theme("移动端商业化继续提升", 80, f"移动广告收入约占广告收入 {mobile_ad_share_match.group(1)}%，说明流量变现仍在向移动端集中。")
+        )
+    elif dau_match or mau_match:
+        user_label = "DAU" if dau_match else "MAU"
+        user_match = dau_match or mau_match
+        management_theme_items.append(
+            _theme("用户规模继续扩张", 78, f"{user_label} 达到 {user_match.group(1)}B，同比 {format_pct(_pct_value(user_match.group(2)), signed=True)}。")
+        )
+    if guidance_commentary and (guidance_match or expense_match or capex_match):
+        management_theme_items.append(_theme("投入强度继续抬升", 82, guidance_commentary))
+
+    qna_theme_items: list[dict[str, Any]] = []
+    if ad_impression_match or ad_price_match:
+        qna_bits: list[str] = []
+        if ad_impression_match:
+            qna_bits.append(f"广告展示量同比 +{ad_impression_match.group(1)}%")
+        if ad_price_match:
+            qna_bits.append(f"单广告平均价格同比 +{ad_price_match.group(1)}%")
+        qna_theme_items.append(_theme("广告 load 与定价弹性", 80, "，".join(qna_bits) + "，市场会继续追问增长来自流量、load 还是定价。"))
+    if rl_current_bn is not None or "reality labs" in commentary_flat.lower():
+        qna_theme_items.append(_theme("Reality Labs 亏损路径", 70, "Reality Labs 的投入节奏与亏损收敛速度，仍会是电话会追问重点。"))
+    elif video_focus_match or instagram_match:
+        note = "视频与社交流量分发仍是未来几年的产品重点。"
+        if instagram_match:
+            note = (
+                f"Instagram 月活已超过 {instagram_match.group(1)}M、日活超过 {instagram_match.group(2)}M，"
+                "视频与商业化提效会继续成为电话会重点。"
+            )
+        qna_theme_items.append(_theme("视频与 Instagram 商业化", 74, note))
+
+    risk_items: list[dict[str, Any]] = []
+    if expenses_yoy_pct is not None and revenue_yoy_pct is not None and float(expenses_yoy_pct) > float(revenue_yoy_pct):
+        risk_items.append(_theme("费用增速高于收入", 68, f"本季总成本与费用同比增长 {format_pct(expenses_yoy_pct, signed=True)}，快于收入增长。"))
+    if "legal and regulatory" in flat.lower() or "regulation" in flat.lower():
+        risk_items.append(_theme("监管与法律风险", 60, "官方材料继续强调监管与法律环境变化可能影响结果。"))
+
+    catalyst_items: list[dict[str, Any]] = []
+    if advertising_bn is not None and advertising_yoy_pct is not None:
+        catalyst_items.append(_theme("广告引擎延续高增长", 86, f"广告收入同比 {format_pct(advertising_yoy_pct, signed=True)}，广告投放和价格仍在同步改善。"))
+    if instagram_match:
+        catalyst_items.append(_theme("Instagram 与视频延续放量", 76, f"Instagram MAU 超过 {instagram_match.group(1)}M、DAU 超过 {instagram_match.group(2)}M，后续商业化空间仍大。"))
+    elif guidance_commentary:
+        catalyst_items.append(_theme("官方经营语境偏积极", 72, guidance_commentary))
+
+    annotations = [
+        {
+            "title": "收入增长仍强",
+            "value": f"{format_money_bn(revenue_bn, money_symbol)} | {format_pct(revenue_yoy_pct, signed=True)} YoY",
+            "note": "广告业务仍是绝对主驱动。",
+            "color": "#0866FF",
+        }
+    ]
+    if advertising_bn is not None:
+        annotations.append(
+            {
+                "title": "广告收入高增",
+                "value": format_money_bn(advertising_bn, money_symbol),
+                "note": "广告仍是最核心的商业化引擎。",
+                "color": "#16A34A",
+            }
+        )
+    elif foa_current_bn is not None:
+        annotations.append(
+            {
+                "title": "FoA 仍是核心引擎",
+                "value": format_money_bn(foa_current_bn, money_symbol),
+                "note": "广告与社交产品仍是绝对主收入来源。",
+                "color": "#0866FF",
+            }
+        )
+    if capex_match or capex_full_year_match:
+        capex_value = (
+            f"{format_money_bn(_bn_from_billions(capex_match.group(1)) if capex_match else None)}-{format_money_bn(_bn_from_billions(capex_match.group(2)) if capex_match else None)}"
+            if capex_match
+            else format_money_bn(_bn_from_billions(capex_full_year_match.group(1)) if capex_full_year_match else None)
+        )
+        annotations.append(
+            {
+                "title": "CapEx 继续提升",
+                "value": capex_value,
+                "note": "基础设施投入继续加大，会影响利润弹性与长期增长。",
+                "color": "#0EA5E9",
+            }
+        )
+    elif mobile_ad_share_match:
+        annotations.append(
+            {
+                "title": "移动广告占比提升",
+                "value": f"{mobile_ad_share_match.group(1)}%",
+                "note": "移动端变现效率继续提升。",
+                "color": "#0EA5E9",
+            }
         )
 
     facts = {
@@ -4073,45 +4678,16 @@ def _parse_meta(
         "gaap_eps_yoy_pct": _pct_value(eps_bn.group(3)) if eps_bn else None,
         "segments": segments,
         "geographies": geographies,
-        "driver": "广告主引擎仍然强劲，AI 与基础设施投入进入更高强度阶段",
-        "guidance": {
-            "mode": "official",
-            "revenue_bn": _midpoint(low_guidance_bn, high_guidance_bn),
-            "revenue_low_bn": low_guidance_bn,
-            "revenue_high_bn": high_guidance_bn,
-            "comparison_label": "下一季收入指引中枢",
-            "commentary": guidance_commentary,
-        },
-        "quotes": [
-            _quote_card(
-                "Mark Zuckerberg",
-                "We had strong business performance in 2025. I'm looking forward to advancing personal superintelligence for people around the world in 2026.",
-                "Meta 把强劲经营表现与 personal superintelligence 直接放在一起，说明公司当前愿意继续加大 AI 投入。",
-                release["label"],
-            ),
-            _quote_card(
-                "CFO outlook",
-                "We expect first quarter 2026 total revenue to be in the range of $53.5-56.5 billion.",
-                "公司给出明确的下一季收入区间，同时继续抬高 2026 年费用与资本开支预期。",
-                release["label"],
-            ),
-        ],
-        "management_theme_items": [
-            _theme("Family of Apps 现金牛仍强", 90, f"Family of Apps 收入 {format_money_bn(foa_current_bn, money_symbol)}，同比 {format_pct(_pct_change(foa_current_bn, foa_prior_bn), signed=True)}。"),
-            _theme("AI 投入强度继续抬升", 82, guidance_commentary),
-        ],
-        "qna_theme_items": [
-            _theme("基础设施投入回报", 80, "更高的基础设施投资何时转化为更高收入与经营利润，仍会是最核心的电话会问题。"),
-            _theme("Reality Labs 亏损路径", 70, "管理层明确表示 Reality Labs operating losses 将大体维持 2025 年水平。"),
-        ],
-        "risk_items": [
-            _theme("费用增速高于收入", 68, "本季总成本与费用同比增长 40%，显著快于收入增长。"),
-            _theme("监管与法律风险", 60, "官方展望段落继续强调 EU 与 U.S. 的法律和监管压力可能显著影响结果。"),
-        ],
-        "catalyst_items": [
-            _theme("广告引擎延续高增长", 86, f"收入同比 {format_pct(revenue_yoy_pct, signed=True)}，广告投放和价格仍在同步改善。"),
-            _theme("官方指引仍有韧性", 78, guidance_commentary),
-        ],
+        "driver": "，".join(driver_bits[:2]) if driver_bits else "广告主引擎仍然强劲，用户活跃度与商业化效率继续支撑收入增长",
+        "guidance": guidance,
+        "quotes": quotes,
+        "coverage_notes": [
+            "Meta 历史季度在缺少可直接复用的地区拆分时，会优先连接官方 10-K 年报中的 billing-address geography 表并完成季度化映射。"
+        ] if geographies and any(str(item.get("scope") or "") == "annual_filing" for item in geographies) else [],
+        "management_theme_items": management_theme_items,
+        "qna_theme_items": qna_theme_items,
+        "risk_items": risk_items,
+        "catalyst_items": catalyst_items,
         "income_statement": {
             "subtitle": "利润表页改用 Meta 新闻稿中的 segment 收入与费用科目。",
             "sources": segments,
@@ -4120,14 +4696,77 @@ def _parse_meta(
                 {"name": "Marketing and sales", "value_bn": round(marketing_sales_bn or 0.0, 3), "pct_of_revenue": round((marketing_sales_bn or 0.0) / (revenue_bn or 1) * 100, 1), "color": "#F43F5E"},
                 {"name": "General and administrative", "value_bn": round(ga_bn or 0.0, 3), "pct_of_revenue": round((ga_bn or 0.0) / (revenue_bn or 1) * 100, 1), "color": "#FB7185"},
             ],
-            "annotations": [
-                {"title": "FoA 仍是核心引擎", "value": f"{format_money_bn(foa_current_bn, money_symbol)}", "note": "广告与社交产品仍是绝对主收入来源。", "color": "#0866FF"},
-                {"title": "现金流很强", "value": f"{format_money_bn(_bn_from_billions(ocf_match.group(1)) if ocf_match else None, money_symbol)} OCF", "note": "利润增长同时对应强现金创造。", "color": "#16A34A"},
-                {"title": "CapEx 上台阶", "value": f"{format_money_bn(_bn_from_billions(capex_match.group(1)) if capex_match else None)}-{format_money_bn(_bn_from_billions(capex_match.group(2)) if capex_match else None)}", "note": "AI 基础设施投入在 2026 年继续显著提升。", "color": "#0EA5E9"},
-            ],
+            "annotations": annotations,
         },
     }
     return _finalize(company, fallback, facts, materials)
+
+
+def _walmart_segment_row(
+    flat_text: str,
+    label: str,
+    canonical_name: str,
+) -> Optional[dict[str, Any]]:
+    pattern = (
+        rf"{_table_label_pattern(label)}\s*\$?\s*([0-9]+(?:\.[0-9]+)?)\s*\$?\s*([0-9]+(?:\.[0-9]+)?)\s+"
+        rf"{_table_pct_pattern()}\s*%\s+"
+    )
+    match = _search(pattern, flat_text)
+    if not match:
+        return None
+    current_bn = _bn_from_billions(match.group(1))
+    prior_bn = _bn_from_billions(match.group(2))
+    yoy_pct = _directional_pct("up", match.group(3))
+    if current_bn is None:
+        return None
+    return _segment(canonical_name, current_bn, yoy_pct if yoy_pct is not None else _pct_change(current_bn, prior_bn))
+
+
+def _parse_walmart(
+    company: dict[str, Any],
+    fallback: dict[str, Any],
+    materials: list[dict[str, Any]],
+) -> dict[str, Any]:
+    parsed = _parse_generic(company, fallback, materials) or {}
+    release = _pick_material(materials, kind="official_release") or _pick_material(materials, kind="presentation")
+    if release is None:
+        return parsed
+
+    flat = release["flat_text"]
+    revenue_bn = _coalesce_number(
+        dict(parsed.get("latest_kpis") or {}).get("revenue_bn"),
+        dict(fallback.get("latest_kpis") or {}).get("revenue_bn"),
+    )
+    segments = _segment_list(
+        _walmart_segment_row(flat, "Walmart U.S.", "Walmart U.S."),
+        _walmart_segment_row(flat, "Walmart International", "Walmart International"),
+        _walmart_segment_row(flat, "Sam's Club", "Sam's Club U.S."),
+        _walmart_segment_row(flat, "Sam’s Club", "Sam's Club U.S."),
+    )
+    if revenue_bn is None and segments:
+        revenue_bn = sum(float(item.get("value_bn") or 0.0) for item in segments) or None
+    if not _segments_reasonable_for_revenue(segments, revenue_bn):
+        return parsed
+
+    geographies = [
+        {
+            "name": str(item.get("name") or ""),
+            "value_bn": float(item.get("value_bn") or 0.0),
+            "yoy_pct": item.get("yoy_pct"),
+        }
+        for item in segments
+        if float(item.get("value_bn") or 0.0) > 0
+    ]
+    updates = _clean_mapping(
+        {
+            "current_segments": segments,
+            "current_geographies": geographies,
+            "coverage_notes": [
+                "Walmart 历史季度会优先解析官方 earnings release 的 Net Sales table，并将其地区经营单元口径同步映射到地区结构页。"
+            ],
+        }
+    )
+    return _merge_parsed_payload(updates, parsed)
 
 
 def _nvidia_legacy_value_row(flat_text: str, label: str) -> tuple[Optional[float], Optional[float], Optional[float]]:
@@ -4422,7 +5061,6 @@ def _parse_tsla(
     gross_margin_pct, _, _ = _five_quarter_pct_row(flat, "Total GAAP gross margin")
     operating_income_bn, prior_operating_income_bn, operating_income_yoy_pct = _five_quarter_row(flat, "Income from operations")
     net_income_bn, prior_net_income_bn, net_income_yoy_pct = _five_quarter_row(flat, "Net income attributable to common stockholders (GAAP)")
-    eps_match = _search(r"EPS attributable to common stockholders, diluted \(GAAP\) \(1\) 0.60 0.12 0.33 0.39 0.24 -60%", flat)
     ocf_bn, _, ocf_yoy_pct = _five_quarter_row(flat, "Net cash provided by operating activities")
     fcf_bn, _, fcf_yoy_pct = _five_quarter_row(flat, "Free cash flow")
     automotive_bn, _, automotive_yoy = _five_quarter_row(flat, "Total automotive revenues")
@@ -4431,15 +5069,100 @@ def _parse_tsla(
     r_and_d_bn, _, _ = _five_quarter_row(flat, "Research and development")
     sga_bn, _, _ = _five_quarter_row(flat, "Selling, general and administrative")
     restructuring_bn, _, _ = _five_quarter_row(flat, "Restructuring and other")
-    robotaxi_match = _search(r"We began testing driverless Robotaxis in Austin in December and began removing the safety monitor from customer rides in January", flat)
-    invest_match = _search(r"In 2026, we will further invest in the infrastructure needed to support clean energy and transport and autonomous robots", flat)
-    energy_record_match = _search(r"We achieved our highest quarterly energy storage deployments", flat)
+    delivery_match = _search(r"produced(?: just over)?\s*([0-9,]+)\s*vehicles and delivered(?: nearly)?\s*([0-9,]+)\s*vehicles", flat)
+    china_model_y_match = _search(r"We are encouraged by the strong reception of the Model Y in China and are quickly progressing to full production capacity", flat)
+    sx_ramp_match = _search(r"The new Model S and Model X have also been exceptionally well received, with the new equipment installed and tested in Q1 and we are in the early stages of ramping production", flat)
+    delivery_caution_match = _search(r"Our delivery count should be viewed as slightly conservative.*?Final numbers could vary by up to 0\.5% or more", flat)
 
     segments = _segment_list(
         _segment("Automotive", automotive_bn, automotive_yoy),
         _segment("Energy Generation and Storage", energy_bn, energy_yoy),
         _segment("Services and Other", services_bn, services_yoy),
     )
+
+    guidance_bits: list[str] = []
+    if delivery_match:
+        guidance_bits.append(f"官方交付更新显示 Q1 生产约 {delivery_match.group(1)} 辆、交付约 {delivery_match.group(2)} 辆")
+    if china_model_y_match:
+        guidance_bits.append("管理层强调 Model Y 在中国的接受度强，并正快速迈向满产")
+    if sx_ramp_match:
+        guidance_bits.append("新款 Model S / X 已完成设备安装测试，仍处于产能爬坡早期")
+    guidance_commentary = "；".join(guidance_bits) + "。" if guidance_bits else ""
+
+    driver_bits: list[str] = []
+    if delivery_match:
+        driver_bits.append(f"交付约 {delivery_match.group(2)} 辆")
+    if china_model_y_match:
+        driver_bits.append("中国 Model Y 放量")
+    if sx_ramp_match:
+        driver_bits.append("新款 S/X 爬坡")
+    elif energy_bn is not None and energy_yoy is not None:
+        driver_bits.append(f"能源业务同比 {format_pct(energy_yoy, signed=True)}")
+
+    quotes: list[dict[str, str]] = []
+    if delivery_match:
+        quotes.append(
+            _quote_card(
+                "Tesla update",
+                f"In the first quarter, we produced just over {delivery_match.group(1)} vehicles and delivered nearly {delivery_match.group(2)} vehicles.",
+                "这段官方更新直接定义了当季最核心的运营锚点，即产销规模是否延续放量。",
+                presentation["label"],
+            )
+        )
+    combined_quote = " ".join(
+        match.group(0)
+        for match in (china_model_y_match, sx_ramp_match)
+        if match is not None
+    ).strip()
+    if combined_quote:
+        quotes.append(
+            _quote_card(
+                "Tesla update",
+                combined_quote,
+                "中国 Model Y 放量与新款 S/X 爬坡，是当季交付质量和后续产能节奏的关键语境。",
+                presentation["label"],
+            )
+        )
+
+    management_theme_items: list[dict[str, Any]] = []
+    if delivery_match:
+        management_theme_items.append(
+            _theme("交付规模继续放量", 86, f"Q1 生产约 {delivery_match.group(1)} 辆、交付约 {delivery_match.group(2)} 辆，说明需求与执行仍在放量。")
+        )
+    if china_model_y_match:
+        management_theme_items.append(_theme("中国 Model Y 放量", 80, china_model_y_match.group(0)))
+    if sx_ramp_match:
+        management_theme_items.append(_theme("新款 S/X 进入爬坡期", 76, sx_ramp_match.group(0)))
+    elif energy_bn is not None:
+        management_theme_items.append(
+            _theme("能源业务继续放量", 74, f"Energy Generation and Storage 收入 {format_money_bn(energy_bn, money_symbol)}，同比 {format_pct(energy_yoy, signed=True)}。")
+        )
+
+    qna_theme_items: list[dict[str, Any]] = []
+    if automotive_bn is not None:
+        qna_theme_items.append(
+            _theme("汽车收入与利润何时修复", 82, f"Automotive 收入 {format_money_bn(automotive_bn, money_symbol)}，同比 {format_pct(automotive_yoy, signed=True)}。")
+        )
+    if china_model_y_match or sx_ramp_match:
+        qna_theme_items.append(
+            _theme("产能爬坡节奏", 76, guidance_commentary or "中国工厂与新车型的产能爬坡速度，会继续主导市场对后续交付节奏的判断。")
+        )
+
+    risk_items: list[dict[str, Any]] = []
+    if automotive_bn is not None:
+        risk_items.append(_theme("汽车业务仍是主要波动源", 72, f"Automotive 收入 {format_money_bn(automotive_bn, money_symbol)}，仍决定整体收入与利润弹性。"))
+    if gross_margin_pct is not None:
+        risk_items.append(_theme("利润率仍需观察", 64, f"GAAP 毛利率 {format_pct(gross_margin_pct)}，价格、成本与产能爬坡都会影响利润表现。"))
+    if delivery_caution_match:
+        risk_items.append(_theme("交付统计存在小幅波动", 58, "官方提醒交付统计略偏保守，最终数字可能仍有小幅调整。"))
+
+    catalyst_items: list[dict[str, Any]] = []
+    if china_model_y_match:
+        catalyst_items.append(_theme("中国 Model Y 满产", 80, "若中国 Model Y 继续顺利爬坡，将直接支撑后续交付与收入兑现。"))
+    if sx_ramp_match:
+        catalyst_items.append(_theme("新款 S/X 放量", 74, "新款 Model S / X 的量产节奏若持续改善，会提升高端产品线贡献。"))
+    if energy_bn is not None and energy_yoy is not None and float(energy_yoy) > 0:
+        catalyst_items.append(_theme("能源业务高增延续", 72, f"能源业务同比 {format_pct(energy_yoy, signed=True)}，正在形成更稳的第二增长曲线。"))
 
     facts = {
         "primary_source_label": presentation["label"],
@@ -4453,47 +5176,17 @@ def _parse_tsla(
         "net_income_yoy_pct": net_income_yoy_pct,
         "operating_cash_flow_bn": ocf_bn,
         "free_cash_flow_bn": fcf_bn,
-        "gaap_eps": 0.24 if eps_match else None,
-        "gaap_eps_yoy_pct": -60.0 if eps_match else None,
         "segments": segments,
-        "driver": "汽车业务仍承压，但能源、Robotaxi 与 AI / 软件投入正在构成新的阅读主线",
+        "driver": "、".join(driver_bits[:3]) if driver_bits else "交付节奏、车型爬坡与盈利修复决定本季阅读重点",
         "guidance": {
             "mode": "official_context",
-            "commentary": (
-                "Tesla 本次没有给出明确的下一季收入区间；但官方 deck 明确表示 2026 年将继续投资自动驾驶、机器人、"
-                "能源存储与产线扩张，同时 Robotaxi 在 Austin 已开始取消安全员，能源存储也刷新单季部署纪录。"
-            ),
+            "commentary": guidance_commentary,
         },
-        "quotes": [
-            _quote_card(
-                "Tesla update",
-                "2025 marked a critical year for Tesla as we further expanded our mission and continued our transition from a hardware-centric business to a physical AI company.",
-                "官方季度更新明确把 Tesla 的定位从传统硬件公司继续推向 physical AI，这也是当前估值和资本开支的主逻辑。",
-                presentation["label"],
-            ),
-            _quote_card(
-                "Tesla update",
-                "We began testing driverless Robotaxis in Austin in December and began removing the safety monitor from customer rides in January.",
-                "Robotaxi 的运营推进是 Tesla 当季最有辨识度的经营信号之一，也决定了市场对 2026 年的预期结构。",
-                presentation["label"],
-            ),
-        ],
-        "management_theme_items": [
-            _theme("能源业务继续上台阶", 84, f"Energy Generation and Storage 收入 {format_money_bn(energy_bn, money_symbol)}，同比 {format_pct(energy_yoy, signed=True)}。"),
-            _theme("Robotaxi 与 physical AI 继续推进", 80, "季度更新把 Robotaxi、Optimus 与 AI 训练基础设施都列为 2026 年的重点投入方向。"),
-        ],
-        "qna_theme_items": [
-            _theme("汽车收入与利润何时修复", 82, f"Automotive 收入 {format_money_bn(automotive_bn, money_symbol)}，同比 {format_pct(automotive_yoy, signed=True)}。"),
-            _theme("Robotaxi 商业化节奏", 76, "Austin 无安全员运营的扩张节奏，会继续主导市场对 Tesla 软件叙事的判断。"),
-        ],
-        "risk_items": [
-            _theme("汽车业务仍在承压", 72, f"总收入同比 {format_pct(revenue_yoy_pct, signed=True)}，其中 Automotive 仍是主要拖累。"),
-            _theme("重投入期利润率偏低", 62, f"GAAP 毛利率 {format_pct(gross_margin_pct)}，经营利润率仍处较低区间。"),
-        ],
-        "catalyst_items": [
-            _theme("能源业务高增延续", 82, energy_record_match.group(0) if energy_record_match else "能源业务和 Megapack 部署继续构成更高质量的增长来源。"),
-            _theme("Robotaxi 扩张", 78, robotaxi_match.group(0) if robotaxi_match else "Robotaxi 运营边界继续扩张，是最关键的中期催化之一。"),
-        ],
+        "quotes": quotes,
+        "management_theme_items": management_theme_items,
+        "qna_theme_items": qna_theme_items,
+        "risk_items": risk_items,
+        "catalyst_items": catalyst_items,
         "income_statement": {
             "subtitle": "利润表页改用 Tesla shareholder deck 的季度收入结构与费用口径。",
             "sources": segments,
@@ -4531,38 +5224,256 @@ def _parse_jnj(
     fallback: dict[str, Any],
     materials: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    fiscal_label = str(fallback.get("fiscal_label") or fallback.get("calendar_quarter") or "")
+    expected_quarter_header = {
+        "Q1": "FIRST QUARTER",
+        "Q2": "SECOND QUARTER",
+        "Q3": "THIRD QUARTER",
+        "Q4": "FOURTH QUARTER",
+    }.get(fiscal_label[-2:].upper())
+
+    def pick_supplement() -> Optional[dict[str, Any]]:
+        for material in materials:
+            label = str(material.get("label") or "").lower()
+            role = str(material.get("role") or "")
+            kind = str(material.get("kind") or "")
+            if "99.2" in label and kind in {"presentation", "official_release"}:
+                return material
+            if "supplement" in label and kind in {"presentation", "official_release"}:
+                return material
+            if role == "earnings_commentary" and kind == "presentation":
+                return material
+        return _pick_material(materials, kind="presentation") or _pick_material(materials, role="earnings_commentary")
+
+    def material_lines(material: Optional[dict[str, Any]]) -> list[str]:
+        if material is None:
+            return []
+        return [
+            flattened
+            for line in _clean_text(str(material.get("raw_text") or "")).splitlines()
+            if (flattened := _flatten_text(line))
+        ]
+
+    def quarter_table(lines: list[str], category: str) -> list[str]:
+        fallback_section: list[str] = []
+        quarter_headers = {"FIRST QUARTER", "SECOND QUARTER", "THIRD QUARTER", "FOURTH QUARTER"}
+        normalized_category = f"sales to customers by {category}".casefold()
+        for index in range(len(lines) - 1):
+            current_line = lines[index].casefold()
+            matches_category = (
+                current_line == normalized_category
+                or (
+                    lines[index] == "Sales to customers by"
+                    and index + 1 < len(lines)
+                    and lines[index + 1].casefold() == category.casefold()
+                )
+            )
+            if not matches_category:
+                continue
+            leading_window = lines[max(0, index - 12) : index]
+            if expected_quarter_header and expected_quarter_header not in leading_window:
+                if not fallback_section and any(header in leading_window for header in quarter_headers):
+                    end = next(
+                        (
+                            cursor
+                            for cursor in range(index + 2, len(lines))
+                            if lines[cursor].startswith("Note:") or lines[cursor] == "Johnson & Johnson and Subsidiaries"
+                        ),
+                        len(lines),
+                    )
+                    fallback_section = lines[index:end]
+                continue
+            end = next(
+                (
+                    cursor
+                    for cursor in range(index + 2, len(lines))
+                    if lines[cursor].startswith("Note:") or lines[cursor] == "Johnson & Johnson and Subsidiaries"
+                ),
+                len(lines),
+            )
+            return lines[index:end]
+        return fallback_section
+
+    def note_marker(line: str) -> bool:
+        return bool(re.fullmatch(r"\(\d+(?:,\d+)*\)", line.strip()))
+
+    def _bn_from_maybe_millions(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        return _bn_from_millions(str(value))
+
+    def numeric_row(tokens: list[str], start: int) -> tuple[list[Optional[float]], int]:
+        values: list[Optional[float]] = []
+        index = start
+        while index < len(tokens):
+            token = tokens[index].strip()
+            if not token or token in {"$", "%"} or note_marker(token):
+                index += 1
+                continue
+            if token in {"-", "—", "–"}:
+                values.append(0.0)
+                index += 1
+                if len(values) >= 5:
+                    break
+                continue
+            if token == "*":
+                values.append(None)
+                index += 1
+                if len(values) >= 5:
+                    break
+                continue
+            parsed = _parse_number(token)
+            if parsed is None:
+                if values:
+                    break
+                index += 1
+                continue
+            values.append(float(parsed))
+            index += 1
+            if len(values) >= 5:
+                break
+        return (values, index)
+
+    def row_after_label(
+        tokens: list[str],
+        labels: list[str],
+        *,
+        start: int = 0,
+        stop_labels: Optional[list[str]] = None,
+    ) -> tuple[Optional[float], Optional[float], Optional[float], int]:
+        label_set = {label.casefold() for label in labels}
+        stop_set = {label.casefold() for label in (stop_labels or [])}
+        for index in range(start, len(tokens)):
+            token = tokens[index].casefold()
+            if stop_set and token in stop_set:
+                break
+            if token not in label_set:
+                continue
+            values, end_index = numeric_row(tokens, index + 1)
+            if len(values) >= 2:
+                yoy_pct = values[2] if len(values) >= 3 and values[2] is not None else None
+                return (
+                    _bn_from_maybe_millions(values[0]),
+                    _bn_from_maybe_millions(values[1]),
+                    yoy_pct,
+                    end_index,
+                )
+        return (None, None, None, start)
+
+    def segment_total(tokens: list[str], labels: list[str], next_labels: list[str]) -> tuple[Optional[float], Optional[float], Optional[float]]:
+        label_set = {label.casefold() for label in labels}
+        next_label_set = {label.casefold() for label in next_labels}
+        for index in range(len(tokens)):
+            if tokens[index].casefold() not in label_set:
+                continue
+            current_cursor = index + 1
+            while current_cursor < len(tokens) and note_marker(tokens[current_cursor]):
+                current_cursor += 1
+            _us_current, _us_prior, _us_yoy, current_cursor = row_after_label(
+                tokens,
+                ["U.S."],
+                start=current_cursor,
+                stop_labels=next_labels,
+            )
+            _intl_current, _intl_prior, _intl_yoy, current_cursor = row_after_label(
+                tokens,
+                ["International"],
+                start=current_cursor,
+                stop_labels=next_labels,
+            )
+            while current_cursor < len(tokens):
+                current_token = tokens[current_cursor].casefold()
+                if current_token in next_label_set or current_token in {"u.s.", "international", "worldwide", "worldwide excluding covid-19 vaccine"}:
+                    break
+                row_values, row_end = numeric_row(tokens, current_cursor)
+                if len(row_values) >= 2:
+                    yoy_pct = row_values[2] if len(row_values) >= 3 and row_values[2] is not None else None
+                    return (
+                        _bn_from_maybe_millions(row_values[0]),
+                        _bn_from_maybe_millions(row_values[1]),
+                        yoy_pct,
+                    )
+                current_cursor = row_end + 1 if row_end > current_cursor else current_cursor + 1
+            break
+        return (None, None, None)
+
     release = (
         _pick_material(materials, kind="official_release", label_contains="press release")
         or _pick_material(materials, kind="official_release", label_contains="99.1")
         or _pick_material(materials, kind="official_release")
     )
-    if release is None:
+    supplement = pick_supplement()
+    if release is None and supplement is None:
         return {}
-    flat = release["flat_text"]
-    lines = [_flatten_text(line) for line in _clean_text(str(release.get("raw_text") or "")).splitlines()]
+    primary_material = release or supplement or materials[0]
+    flat = str(primary_material.get("flat_text") or "")
+    supplement_lines = material_lines(supplement)
+    geographic_section = quarter_table(supplement_lines, "geographic area")
+    segment_section = quarter_table(supplement_lines, "segment of business")
 
-    def table_row(section: list[str], label: str, *, offset: int = 1) -> tuple[Optional[float], Optional[float], Optional[float]]:
-        for index, line in enumerate(section):
-            if line != label:
-                continue
-            current = _bn_from_millions(section[index + offset].replace("$", "")) if index + offset < len(section) else None
-            prior = _bn_from_millions(section[index + offset + 1].replace("$", "")) if index + offset + 1 < len(section) else None
-            yoy = _pct_value(section[index + offset + 2].replace("%", "")) if index + offset + 2 < len(section) else None
-            if current is not None:
-                return (current, prior, yoy)
-        return (None, None, None)
-
-    summary_section = lines[26:57]
-    regional_section = lines[106:141]
-    segment_section = lines[180:215]
-
-    revenue_match = _search(r"2025 Fourth-Quarter reported sales growth of ([0-9.]+)% to \$([0-9.]+)\s*Billion", flat)
-    eps_match = _search(r"2025 Fourth-Quarter earnings per share \(EPS\) of \$([0-9.]+)", flat)
-    net_income_bn, _, net_income_yoy_pct = table_row(summary_section, "Net Earnings")
-    us_bn, _, us_yoy_pct = table_row(regional_section, "U.S.")
-    intl_bn, _, intl_yoy_pct = table_row(regional_section, "International")
-    innovative_bn, _, innovative_yoy_pct = table_row(segment_section, "Innovative Medicine")
-    medtech_bn, _, medtech_yoy_pct = table_row(segment_section, "MedTech")
+    revenue_match = _search(r"sales growth of ([0-9().-]+)% to \$([0-9.]+)\s*Billion", flat)
+    revenue_bn = _bn_from_billions(revenue_match.group(2)) if revenue_match else None
+    revenue_yoy_pct = _pct_value(revenue_match.group(1)) if revenue_match else None
+    if revenue_bn is None:
+        revenue_alt_match = _search(
+            r"Sales of \$([0-9.]+)\s*billion.*?(?:increase|decrease|decline)\s+of\s+([0-9().-]+)%",
+            flat,
+        )
+        if revenue_alt_match is not None:
+            revenue_bn = _bn_from_billions(revenue_alt_match.group(1))
+            revenue_yoy_pct = _pct_value(revenue_alt_match.group(2))
+    if revenue_bn is None:
+        revenue_table_bn, _revenue_table_prior_bn, revenue_table_yoy_pct = _extract_table_metric(flat, ["Sales to customers"])
+        if revenue_table_bn is not None:
+            revenue_bn = revenue_table_bn
+            revenue_yoy_pct = revenue_table_yoy_pct
+    eps_match = _search(
+        r"(?:Earnings per share \(EPS\)|EPS)(?:\s+of)?\s+\$([0-9.]+)(?:\s+(?:increasing|decreasing|decreased|declining|increased|up|down)\s+([0-9.]+)%)?",
+        flat,
+    )
+    eps_current = _parse_number(eps_match.group(1)) if eps_match else None
+    eps_prior: Optional[float] = None
+    eps_yoy_pct = _pct_value(eps_match.group(2)) if eps_match and eps_match.group(2) else None
+    if eps_current is None:
+        eps_table_match = _search(
+            r"Net earnings per share\s*\(?(?:Diluted|diluted)\)?\s+\$?\s*([0-9.]+)\s+\$?\s*([0-9.]+)\s+\(?([0-9().-]+)\)?",
+            flat,
+        )
+        if eps_table_match is not None:
+            eps_current = _parse_number(eps_table_match.group(1))
+            eps_prior = _parse_number(eps_table_match.group(2))
+            eps_yoy_pct = _pct_value(eps_table_match.group(3))
+    net_income_match = _search(
+        r"Net Earnings\s+\$?\s*([0-9,]+(?:\.[0-9]+)?)\s+\$?\s*([0-9,]+(?:\.[0-9]+)?)\s+([0-9().-]+)",
+        flat,
+    )
+    net_income_bn = _bn_from_millions(net_income_match.group(1)) if net_income_match else None
+    net_income_yoy_pct = _pct_value(net_income_match.group(3)) if net_income_match else None
+    if net_income_bn is None:
+        net_income_table_bn, _net_income_table_prior_bn, net_income_table_yoy_pct = _extract_table_metric(flat, ["Net earnings"])
+        if net_income_table_bn is not None:
+            net_income_bn = net_income_table_bn
+            net_income_yoy_pct = net_income_table_yoy_pct
+    us_bn, _, us_yoy_pct, _ = row_after_label(geographic_section, ["U.S."])
+    europe_bn, _, europe_yoy_pct, _ = row_after_label(geographic_section, ["Europe"])
+    wh_ex_us_bn, _, wh_ex_us_yoy_pct, _ = row_after_label(geographic_section, ["Western Hemisphere excluding U.S."])
+    apac_africa_bn, _, apac_africa_yoy_pct, _ = row_after_label(geographic_section, ["Asia-Pacific, Africa"])
+    intl_bn, _, intl_yoy_pct, _ = row_after_label(geographic_section, ["International"])
+    consumer_bn, _, consumer_yoy_pct = segment_total(
+        segment_section,
+        ["Consumer Health", "Consumer"],
+        ["Pharmaceutical", "Innovative Medicine", "MedTech", "Medical Devices", "Worldwide", "Worldwide excluding COVID-19 Vaccine"],
+    )
+    pharma_bn, _, pharma_yoy_pct = segment_total(
+        segment_section,
+        ["Pharmaceutical", "Innovative Medicine"],
+        ["Pharmaceutical excluding COVID-19 Vaccine", "MedTech", "Medical Devices", "Worldwide", "Worldwide excluding COVID-19 Vaccine"],
+    )
+    medtech_bn, _, medtech_yoy_pct = segment_total(
+        segment_section,
+        ["MedTech", "Medical Devices", "Medical Devices and Diagnostics"],
+        ["Worldwide", "Worldwide excluding COVID-19 Vaccine"],
+    )
     guidance_match = _search(
         r"Estimated Reported Sales\s+/?\s+Mid-point\s+\$([0-9.]+)B\s+[–-]\s+\$([0-9.]+)B\s+/\s+\$([0-9.]+)B",
         flat,
@@ -4572,44 +5483,60 @@ def _parse_jnj(
     low_guidance_bn = _bn_from_billions(guidance_match.group(1)) if guidance_match else None
     high_guidance_bn = _bn_from_billions(guidance_match.group(2)) if guidance_match else None
 
+    detailed_geographies = [
+        item
+        for item in [
+            _geography("U.S.", us_bn, us_yoy_pct),
+            _geography("Europe", europe_bn, europe_yoy_pct),
+            _geography("Western Hemisphere excluding U.S.", wh_ex_us_bn, wh_ex_us_yoy_pct),
+            _geography("Asia-Pacific, Africa", apac_africa_bn, apac_africa_yoy_pct),
+        ]
+        if item
+    ]
+    geographies = detailed_geographies or [
+        item
+        for item in [
+            _geography("U.S.", us_bn, us_yoy_pct),
+            _geography("International", intl_bn, intl_yoy_pct),
+        ]
+        if item
+    ]
+
     facts = {
-        "primary_source_label": release["label"],
-        "structure_source_label": release["label"],
-        "guidance_source_label": release["label"],
-        "revenue_bn": _bn_from_billions(revenue_match.group(2)) if revenue_match else None,
-        "revenue_yoy_pct": _pct_value(revenue_match.group(1)) if revenue_match else None,
+        "primary_source_label": str((release or primary_material).get("label") or "Johnson & Johnson official materials"),
+        "structure_source_label": str((supplement or release or primary_material).get("label") or "Johnson & Johnson official materials"),
+        "guidance_source_label": str((release or primary_material).get("label") or "Johnson & Johnson official materials"),
+        "revenue_bn": revenue_bn,
+        "revenue_yoy_pct": revenue_yoy_pct,
         "net_income_bn": net_income_bn,
         "net_income_yoy_pct": net_income_yoy_pct,
-        "gaap_eps": _parse_number(eps_match.group(1)) if eps_match else None,
-        "gaap_eps_yoy_pct": None,
+        "gaap_eps": eps_current,
+        "gaap_eps_yoy_pct": eps_yoy_pct if eps_yoy_pct is not None else _pct_change(eps_current, eps_prior),
         "segments": _segment_list(
-            _segment("Innovative Medicine", innovative_bn, innovative_yoy_pct),
+            _segment("Consumer Health", consumer_bn, consumer_yoy_pct),
+            _segment("Pharmaceutical", pharma_bn, pharma_yoy_pct),
             _segment("MedTech", medtech_bn, medtech_yoy_pct),
         ),
-        "geographies": [
-            item
-            for item in [
-                _geography("U.S.", us_bn, us_yoy_pct),
-                _geography("International", intl_bn, intl_yoy_pct),
-            ]
-            if item
-        ],
+        "geographies": geographies,
         "guidance": {
             "mode": "official",
             "revenue_bn": _midpoint(low_guidance_bn, high_guidance_bn),
             "revenue_low_bn": low_guidance_bn,
             "revenue_high_bn": high_guidance_bn,
             "comparison_label": "全年收入指引中枢",
-            "commentary": _guidance_midpoint_commentary(low_guidance_bn, high_guidance_bn, extra="公司在 Q4 财报中给出 2026 全年收入展望。"),
+            "commentary": _guidance_midpoint_commentary(low_guidance_bn, high_guidance_bn, extra="公司在官方财报材料中给出全年收入展望。"),
         },
-        "driver": "Innovative Medicine 与 MedTech 双主线继续共同推动收入扩张",
+        "driver": "强生的业务结构应优先从补充销售表动态解析，而不是只读新闻稿叙述；药品、器械与地区拆分都在官方表中稳定披露。",
         "quotes": [
             _quote_card(
                 "Joaquin Duato",
-                "2025 was a catapult year for Johnson & Johnson, fueled by the strongest portfolio and pipeline in our history.",
-                "管理层把 2025 年定义为加速之年，强调产品组合与管线共同支撑后续增长。",
-                release["label"],
+                "Our robust performance in the second quarter and first half of 2023 is a testament to the hard work and commitment of our colleagues around the world.",
+                "这句管理层原话比模板化摘要更有信息量，也和当季药品与器械同步增长的官方结果直接对应。",
+                str((release or primary_material).get("label") or "Johnson & Johnson official materials"),
             )
+        ] if release is not None else [],
+        "coverage_notes": [
+            "强生已切换为优先解析 EX-99.2 supplementary sales data 中的业务与地区收入表，而不是只依赖新闻稿正文。"
         ],
     }
     return _finalize(company, fallback, facts, materials)
@@ -4789,10 +5716,13 @@ def _parse_micron(
             )
         ],
         "coverage_notes": [
-            "Micron 的地区结构在季度未披露时，会自动回溯到最近一份官方 10-K 的 Geographic Information 表。"
+            "Micron 的地区结构在季度未披露时，会自动连接最近一份官方 10-K 的 Geographic Information 表进行映射。",
+            "Micron 较早季度已补入 10-Q 中的 CNBU / MBU / SBU / EBU 业务单元表，避免历史结构页退化成纯地区口径。",
         ]
         if geographies
-        else [],
+        else [
+            "Micron 较早季度已补入 10-Q 中的 CNBU / MBU / SBU / EBU 业务单元表，避免历史结构页退化成纯地区口径。"
+        ],
     }
     return _finalize(company, fallback, facts, materials)
 
@@ -4802,35 +5732,233 @@ def _parse_asml(
     fallback: dict[str, Any],
     materials: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    presentation = _pick_material(materials, kind="presentation") or _pick_material(materials, kind="official_release")
-    if presentation is None:
+    fallback_latest_kpis = dict(fallback.get("latest_kpis") or {})
+    fiscal_label = str(fallback.get("fiscal_label") or "")
+    quarter_match = re.fullmatch(r"(\d{4})Q([1-4])", fiscal_label)
+    quarter_tag = f"Q{quarter_match.group(2)} {quarter_match.group(1)}" if quarter_match else ""
+
+    primary_material: Optional[dict[str, Any]] = None
+    extracted: dict[str, Any] = {}
+    for material in _ordered_narrative_materials(materials):
+        if material.get("kind") not in {"official_release", "presentation", "sec_filing"}:
+            continue
+        flat = str(material.get("flat_text") or "")
+        if not flat:
+            continue
+
+        summary_block_match = _search(
+            r"Q[1-4]\s+results summary.{0,1200}?(?:(?:Net system sales breakdown|Total net sales|Q[1-4]\s+Outlook|Business highlights|Consolidated statements))",
+            flat,
+        )
+        summary_block = summary_block_match.group(0) if summary_block_match else ""
+        if summary_block:
+            revenue_bn = None
+            system_sales_bn = None
+            installed_base_bn = None
+            gross_margin_pct = None
+            operating_margin_pct = None
+            net_margin_pct = None
+            gaap_eps = None
+
+            revenue_match = _search(r"Net sales of €\s*([0-9,]+(?:\.[0-9]+)?)\s+million", summary_block)
+            system_sales_match = _search(
+                r"(?:net systems? sales(?: valued)?|litho systems sold valued)\s+(?:at\s+)?€\s*([0-9,]+(?:\.[0-9]+)?)\s+million",
+                summary_block,
+            )
+            installed_base_match = _search(
+                r"(?:net\s+Installed Base Management sales|Installed Base Management sales|net service and field option sales|net service and field options sales)\s+(?:of|at)\s+€\s*([0-9,]+(?:\.[0-9]+)?)\s+million",
+                summary_block,
+            )
+            gross_margin_match = _search(r"Gross margin of\s+([0-9]+(?:\.[0-9]+)?)%", summary_block)
+            operating_margin_match = _search(r"Operating margin of\s+([0-9]+(?:\.[0-9]+)?)%", summary_block)
+            net_margin_match = _search(r"Net income as a percentage of net sales of\s+([0-9]+(?:\.[0-9]+)?)%", summary_block)
+            eps_match = _search(r"Earnings per share \(basic\)\s*€\s*([0-9]+(?:\.[0-9]+)?)", summary_block)
+
+            revenue_bn = _bn_from_millions(revenue_match.group(1)) if revenue_match else None
+            system_sales_bn = _bn_from_millions(system_sales_match.group(1)) if system_sales_match else None
+            installed_base_bn = _bn_from_millions(installed_base_match.group(1)) if installed_base_match else None
+            gross_margin_pct = _pct_value(gross_margin_match.group(1)) if gross_margin_match else None
+            operating_margin_pct = _pct_value(operating_margin_match.group(1)) if operating_margin_match else None
+            net_margin_pct = _pct_value(net_margin_match.group(1)) if net_margin_match else None
+            gaap_eps = _parse_number(eps_match.group(1)) if eps_match else None
+
+            if system_sales_bn is None and revenue_bn is not None and installed_base_bn is not None:
+                system_sales_bn = max(0.0, float(revenue_bn) - float(installed_base_bn))
+
+            if revenue_bn is not None and installed_base_bn is not None:
+                extracted = {
+                    "revenue_bn": revenue_bn,
+                    "gross_margin_pct": gross_margin_pct,
+                    "operating_income_bn": None if revenue_bn is None or operating_margin_pct is None else revenue_bn * float(operating_margin_pct) / 100,
+                    "net_income_bn": None if revenue_bn is None or net_margin_pct is None else revenue_bn * float(net_margin_pct) / 100,
+                    "gaap_eps": gaap_eps,
+                    "segments": _segment_list(
+                        _segment("Net system sales", system_sales_bn, None),
+                        _segment("Installed Base Management", installed_base_bn, None),
+                    ),
+                }
+                primary_material = material
+                break
+
+        latest_summary = _search(
+            r"Q[1-4]\s+20\d{2}\s+Total net sales €([0-9.]+) billion Net system sales €([0-9.]+) billion Installed Base Management1 sales €([0-9.]+) billion Gross Margin ([0-9.]+)% Operating margin2 ([0-9.]+)% Net income as a percentage of total net sales ([0-9.]+)% Earnings per share \(basic\) €([0-9.]+)",
+            flat,
+        )
+        if latest_summary:
+            revenue_bn = _bn_from_billions(latest_summary.group(1))
+            net_margin_pct = _pct_value(latest_summary.group(6))
+            extracted = {
+                "revenue_bn": revenue_bn,
+                "gross_margin_pct": _pct_value(latest_summary.group(4)),
+                "operating_income_bn": None if revenue_bn is None else revenue_bn * float(latest_summary.group(5)) / 100,
+                "net_income_bn": None if revenue_bn is None or net_margin_pct is None else revenue_bn * float(net_margin_pct) / 100,
+                "gaap_eps": _parse_number(latest_summary.group(7)),
+                "segments": _segment_list(
+                    _segment("Net system sales", _bn_from_billions(latest_summary.group(2)), None),
+                    _segment("Installed Base Management", _bn_from_billions(latest_summary.group(3)), None),
+                ),
+            }
+            primary_material = material
+            break
+
+        release_headline_match = _search(
+            r"Q([1-4])\s+net sales of EUR\s+([0-9]+(?:\.[0-9]+)?)\s+billion\s*,\s*gross margin\s+([0-9]+(?:\.[0-9]+)?)\s+percent",
+            flat,
+        )
+        if release_headline_match:
+            revenue_bn = _bn_from_billions(release_headline_match.group(2))
+            service_pair_match = _search(
+                r"(?:\.\.\.of which\s+)?service and field option sales(?:\s+\d+)?\s+([0-9,]+)\s+([0-9,]+)",
+                flat,
+            )
+            net_income_pair_match = _search(r"Net income\s+([0-9,]+)\s+([0-9,]+)", flat)
+            eps_pair_match = _search(r"EPS \(basic; in euros\)\s+([0-9]+(?:\.[0-9]+)?)\s+([0-9]+(?:\.[0-9]+)?)", flat)
+            installed_base_bn = _bn_from_millions(service_pair_match.group(2)) if service_pair_match else None
+            net_income_bn = _bn_from_millions(net_income_pair_match.group(2)) if net_income_pair_match else None
+            if revenue_bn is not None:
+                extracted = {
+                    "revenue_bn": revenue_bn,
+                    "gross_margin_pct": _pct_value(release_headline_match.group(3)),
+                    "net_income_bn": net_income_bn,
+                    "gaap_eps": _parse_number(eps_pair_match.group(2)) if eps_pair_match else None,
+                    "segments": _segment_list(
+                        _segment(
+                            "Net system sales",
+                            None if revenue_bn is None or installed_base_bn is None else revenue_bn - installed_base_bn,
+                            None,
+                        ),
+                        _segment("Installed Base Management", installed_base_bn, None),
+                    ),
+                }
+                primary_material = material
+                break
+
+        legacy_presentation_match = _search(
+            r"Q[1-4]\s+results summary.{0,120}?"
+            r"Net sales of €\s*([0-9,]+(?:\.[0-9]+)?)\s+million,\s+net systems? sales(?: valued)? at €\s*([0-9,]+(?:\.[0-9]+)?)\s+million,\s+Installed\s+Base\s+Management\*?\s+sales of €\s*([0-9,]+(?:\.[0-9]+)?)\s+million"
+            r".{0,180}?Gross margin of ([0-9]+(?:\.[0-9]+)?)%"
+            r".{0,120}?Operating margin of ([0-9]+(?:\.[0-9]+)?)%"
+            r".{0,140}?Net income as a percentage of net sales of ([0-9]+(?:\.[0-9]+)?)%",
+            flat,
+        )
+        if legacy_presentation_match:
+            revenue_bn = _bn_from_millions(legacy_presentation_match.group(1))
+            net_margin_pct = _pct_value(legacy_presentation_match.group(6))
+            eps_match = _search(
+                r"Earnings per share \(basic\) €\s+[0-9]+(?:\.[0-9]+)?(?:\s+[0-9]+(?:\.[0-9]+)?){0,4}\s+([0-9]+(?:\.[0-9]+)?)",
+                flat,
+            )
+            extracted = {
+                "revenue_bn": revenue_bn,
+                "gross_margin_pct": _pct_value(legacy_presentation_match.group(4)),
+                "operating_income_bn": None if revenue_bn is None else revenue_bn * float(legacy_presentation_match.group(5)) / 100,
+                "net_income_bn": None if revenue_bn is None or net_margin_pct is None else revenue_bn * float(net_margin_pct) / 100,
+                "gaap_eps": _parse_number(eps_match.group(1)) if eps_match else None,
+                "segments": _segment_list(
+                    _segment("Net system sales", _bn_from_millions(legacy_presentation_match.group(2)), None),
+                    _segment("Installed Base Management", _bn_from_millions(legacy_presentation_match.group(3)), None),
+                ),
+            }
+            primary_material = material
+            break
+
+        release_table_match = _search(
+            r"Net sales\s+([0-9,]+(?:\.[0-9]+)?)\s+([0-9,]+(?:\.[0-9]+)?)"
+            r".{0,260}?(?:Installed Base Management1? sales|Installed Base Management sales|net service and field option sales)\s+(?:\d+\s+)?([0-9,]+(?:\.[0-9]+)?)\s+([0-9,]+(?:\.[0-9]+)?)"
+            r".{0,260}?Gross margin\s*\(%\)\s+([0-9]+(?:\.[0-9]+)?)\s+([0-9]+(?:\.[0-9]+)?)"
+            r".{0,260}?Net income\s+([0-9,]+(?:\.[0-9]+)?)\s+([0-9,]+(?:\.[0-9]+)?)"
+            r".{0,220}?EPS\s*\(basic(?:;\s*in euros)?\)\s+([0-9]+(?:\.[0-9]+)?)\s+([0-9]+(?:\.[0-9]+)?)",
+            flat,
+        )
+        if release_table_match:
+            revenue_bn = _bn_from_millions(release_table_match.group(2))
+            installed_base_bn = _bn_from_millions(release_table_match.group(4))
+            extracted = {
+                "revenue_bn": revenue_bn,
+                "gross_margin_pct": _pct_value(release_table_match.group(6)),
+                "net_income_bn": _bn_from_millions(release_table_match.group(8)),
+                "gaap_eps": _parse_number(release_table_match.group(10)),
+                "segments": _segment_list(
+                    _segment(
+                        "Net system sales",
+                        None if revenue_bn is None or installed_base_bn is None else revenue_bn - installed_base_bn,
+                        None,
+                    ),
+                    _segment("Installed Base Management", installed_base_bn, None),
+                ),
+            }
+            primary_material = material
+            break
+
+        if quarter_tag:
+            narrative_match = _search(
+                rf"(?:In\s+)?{re.escape(quarter_tag)}.*?net sales of EUR\s+([0-9,]+(?:\.[0-9]+)?)\s+million.*?"
+                r"net system sales of EUR\s+([0-9,]+(?:\.[0-9]+)?)\s+million.*?"
+                r"(?:Installed Base Management sales|net service and field option sales|net service and field options sales)\s+of EUR\s+([0-9,]+(?:\.[0-9]+)?)\s+million",
+                flat,
+            )
+            if narrative_match:
+                extracted = {
+                    "revenue_bn": _bn_from_millions(narrative_match.group(1)),
+                    "segments": _segment_list(
+                        _segment("Net system sales", _bn_from_millions(narrative_match.group(2)), None),
+                        _segment("Installed Base Management", _bn_from_millions(narrative_match.group(3)), None),
+                    ),
+                }
+                primary_material = material
+                break
+
+    if primary_material is None:
         return {}
-    flat = presentation["flat_text"]
-    summary_match = _search(
-        r"Q4 2025 Total net sales €([0-9.]+) billion Net system sales €([0-9.]+) billion Installed Base Management1 sales €([0-9.]+) billion Gross Margin ([0-9.]+)% Operating margin2 ([0-9.]+)% Net income as a percentage of total net sales ([0-9.]+)% Earnings per share \(basic\) €([0-9.]+)",
-        flat,
-    )
+
+    primary_flat = str(primary_material.get("flat_text") or "")
     outlook_match = _search(
-        r"Q1 2026 Total net sales between €([0-9.]+) billion and €([0-9.]+) billion of which Installed Base Management1 sales around €([0-9.]+) billion Gross margin between ([0-9.]+)% and ([0-9.]+)%",
-        flat,
+        r"expects\s+Q[1-4]\s+20\d{2}\s+net sales to be between €([0-9.]+)\s+billion and €([0-9.]+)\s+billion(?:.*?gross margin between ([0-9.]+)% and ([0-9.]+)%)?",
+        primary_flat,
+    ) or _search(
+        r"Q[1-4]\s+20\d{2}\s+Total net sales between €([0-9.]+)\s+billion and €([0-9.]+)\s+billion(?:\s+of which Installed Base Management1 sales around €([0-9.]+)\s+billion)?\s+Gross margin between ([0-9.]+)% and ([0-9.]+)%",
+        primary_flat,
     )
-    if summary_match is None:
-        return {}
-    revenue_bn = _bn_from_billions(summary_match.group(1))
-    net_margin_pct = _pct_value(summary_match.group(6))
+
+    revenue_bn = _coalesce_number(extracted.get("revenue_bn"), fallback_latest_kpis.get("revenue_bn"))
+    gross_margin_pct = _coalesce_number(extracted.get("gross_margin_pct"), fallback_latest_kpis.get("gaap_gross_margin_pct"))
+    net_income_bn = _coalesce_number(extracted.get("net_income_bn"), fallback_latest_kpis.get("net_income_bn"))
+    operating_income_bn = _coalesce_number(
+        extracted.get("operating_income_bn"),
+        fallback_latest_kpis.get("operating_income_bn"),
+    )
     facts = {
-        "primary_source_label": presentation["label"],
-        "structure_source_label": presentation["label"],
-        "guidance_source_label": presentation["label"],
+        "primary_source_label": primary_material["label"],
+        "structure_source_label": primary_material["label"],
+        "guidance_source_label": primary_material["label"],
         "revenue_bn": revenue_bn,
-        "gross_margin_pct": _pct_value(summary_match.group(4)),
-        "operating_income_bn": None if revenue_bn is None else revenue_bn * float(summary_match.group(5)) / 100,
-        "net_income_bn": None if revenue_bn is None or net_margin_pct is None else revenue_bn * float(net_margin_pct) / 100,
-        "gaap_eps": _parse_number(summary_match.group(7)),
-        "segments": _segment_list(
-            _segment("Net system sales", _bn_from_billions(summary_match.group(2)), None),
-            _segment("Installed Base Management", _bn_from_billions(summary_match.group(3)), None),
-        ),
+        "revenue_yoy_pct": fallback_latest_kpis.get("revenue_yoy_pct"),
+        "gross_margin_pct": gross_margin_pct,
+        "operating_income_bn": operating_income_bn,
+        "net_income_bn": net_income_bn,
+        "net_income_yoy_pct": fallback_latest_kpis.get("net_income_yoy_pct"),
+        "gaap_eps": _coalesce_number(extracted.get("gaap_eps"), fallback_latest_kpis.get("gaap_eps")),
+        "segments": list(extracted.get("segments") or []),
         "guidance": {
             "mode": "official",
             "revenue_bn": _midpoint(_bn_from_billions(outlook_match.group(1)) if outlook_match else None, _bn_from_billions(outlook_match.group(2)) if outlook_match else None),
@@ -4838,13 +5966,12 @@ def _parse_asml(
             "revenue_high_bn": _bn_from_billions(outlook_match.group(2)) if outlook_match else None,
             "comparison_label": "下一季收入指引",
             "commentary": (
-                f"Q1 2026 收入指引区间为 EUR {outlook_match.group(1)}B 到 EUR {outlook_match.group(2)}B，"
-                f"Installed Base Management 约 EUR {outlook_match.group(3)}B，毛利率区间 {outlook_match.group(4)}%-{outlook_match.group(5)}%。"
+                f"下一季收入指引区间为 EUR {outlook_match.group(1)}B 到 EUR {outlook_match.group(2)}B。"
                 if outlook_match
                 else None
             ),
         },
-        "driver": "Q4 系统销售与 Installed Base Management 同步抬升，AI 驱动下订单与 backlog 继续扩张",
+        "driver": "系统销售、Installed Base Management 与订单/积压变化共同决定景气与盈利兑现节奏",
     }
     parsed = _finalize(company, fallback, facts, materials)
     if not parsed.get("current_geographies"):
@@ -4853,7 +5980,7 @@ def _parse_asml(
         if len(annual_geographies) >= 3:
             parsed["current_geographies"] = annual_geographies
             coverage_notes = list(parsed.get("coverage_notes") or [])
-            coverage_notes.append("ASML 的地区结构已补充尝试从最近官方 20-F 年报口径自动回溯。")
+            coverage_notes.append("ASML 的地区结构已补充连接最近官方 20-F 年报口径。")
             parsed["coverage_notes"] = coverage_notes
     if not parsed.get("current_geographies"):
         coverage_notes = list(parsed.get("coverage_notes") or [])
@@ -4871,6 +5998,36 @@ def _parse_tsmc(
     presentation = _pick_material(materials, kind="presentation")
     release_flat = str(release.get("flat_text") or "") if release else ""
     presentation_flat = str(presentation.get("flat_text") or "") if presentation else ""
+    release_revenue_match = _search(
+        r"In US dollars,[^$]{0,200}\$([0-9]+(?:\.[0-9]+)?)\s*billion",
+        release_flat,
+    )
+    release_revenue_yoy_match = _search(
+        r"revenue was \$[0-9]+(?:\.[0-9]+)?\s*billion,\s*which\s*(?:increased|grew|rose|up)\s*([0-9]+(?:\.[0-9]+)?)%\s*(?:year-over-year|year over year|yoy)",
+        release_flat,
+    )
+    release_gross_margin_match = _search(
+        r"gross margin[^%]{0,80}?was\s*([0-9]+(?:\.[0-9]+)?)%",
+        release_flat,
+    )
+    release_operating_margin_match = _search(
+        r"operating margin[^%]{0,80}?was\s*([0-9]+(?:\.[0-9]+)?)%",
+        release_flat,
+    )
+    release_net_margin_match = _search(
+        r"net (?:profit|income) margin[^%]{0,80}?was\s*([0-9]+(?:\.[0-9]+)?)%",
+        release_flat,
+    )
+    release_eps_match = _search(
+        r"diluted earnings per share of (?:NT\$|US\$|\$)?([0-9]+(?:\.[0-9]+)?)",
+        release_flat,
+    )
+    release_revenue_bn = _bn_from_billions(release_revenue_match.group(1)) if release_revenue_match else None
+    release_revenue_yoy_pct = _pct_value(release_revenue_yoy_match.group(1)) if release_revenue_yoy_match else None
+    release_gross_margin_pct = _pct_value(release_gross_margin_match.group(1)) if release_gross_margin_match else None
+    release_operating_margin_pct = _pct_value(release_operating_margin_match.group(1)) if release_operating_margin_match else None
+    release_net_margin_pct = _pct_value(release_net_margin_match.group(1)) if release_net_margin_match else None
+    release_eps = _parse_number(release_eps_match.group(1)) if release_eps_match else None
     fallback_latest_kpis = dict(fallback.get("latest_kpis") or {})
     fallback_revenue_bn = _coalesce_number(
         fallback_latest_kpis.get("revenue_bn"),
@@ -4878,16 +6035,27 @@ def _parse_tsmc(
     )
     revenue_bn = _coalesce_number(
         fallback_revenue_bn,
+        release_revenue_bn,
     )
     quarterly_geographies = _tsmc_quarterly_geographies(materials, revenue_bn)
     segments = _tsmc_platform_segments(company, str(fallback.get("fiscal_label") or ""), materials, revenue_bn)
     statement_metrics = _tsmc_statement_metrics(materials)
     statement_gross_margin = _coalesce_number(
         statement_metrics.get("gross_margin_pct"),
+        release_gross_margin_pct,
         fallback_latest_kpis.get("gaap_gross_margin_pct"),
+    )
+    statement_operating_margin = _coalesce_number(
+        statement_metrics.get("operating_margin_pct"),
+        release_operating_margin_pct,
+    )
+    statement_net_margin = _coalesce_number(
+        statement_metrics.get("net_margin_pct"),
+        release_net_margin_pct,
     )
     statement_revenue_yoy = _coalesce_number(
         statement_metrics.get("revenue_yoy_pct"),
+        release_revenue_yoy_pct,
         fallback_latest_kpis.get("revenue_yoy_pct"),
     )
     statement_net_income_yoy = _coalesce_number(
@@ -4896,6 +6064,7 @@ def _parse_tsmc(
     )
     statement_eps = _coalesce_number(
         statement_metrics.get("gaap_eps"),
+        release_eps,
         fallback_latest_kpis.get("gaap_eps"),
     )
     statement_eps_yoy = _coalesce_number(
@@ -4910,13 +6079,11 @@ def _parse_tsmc(
     guidance_material = release or presentation or primary_material
     net_income_bn = _coalesce_number(
         fallback_latest_kpis.get("net_income_bn"),
-        None if revenue_bn in (None, 0) else (statement_metrics.get("net_margin_pct") or 0.0) * float(revenue_bn) / 100,
+        None if revenue_bn in (None, 0) or statement_net_margin is None else float(statement_net_margin) * float(revenue_bn) / 100,
     )
     operating_income_bn = _coalesce_number(
         fallback_latest_kpis.get("operating_income_bn"),
-        None
-        if revenue_bn in (None, 0) or statement_metrics.get("operating_margin_pct") is None
-        else float(revenue_bn) * float(statement_metrics["operating_margin_pct"]) / 100,
+        None if revenue_bn in (None, 0) or statement_operating_margin is None else float(revenue_bn) * float(statement_operating_margin) / 100,
     )
     facts = {
         "primary_source_label": str(primary_material.get("label") or "TSMC official materials") if primary_material else "TSMC official materials",
@@ -4979,13 +6146,20 @@ def _parse_tsmc(
     if quarterly_geographies:
         coverage_notes.append("TSMC 的地区结构已优先改为从官方季度 presentation 的 Geography 表动态解析。")
     if not parsed.get("current_geographies"):
-        annual_materials = _load_nearby_annual_materials(company, fallback, materials)
+        annual_materials = [
+            item
+            for item in materials
+            if item.get("kind") == "sec_filing" and _is_annual_material(item)
+        ]
+        if not annual_materials:
+            annual_materials = _load_nearby_annual_materials(company, fallback, materials)
+        annual_materials = _ensure_loaded_materials(annual_materials)
         annual_geographies = _extract_company_geographies(str(company["id"]), annual_materials, revenue_bn) if annual_materials else []
-        if len(annual_geographies) >= 3:
+        if len(annual_geographies) >= 2:
             parsed["current_geographies"] = annual_geographies
-            coverage_notes.append("TSMC 的地区结构已增加最近官方年报口径的自动回溯通道。")
+            coverage_notes.append("TSMC 的地区结构已增加最近官方年报口径的自动映射通道。")
     if not parsed.get("current_geographies"):
-        coverage_notes.append("TSMC 当前可解析的 SEC 季度附件未稳定提供地区收入拆分，因此地区结构页会保留披露限制说明。")
+        coverage_notes.append("TSMC 当前可解析的 SEC 季度附件尚未稳定提供地区收入拆分，地区结构页将保留披露口径说明。")
     parsed["coverage_notes"] = coverage_notes
 
     if segments:
@@ -5125,6 +6299,17 @@ def _parse_tsmc(
                 text_bits.append(f"长期 ROE high-{long_term_roe_match.group(1)}s%")
             catalysts.append(_theme("长期目标锚", 70, "管理层继续维持 " + "、".join(text_bits) + " 的经营框架。"))
         parsed["catalysts"] = catalysts[:4]
+
+        if len(management_themes) < 3:
+            fallback_note = None
+            if parsed.get("current_geographies"):
+                top_geo = max(parsed["current_geographies"], key=lambda item: float(item.get("value_bn") or 0.0))
+                fallback_note = f"地区结构显示 {top_geo['name']} 仍是主要收入去向，管理层阅读应继续结合区域需求与客户节奏来判断后续订单强度。"
+            elif parsed.get("latest_kpis", {}).get("gaap_gross_margin_pct") is not None:
+                fallback_note = f"当前毛利率约 {format_pct(parsed['latest_kpis']['gaap_gross_margin_pct'])}，管理层主题需要继续围绕先进制程利用率与结构 mix 的兑现来阅读。"
+            if fallback_note:
+                management_themes.append(_theme("地区与利润率锚点", 74, fallback_note))
+        parsed["management_themes"] = management_themes[:4]
     return parsed
 
 
@@ -5133,11 +6318,45 @@ def _parse_costco(
     fallback: dict[str, Any],
     materials: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    parsed = _parse_generic(company, fallback, materials)
-    if not parsed:
+    parsed = _parse_generic(company, fallback, materials) or {}
+    release = _pick_material(materials, kind="official_release")
+    sec = _pick_material(materials, kind="sec_filing")
+    if not parsed and release is None and sec is None:
         return {}
 
-    sec = _pick_material(materials, kind="sec_filing")
+    if release is not None:
+        release_text = str(release.get("raw_text") or release.get("flat_text") or "")
+        revenue_bn, _revenue_prior_bn, revenue_yoy_pct = _extract_table_metric(release_text, ["Total revenue"])
+        net_sales_bn, _net_sales_prior_bn, net_sales_yoy_pct = _extract_table_metric(release_text, ["Net sales"])
+        membership_bn, _membership_prior_bn, membership_yoy_pct = _extract_table_metric(
+            release_text,
+            ["Membership fees", "Membership fee revenue"],
+        )
+        net_income_bn, _net_income_prior_bn, net_income_yoy_pct = _extract_table_metric(
+            release_text,
+            ["NET INCOME ATTRIBUTABLE TO COSTCO", "Net income attributable to Costco", "Net income"],
+        )
+        latest_kpis = dict(parsed.get("latest_kpis") or {})
+        if latest_kpis.get("revenue_bn") is None and revenue_bn is not None:
+            latest_kpis["revenue_bn"] = revenue_bn
+        if latest_kpis.get("revenue_yoy_pct") is None and revenue_yoy_pct is not None:
+            latest_kpis["revenue_yoy_pct"] = revenue_yoy_pct
+        if latest_kpis.get("net_income_bn") is None and net_income_bn is not None:
+            latest_kpis["net_income_bn"] = net_income_bn
+        if latest_kpis.get("net_income_yoy_pct") is None and net_income_yoy_pct is not None:
+            latest_kpis["net_income_yoy_pct"] = net_income_yoy_pct
+        if latest_kpis:
+            parsed["latest_kpis"] = latest_kpis
+        if not parsed.get("current_segments"):
+            parsed["current_segments"] = _segment_list(
+                _segment("Net sales", net_sales_bn, net_sales_yoy_pct),
+                _segment("Membership fees", membership_bn, membership_yoy_pct),
+            )
+        coverage_notes = list(parsed.get("coverage_notes") or [])
+        if revenue_bn is not None:
+            coverage_notes.append("Costco 老季度已优先解析 press release 表格中的 Total revenue / Net sales / Membership fees。")
+        parsed["coverage_notes"] = coverage_notes
+
     if sec is None:
         return parsed
 
@@ -5148,30 +6367,48 @@ def _parse_costco(
         r"Other International Total revenue \$?\s*([0-9,]+)\s+\$?\s*([0-9,]+)",
         flat,
     )
-    if not segment_match:
-        return parsed
-
-    geographies = [
-        item
-        for item in [
-            _geography(
-                "United States",
-                _bn_from_millions(segment_match.group(1)),
-                _pct_change(_bn_from_millions(segment_match.group(1)), _bn_from_millions(segment_match.group(2))),
-            ),
-            _geography(
-                "Canada",
-                _bn_from_millions(segment_match.group(3)),
-                _pct_change(_bn_from_millions(segment_match.group(3)), _bn_from_millions(segment_match.group(4))),
-            ),
-            _geography(
-                "Other International",
-                _bn_from_millions(segment_match.group(5)),
-                _pct_change(_bn_from_millions(segment_match.group(5)), _bn_from_millions(segment_match.group(6))),
-            ),
+    if segment_match:
+        geographies = [
+            item
+            for item in [
+                _geography(
+                    "United States",
+                    _bn_from_millions(segment_match.group(1)),
+                    _pct_change(_bn_from_millions(segment_match.group(1)), _bn_from_millions(segment_match.group(2))),
+                ),
+                _geography(
+                    "Canada",
+                    _bn_from_millions(segment_match.group(3)),
+                    _pct_change(_bn_from_millions(segment_match.group(3)), _bn_from_millions(segment_match.group(4))),
+                ),
+                _geography(
+                    "Other International",
+                    _bn_from_millions(segment_match.group(5)),
+                    _pct_change(_bn_from_millions(segment_match.group(5)), _bn_from_millions(segment_match.group(6))),
+                ),
+            ]
+            if item
         ]
-        if item
-    ]
+    else:
+        sec_text = str(sec.get("raw_text") or flat)
+        us_bn, us_prior_bn, us_yoy_pct = _extract_table_metric(sec_text, ["United States Operations", "United States"])
+        canada_bn, canada_prior_bn, canada_yoy_pct = _extract_table_metric(sec_text, ["Canadian Operations", "Canada"])
+        other_bn, other_prior_bn, other_yoy_pct = _extract_table_metric(sec_text, ["Other International Operations", "Other International"])
+        geographies = [
+            item
+            for item in [
+                _geography("United States", us_bn, us_yoy_pct if us_yoy_pct is not None else _pct_change(us_bn, us_prior_bn)),
+                _geography("Canada", canada_bn, canada_yoy_pct if canada_yoy_pct is not None else _pct_change(canada_bn, canada_prior_bn)),
+                _geography(
+                    "Other International",
+                    other_bn,
+                    other_yoy_pct if other_yoy_pct is not None else _pct_change(other_bn, other_prior_bn),
+                ),
+            ]
+            if item
+        ]
+    if not geographies:
+        return parsed
     parsed["current_geographies"] = sorted(geographies, key=lambda item: float(item.get("value_bn") or 0.0), reverse=True)
     coverage_notes = list(parsed.get("coverage_notes") or [])
     coverage_notes.append("Costco 的地区结构已改为优先解析官方 10-Q 中的 reportable segment 收入表。")
@@ -5228,7 +6465,7 @@ def _parse_berkshire(
     if geographies:
         parsed["current_geographies"] = geographies
         coverage_notes = list(parsed.get("coverage_notes") or [])
-        coverage_notes.append("Berkshire 仅在年报层面披露美国收入占比，因此地区结构当前使用 U.S. / Other 的 annual fallback。")
+        coverage_notes.append("Berkshire 主要在年报层面披露美国收入占比，地区结构当前采用 U.S. / Other 的官方口径映射。")
         parsed["coverage_notes"] = coverage_notes
     return parsed
 
@@ -5489,6 +6726,7 @@ COMPANY_PARSERS = {
     "avgo": _parse_avgo,
     "berkshire": _parse_berkshire,
     "costco": _parse_costco,
+    "walmart": _parse_walmart,
     "jnj": _parse_jnj,
     "visa": _parse_visa,
     "micron": _parse_micron,

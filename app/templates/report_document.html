@@ -223,6 +223,13 @@
         <div class="page-split two-col compact-panels signal-followup-panels balanced-panels">
           <article class="text-panel">
             <h3>{{ report.call_panel.title }}</h3>
+            {% if report.call_panel.meta_lines %}
+            <ul class="summary-list">
+              {% for item in report.call_panel.meta_lines %}
+              <li>{{ item }}</li>
+              {% endfor %}
+            </ul>
+            {% endif %}
             <ul class="warning-list">
               {% for item in report.call_panel.bullets %}
               <li>{{ item }}</li>
@@ -231,7 +238,7 @@
           </article>
           <article class="text-panel">
             {% if report.call_quote_cards %}
-            <h3>官方管理层锚点</h3>
+            <h3>{{ report.narrative_provenance.quote_panel_title }}</h3>
             <div class="quote-card-stack">
               {% set featured_quote = report.call_quote_cards[0] %}
               <article class="quote-card{% if featured_quote.quote|length > 280 or featured_quote.analysis|length > 150 or featured_quote.source_label|length > 88 %} quote-card-dense{% endif %}{% if featured_quote.quote|length > 420 or featured_quote.analysis|length > 210 %} quote-card-ultra-dense{% endif %}">
@@ -260,6 +267,7 @@
         <div class="page-split two-col compact-panels signal-followup-panels balanced-panels">
           <article class="text-panel">
             <h3>本季风险视角</h3>
+            <p><strong>来源：</strong>{{ report.narrative_provenance.risks.label }}。{{ report.narrative_provenance.risks.detail }}</p>
             <ul class="warning-list">
               {% for item in report.risks[:3] %}
               <li><strong>{{ item.label }}</strong>：{{ item.note }}</li>
@@ -268,6 +276,7 @@
           </article>
           <article class="text-panel">
             <h3>本季催化剂视角</h3>
+            <p><strong>来源：</strong>{{ report.narrative_provenance.catalysts.label }}。{{ report.narrative_provenance.catalysts.detail }}</p>
             <ul class="warning-list">
               {% for item in report.catalysts[:3] %}
               <li><strong>{{ item.label }}</strong>：{{ item.note }}</li>
