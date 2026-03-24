@@ -5,13 +5,17 @@
 
 :root {
   color-scheme: light;
-  --bg: #eff4f8;
-  --panel: rgba(255, 255, 255, 0.92);
+  --bg: #eef2f6;
+  --panel: rgba(255, 255, 255, 0.96);
   --panel-strong: #ffffff;
   --text: #0f172a;
   --muted: #64748b;
   --line: #dbe4ee;
-  --shadow: 0 24px 70px rgba(15, 23, 42, 0.08);
+  --shadow: 0 14px 34px rgba(15, 23, 42, 0.06);
+  --page-shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
+  --paper-border: rgba(148, 163, 184, 0.18);
+  --paper-fill: rgba(255, 255, 255, 0.985);
+  --paper-fill-soft: rgba(248, 250, 252, 0.96);
 }
 
 * {
@@ -490,7 +494,7 @@ a {
 
 .report-body {
   background:
-    linear-gradient(180deg, #e8edf3 0%, #edf2f7 100%);
+    linear-gradient(180deg, #edf1f5 0%, #f2f5f8 100%);
 }
 
 .report-body .cover-brand-lockup {
@@ -498,9 +502,9 @@ a {
   margin-bottom: 14px;
   padding: 8px 12px;
   border-radius: 18px;
-  border: 1px solid rgba(255, 255, 255, 0.78);
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.86), rgba(255, 255, 255, 0.64));
-  box-shadow: 0 16px 38px rgba(15, 23, 42, 0.08);
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.97), rgba(247, 250, 252, 0.94));
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.04);
 }
 
 .report-body .cover-brand-lockup svg {
@@ -517,9 +521,9 @@ a {
   gap: 16px;
   justify-content: space-between;
   padding: 16px 24px;
-  background: rgba(255, 255, 255, 0.84);
+  background: rgba(255, 255, 255, 0.94);
   border-bottom: 1px solid var(--line);
-  backdrop-filter: blur(18px);
+  backdrop-filter: none;
 }
 
 .toolbar-meta {
@@ -556,9 +560,8 @@ a {
   overflow: hidden;
   border-radius: 30px;
   background:
-    radial-gradient(circle at 18% 10%, rgba(255, 255, 255, 0.82), transparent 22%),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.95), var(--brand-surface));
-  box-shadow: 0 26px 70px rgba(15, 23, 42, 0.14);
+    linear-gradient(180deg, var(--paper-fill), color-mix(in srgb, var(--brand-surface) 18%, #ffffff) 100%);
+  box-shadow: var(--page-shadow);
   page-break-after: always;
 }
 
@@ -676,7 +679,7 @@ a {
   position: absolute;
   inset: 14px;
   border-radius: 24px;
-  border: 1px solid rgba(148, 163, 184, 0.18);
+  border: 1px solid var(--paper-border);
   pointer-events: none;
 }
 
@@ -686,7 +689,7 @@ a {
   inset: 0;
   border-radius: 30px;
   pointer-events: none;
-  opacity: 0.95;
+  opacity: 0.38;
 }
 
 .page-no {
@@ -700,9 +703,9 @@ a {
 
 .cover-page {
   background:
-    radial-gradient(circle at top left, rgba(118, 185, 0, 0.18), transparent 24%),
-    radial-gradient(circle at 82% 14%, rgba(14, 165, 160, 0.12), transparent 18%),
-    linear-gradient(180deg, #fbfdff 0%, #f1f6fb 100%);
+    radial-gradient(circle at top left, rgba(118, 185, 0, 0.1), transparent 22%),
+    radial-gradient(circle at 82% 14%, rgba(14, 165, 160, 0.06), transparent 16%),
+    linear-gradient(180deg, #fcfdff 0%, #f5f8fb 100%);
 }
 
 .cover-grid,
@@ -722,15 +725,15 @@ a {
 
 .pattern-glass .cover-page {
   background:
-    radial-gradient(circle at 14% 12%, rgba(255, 255, 255, 0.92), transparent 24%),
-    radial-gradient(circle at 84% 16%, rgba(37, 99, 235, 0.12), transparent 18%),
-    linear-gradient(180deg, #fcfdff 0%, #edf4ff 100%);
+    radial-gradient(circle at 14% 12%, rgba(255, 255, 255, 0.82), transparent 22%),
+    radial-gradient(circle at 84% 16%, rgba(37, 99, 235, 0.07), transparent 16%),
+    linear-gradient(180deg, #fcfdff 0%, #f2f6fb 100%);
 }
 
 .pattern-glass .page::after {
   background:
-    radial-gradient(circle at 82% 14%, rgba(37, 99, 235, 0.05), transparent 18%),
-    radial-gradient(circle at 12% 82%, rgba(148, 163, 184, 0.05), transparent 20%);
+    radial-gradient(circle at 82% 14%, rgba(37, 99, 235, 0.025), transparent 16%),
+    radial-gradient(circle at 12% 82%, rgba(148, 163, 184, 0.02), transparent 18%);
 }
 
 .pattern-matrix .cover-page {
@@ -993,8 +996,8 @@ a {
 
 .cover-summary-card {
   padding: 18px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.88), rgba(255, 255, 255, 0.72));
-  border: 1px solid rgba(255, 255, 255, 0.9);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.985), rgba(248, 250, 252, 0.95));
+  border: 1px solid rgba(148, 163, 184, 0.14);
 }
 
 .rhythm-airy .cover-grid {
@@ -1098,8 +1101,8 @@ a {
   min-height: 24px;
   padding: 0 10px;
   border-radius: 999px;
-  border: 1px solid color-mix(in srgb, var(--brand-primary) 14%, #dbe4ee);
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.86), rgba(255, 255, 255, 0.6));
+  border: 1px solid color-mix(in srgb, var(--brand-primary) 12%, #dbe4ee);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.97), rgba(248, 250, 252, 0.94));
 }
 
 .page-head {
@@ -1133,8 +1136,8 @@ a {
   min-height: 22px;
   padding: 0 10px;
   border-radius: 999px;
-  border: 1px solid color-mix(in srgb, var(--brand-primary) 16%, #dbe4ee);
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.94), rgba(255, 255, 255, 0.66));
+  border: 1px solid color-mix(in srgb, var(--brand-primary) 14%, #dbe4ee);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 250, 252, 0.94));
   color: color-mix(in srgb, var(--brand-secondary) 68%, #334155);
   font-size: 10.5px;
   font-weight: 700;
@@ -1178,9 +1181,9 @@ a {
   width: 122px;
   padding: 6px 9px;
   border-radius: 16px;
-  border: 1px solid rgba(255, 255, 255, 0.84);
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(255, 255, 255, 0.68));
-  box-shadow: 0 10px 20px rgba(15, 23, 42, 0.05);
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 250, 252, 0.94));
+  box-shadow: 0 6px 14px rgba(15, 23, 42, 0.035);
 }
 
 .page-brand-lockup-mini svg {
@@ -1199,7 +1202,7 @@ a {
   font-size: 12.8px;
   letter-spacing: 0.01em;
   text-align: right;
-  color: color-mix(in srgb, var(--brand-secondary) 34%, #64748b);
+  color: color-mix(in srgb, var(--brand-secondary) 42%, #64748b);
 }
 
 .page-head::after {
@@ -1260,20 +1263,18 @@ a {
 
 .section-quarterly {
   background:
-    radial-gradient(circle at 14% 14%, rgba(255, 255, 255, 0.82), transparent 18%),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.96), color-mix(in srgb, var(--brand-surface) 82%, #ffffff));
+    linear-gradient(180deg, rgba(255, 255, 255, 0.99), color-mix(in srgb, var(--brand-surface) 14%, #ffffff));
 }
 
 .section-historical {
   background:
-    radial-gradient(circle at 84% 14%, color-mix(in srgb, var(--brand-primary) 8%, transparent), transparent 18%),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.98), color-mix(in srgb, var(--brand-accent) 24%, #ffffff));
+    linear-gradient(180deg, rgba(255, 255, 255, 0.99), color-mix(in srgb, var(--brand-accent) 14%, #ffffff));
 }
 
 .section-evidence {
   background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(241, 245, 249, 0.94)),
-    linear-gradient(180deg, rgba(15, 23, 42, 0.025) 1px, transparent 1px);
+    linear-gradient(180deg, rgba(255, 255, 255, 0.99), rgba(245, 247, 250, 0.96)),
+    linear-gradient(180deg, rgba(15, 23, 42, 0.016) 1px, transparent 1px);
   background-size: auto, 100% 18px;
 }
 
@@ -1499,7 +1500,7 @@ a {
   border-radius: 28px;
   overflow: hidden;
   border: 1px solid var(--line);
-  background: linear-gradient(180deg, #ffffff, color-mix(in srgb, var(--brand-surface) 56%, #ffffff));
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.995), color-mix(in srgb, var(--brand-surface) 10%, #ffffff));
 }
 
 .pattern-grid .chart-card,
@@ -1512,8 +1513,61 @@ a {
 .pattern-glass .score-card,
 .pattern-glass .mini-card,
 .pattern-glass .cover-summary-card {
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(248, 250, 252, 0.72));
-  backdrop-filter: blur(18px);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.985), rgba(248, 250, 252, 0.95));
+  backdrop-filter: none;
+}
+
+.text-panel,
+.score-card,
+.mini-card,
+.evidence-card,
+.insight-card,
+.source-card,
+.cover-chip,
+.cover-summary-card,
+.signal-panel,
+.quote-card {
+  border-color: rgba(148, 163, 184, 0.14);
+  background: linear-gradient(180deg, var(--paper-fill), var(--paper-fill-soft));
+  box-shadow: 0 3px 10px rgba(15, 23, 42, 0.025);
+}
+
+.theme-amazon .chart-card,
+.theme-amazon .text-panel,
+.theme-walmart .chart-card,
+.theme-costco .chart-card {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.995), rgba(253, 249, 240, 0.96));
+}
+
+.theme-meta .chart-card,
+.theme-meta .text-panel,
+.theme-alphabet .chart-card,
+.theme-alphabet .text-panel,
+.theme-microsoft .chart-card,
+.theme-microsoft .text-panel,
+.theme-visa .chart-card,
+.theme-oracle .chart-card,
+.theme-asml .chart-card,
+.theme-tsmc .chart-card,
+.theme-tsmc .text-panel,
+.theme-asml .text-panel,
+.theme-nvidia .chart-card,
+.theme-nvidia .text-panel,
+.theme-avgo .chart-card,
+.theme-micron .chart-card,
+.theme-tsla .chart-card,
+.theme-tsla .text-panel,
+.theme-xom .chart-card,
+.theme-xom .text-panel,
+.theme-berkshire .chart-card,
+.theme-berkshire .text-panel,
+.theme-jpm .chart-card,
+.theme-jpm .text-panel,
+.theme-apple .chart-card,
+.theme-apple .text-panel,
+.theme-lly .chart-card,
+.theme-jnj .chart-card {
+  box-shadow: 0 3px 10px rgba(15, 23, 42, 0.025);
 }
 
 .pattern-grid .text-panel,
@@ -2418,6 +2472,25 @@ a {
 @media print {
   .page {
     padding: 30px 30px 24px;
+    box-shadow: none;
+  }
+
+  .preview-toolbar {
+    backdrop-filter: none;
+  }
+
+  .text-panel,
+  .score-card,
+  .mini-card,
+  .evidence-card,
+  .insight-card,
+  .source-card,
+  .cover-chip,
+  .cover-summary-card,
+  .signal-panel,
+  .quote-card,
+  .page-brand-lockup-mini,
+  .report-body .cover-brand-lockup {
     box-shadow: none;
   }
 

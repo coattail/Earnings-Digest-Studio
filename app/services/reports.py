@@ -64,11 +64,11 @@ REPORT_JOB_FUTURES_LOCK = threading.Lock()
 ProgressCallback = Callable[[float, str, str], None]
 RECENT_REPORT_CACHE_TTL_SECONDS = 6 * 60 * 60
 HISTORICAL_REPORT_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
-REPORT_PAYLOAD_SCHEMA_VERSION = 12
+REPORT_PAYLOAD_SCHEMA_VERSION = 16
 FULL_COVERAGE_ENV = "EARNINGS_DIGEST_REQUIRE_FULL_COVERAGE"
 FULL_COVERAGE_READY_MAP_PATH = APP_DIR.parent / "data" / "cache" / "full-coverage-ready-quarters.json"
 HISTORICAL_OFFICIAL_QUARTER_CACHE_DIR = CACHE_DIR / "historical-official-quarter-cache"
-HISTORICAL_OFFICIAL_QUARTER_CACHE_VERSION = 2
+HISTORICAL_OFFICIAL_QUARTER_CACHE_VERSION = 4
 HISTORICAL_OFFICIAL_QUARTER_MEMORY_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 HISTORICAL_OFFICIAL_QUARTER_MEMORY_LOCK = threading.Lock()
 
@@ -139,6 +139,7 @@ def _clone_cached_official_quarter_payload(payload: dict[str, Any]) -> dict[str,
         "current_geographies": [dict(item) for item in list(payload.get("current_geographies") or []) if isinstance(item, dict)],
         "source_url": payload.get("source_url"),
         "source_date": payload.get("source_date"),
+        "profit_basis": payload.get("profit_basis"),
     }
 
 
@@ -958,6 +959,30 @@ def _excerpt_text(text: Optional[str], limit: int) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: limit - 1].rstrip(" ,.;:") + "..."
+
+
+def _parse_iso_date(value: Optional[str]) -> Optional[date]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _historical_official_cache_is_temporally_aligned(
+    entry: dict[str, Any],
+    cached_payload: dict[str, Any],
+) -> bool:
+    source_date = _parse_iso_date(cached_payload.get("source_date"))
+    if source_date is None:
+        return True
+    period_end = _parse_iso_date(entry.get("period_end"))
+    if period_end is None:
+        return True
+    delta_days = (source_date - period_end).days
+    return -30 <= delta_days <= 220
 
 
 def _prepare_call_quote_cards(cards: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -2062,6 +2087,27 @@ def _historical_metric_candidate(
     return existing_value
 
 
+def _historical_revenue_candidate(
+    existing_revenue_bn: Optional[float],
+    parsed_revenue_bn: Optional[float],
+    *,
+    reference_profit_bn: Optional[float],
+) -> Optional[float]:
+    candidate = _historical_metric_candidate(existing_revenue_bn, parsed_revenue_bn)
+    if candidate is None or existing_revenue_bn in (None, 0) or reference_profit_bn in (None, 0):
+        return candidate
+    candidate_margin = abs(float(reference_profit_bn)) / float(candidate)
+    existing_margin = abs(float(reference_profit_bn)) / float(existing_revenue_bn)
+    if (
+        candidate != existing_revenue_bn
+        and candidate_margin >= 0.75
+        and existing_margin <= 0.65
+        and float(existing_revenue_bn) >= float(candidate) * 1.35
+    ):
+        return float(existing_revenue_bn)
+    return candidate
+
+
 def _segment_snapshot_quality(
     company: dict[str, Any],
     segments: list[dict[str, Any]],
@@ -2158,6 +2204,8 @@ def _enrich_history_with_official_structures(
         entry = dict(enriched[index])
         period = str(entry["quarter_label"])
         cached_parsed = _load_historical_official_quarter_cache(str(company["id"]), period)
+        if cached_parsed is not None and not _historical_official_cache_is_temporally_aligned(entry, cached_parsed):
+            cached_parsed = None
         if cached_parsed is None:
             fixture = get_quarter_fixture(str(company["id"]), period)
             base_sources = list(fixture.get("sources") or []) if fixture else []
@@ -2193,11 +2241,20 @@ def _enrich_history_with_official_structures(
                 "current_geographies": [dict(item) for item in list(parsed.get("current_geographies") or []) if isinstance(item, dict)],
                 "source_url": str(sources[0].get("url") or "") if sources else "",
                 "source_date": str(sources[0].get("date") or "") if sources else "",
+                "profit_basis": parsed.get("profit_basis"),
             }
             _store_historical_official_quarter_cache(str(company["id"]), period, cached_parsed)
         latest_kpis = dict(cached_parsed.get("latest_kpis") or {})
-        revenue_bn = _historical_metric_candidate(entry.get("revenue_bn"), latest_kpis.get("revenue_bn"))
-        net_income_bn = _historical_metric_candidate(entry.get("net_income_bn"), latest_kpis.get("net_income_bn"), min_ratio=0.25, max_ratio=2.8)
+        profit_basis = str(cached_parsed.get("profit_basis") or "")
+        if profit_basis == "adjusted_special_items" and latest_kpis.get("net_income_bn") is not None:
+            net_income_bn = latest_kpis.get("net_income_bn")
+        else:
+            net_income_bn = _historical_metric_candidate(entry.get("net_income_bn"), latest_kpis.get("net_income_bn"), min_ratio=0.25, max_ratio=2.8)
+        revenue_bn = _historical_revenue_candidate(
+            entry.get("revenue_bn"),
+            latest_kpis.get("revenue_bn"),
+            reference_profit_bn=net_income_bn if net_income_bn is not None else entry.get("net_income_bn"),
+        )
         gross_margin_pct = latest_kpis.get("gaap_gross_margin_pct")
         revenue_yoy_pct = latest_kpis.get("revenue_yoy_pct")
         net_income_yoy_pct = latest_kpis.get("net_income_yoy_pct")

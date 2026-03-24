@@ -1347,6 +1347,89 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         self.assertFalse(all(entry.get("segments") for entry in cube))
         self.assertEqual(resolve_structure_dimension("avgo", cube), "management")
 
+    def test_enrich_history_with_official_structures_accepts_adjusted_profit_basis_for_special_item_quarter(self) -> None:
+        company = get_company("visa")
+        history = [
+            {
+                "quarter_label": "2017Q1",
+                "period_end": "2017-03-31",
+                "revenue_bn": 4.477,
+                "net_income_bn": 0.43,
+                "gross_margin_pct": None,
+                "revenue_yoy_pct": 17.3,
+                "net_income_yoy_pct": -74.8,
+                "segments": [],
+                "geographies": [],
+                "source_type": "structured_financial_series",
+                "source_url": "",
+            }
+        ]
+
+        cached_snapshot = {
+            "latest_kpis": {
+                "net_income_bn": 2.1,
+                "net_income_yoy_pct": 29.15,
+                "gaap_eps": 0.18,
+                "non_gaap_eps": 0.86,
+            },
+            "current_segments": [],
+            "current_geographies": [],
+            "source_url": "https://example.com/visa/2017q1",
+            "source_date": "2017-04-20",
+            "profit_basis": "adjusted_special_items",
+        }
+
+        with patch("app.services.reports._load_historical_official_quarter_cache", return_value=cached_snapshot):
+            with patch("app.services.reports.resolve_official_sources", side_effect=AssertionError("should use cache")):
+                with patch("app.services.reports.hydrate_source_materials", side_effect=AssertionError("should use cache")):
+                    with patch("app.services.reports.parse_official_materials", side_effect=AssertionError("should use cache")):
+                        enriched = _enrich_history_with_official_structures(company, history)
+
+        self.assertAlmostEqual(enriched[0]["net_income_bn"], 2.1, places=2)
+        self.assertAlmostEqual(enriched[0]["net_margin_pct"], 2.1 / 4.477 * 100, places=2)
+        self.assertAlmostEqual(enriched[0]["net_income_yoy_pct"], 29.15, places=2)
+
+    def test_enrich_history_with_official_structures_rejects_revenue_override_that_creates_implausible_margin(self) -> None:
+        company = get_company("visa")
+        history = [
+            {
+                "quarter_label": "2016Q2",
+                "period_end": "2016-06-30",
+                "revenue_bn": 3.63,
+                "net_income_bn": 0.412,
+                "gross_margin_pct": None,
+                "revenue_yoy_pct": 3.18,
+                "net_income_yoy_pct": -75.72,
+                "segments": [],
+                "geographies": [],
+                "source_type": "structured_financial_series",
+                "source_url": "",
+            }
+        ]
+
+        cached_snapshot = {
+            "latest_kpis": {
+                "revenue_bn": 1.635,
+                "net_income_bn": 1.6,
+                "net_income_yoy_pct": -11.45,
+            },
+            "current_segments": [],
+            "current_geographies": [],
+            "source_url": "https://example.com/visa/2016q2",
+            "source_date": "2016-07-21",
+            "profit_basis": "adjusted_special_items",
+        }
+
+        with patch("app.services.reports._load_historical_official_quarter_cache", return_value=cached_snapshot):
+            with patch("app.services.reports.resolve_official_sources", side_effect=AssertionError("should use cache")):
+                with patch("app.services.reports.hydrate_source_materials", side_effect=AssertionError("should use cache")):
+                    with patch("app.services.reports.parse_official_materials", side_effect=AssertionError("should use cache")):
+                        enriched = _enrich_history_with_official_structures(company, history)
+
+        self.assertAlmostEqual(enriched[0]["revenue_bn"], 3.63, places=2)
+        self.assertAlmostEqual(enriched[0]["net_income_bn"], 1.6, places=2)
+        self.assertLess(enriched[0]["net_margin_pct"], 50.0)
+
     def test_companyfacts_series_maps_historical_quarter_metrics(self) -> None:
         payload = {
             "facts": {
@@ -1458,6 +1541,82 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         source_config = dict(get_company("alphabet")["official_source"])
         self.assertEqual(_sec_cik_for_calendar_quarter(source_config, "2013Q3"), "0001288776")
         self.assertEqual(_sec_cik_for_calendar_quarter(source_config, "2025Q4"), "0001652044")
+
+    @patch("app.services.official_source_resolver._load_submissions", return_value={"filings": {"recent": {"form": []}}})
+    @patch("app.services.official_source_resolver._discover_attachment_url", return_value=("https://example.com/wrapper", ""))
+    @patch("app.services.official_source_resolver._select_filing")
+    def test_resolve_official_sources_cache_key_respects_source_config(
+        self,
+        mock_select_filing: object,
+        _mock_discover_attachment_url: object,
+        _mock_load_submissions: object,
+    ) -> None:
+        def select_side_effect(
+            _submissions: dict[str, object],
+            *,
+            company_id: str,
+            period_end: str,
+            forms: list[str],
+            release_mode: bool,
+            document_hints: tuple[str, ...] = (),
+            document_excludes: tuple[str, ...] = (),
+            refresh: bool = False,
+        ) -> dict[str, object] | None:
+            _ = (company_id, period_end, document_hints, document_excludes, refresh)
+            if release_mode and "8-K" in forms:
+                return {
+                    "form": "8-K",
+                    "accessionNumber": "000140316117000026",
+                    "primaryDocument": "vex991earningsrelease33117.htm",
+                    "filingDate": "2017-04-20",
+                }
+            if not release_mode and "10-Q" in forms:
+                return {
+                    "form": "10-Q",
+                    "accessionNumber": "000140316117000028",
+                    "primaryDocument": "v33117form10q.htm",
+                    "filingDate": "2017-04-21",
+                }
+            if not release_mode and forms == ["10-K"]:
+                return {
+                    "form": "10-K",
+                    "accessionNumber": "000140316118000020",
+                    "primaryDocument": "0001403161-18-000020.txt",
+                    "filingDate": "2018-04-27",
+                }
+            return None
+
+        mock_select_filing.side_effect = select_side_effect
+        source_resolver.RESOLVED_SOURCES_MEMORY_CACHE.clear()
+
+        company = get_company("visa")
+        annual_company = dict(company)
+        annual_company["official_source"] = {
+            **dict(company.get("official_source") or {}),
+            "release_forms": [],
+            "filing_forms": ["10-K"],
+        }
+
+        with patch.dict(os.environ, {"EARNINGS_DIGEST_DISABLE_SOURCE_FETCH": "0"}):
+            annual_sources = source_resolver.resolve_official_sources(
+                annual_company,
+                "2017Q1",
+                "2017-03-31",
+                [],
+                refresh=False,
+                prefer_sec_only=True,
+            )
+            quarter_sources = source_resolver.resolve_official_sources(
+                company,
+                "2017Q1",
+                "2017-03-31",
+                [],
+                refresh=False,
+                prefer_sec_only=True,
+            )
+
+        self.assertTrue(str(annual_sources[0]["url"]).endswith("0001403161-18-000020.txt"))
+        self.assertTrue(any(str(item["url"]).endswith("v33117form10q.htm") for item in quarter_sources))
 
     def test_parse_official_materials_walmart_extracts_legacy_net_sales_table(self) -> None:
         release_path = self._write_temp_text(
@@ -2997,6 +3156,42 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertEqual(parsed["current_segments"][1]["name"], "Data processing revenue")
         self.assertEqual(len(parsed["current_geographies"]), 2)
         self.assertEqual(parsed["current_geographies"][0]["scope"], "quarterly_mapped_from_official_geography")
+
+    def test_parse_official_materials_prefers_adjusted_profit_for_special_item_quarters(self) -> None:
+        release_path = self._write_temp_text(
+            "visa-historical-special-items-release.txt",
+            (
+                "Fiscal Second Quarter 2017 Key Highlights: "
+                "• GAAP net income of $430 million or $0.18 per share including special items related to the legal entity reorganization of Visa Europe. "
+                "• Adjusted net income of $2.1 billion or $0.86 per share excluding special items related to the legal entity reorganization of Visa Europe. "
+                "• Net operating revenue of $4.5 billion, an increase of 23%."
+            ),
+        )
+        sec_path = self._write_temp_text(
+            "visa-historical-special-items-sec.txt",
+            (
+                "Net revenues $ 4,477 $ 3,817 17 % "
+                "Net income, as reported $ 430 $ 1,707 (75 )% "
+                "Diluted earnings per share, as reported $ 0.18 $ 0.71 (75 )% "
+                "Net income, as adjusted (2) $ 2,066 $ 1,626 27 % "
+                "Diluted earnings per share, as adjusted (2) $ 0.86 $ 0.68 26 %"
+            ),
+        )
+
+        parsed = parse_official_materials(
+            get_company("visa"),
+            {"fiscal_label": "2017Q1", "coverage_notes": []},
+            [
+                {"label": "Visa q22017 earnings release", "kind": "official_release", "status": "cached", "text_path": release_path},
+                {"label": "Visa Form 10-Q", "kind": "sec_filing", "status": "cached", "text_path": sec_path},
+            ],
+        )
+
+        self.assertAlmostEqual(parsed["latest_kpis"]["revenue_bn"], 4.5, places=1)
+        self.assertAlmostEqual(parsed["latest_kpis"]["net_income_bn"], 2.1, places=1)
+        self.assertAlmostEqual(parsed["latest_kpis"]["gaap_eps"], 0.18, places=2)
+        self.assertAlmostEqual(parsed["latest_kpis"]["non_gaap_eps"], 0.86, places=2)
+        self.assertEqual(parsed["profit_basis"], "adjusted_special_items")
 
     def test_micron_parser_extracts_business_unit_revenue(self) -> None:
         release_path = self._write_temp_text(

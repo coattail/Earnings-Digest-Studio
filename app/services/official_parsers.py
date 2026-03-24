@@ -786,6 +786,175 @@ def _extract_narrative_metric(flat_text: str, label_pattern: str) -> tuple[Optio
     return (None, None)
 
 
+SPECIAL_ITEM_CONTEXT_MARKERS = (
+    "special item",
+    "special items",
+    "excluding special",
+    "including special",
+    "one-time",
+    "one time",
+    "restructuring",
+    "acquisition",
+    "integration",
+    "legal entity reorganization",
+    "impairment",
+    "settlement",
+    "tax reform",
+    "tax benefit",
+    "tax charge",
+    "remeasurement",
+)
+
+
+def _match_excerpt(flat_text: str, match: re.Match[str], *, before: int = 48, after: int = 180) -> str:
+    start = max(0, match.start() - before)
+    end = min(len(flat_text), match.end() + after)
+    return flat_text[start:end]
+
+
+def _extract_company_level_narrative_metric(flat_text: str, label_pattern: str) -> tuple[Optional[float], Optional[float]]:
+    sentence_lead = r"(?:^|[.;:!?]\s+|•\s+|\u2022\s+)"
+    patterns = [
+        rf"{sentence_lead}(?:reported|generated|posted|delivered|recorded)?\s*(?:the company's\s+)?(?P<label>{label_pattern})(?:\s+for\s+the\s+(?:quarter|period))?(?:\s+(?:was|were|of|totaled|reached|came in at|amounted to))?\s+\$?(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>billion|million)",
+        rf"{sentence_lead}(?:reported|generated|posted|delivered|recorded)\s+\$?(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>billion|million)\s+(?:of\s+)?(?P<label>{label_pattern})",
+    ]
+    best: tuple[int, Optional[float], Optional[float]] = (-10_000, None, None)
+    for pattern in patterns:
+        for match in re.finditer(pattern, flat_text, flags=re.IGNORECASE | re.DOTALL):
+            amount = _bn_from_unit(match.group("amount"), match.group("unit"))
+            if amount is None:
+                continue
+            context = _match_excerpt(flat_text, match).lower()
+            score = 0
+            if "quarter" in context or "period" in context:
+                score += 3
+            if any(token in context for token in ("total revenue", "net revenue", "net operating revenue", "total sales")):
+                score += 4
+            if any(token in context for token in ("full-year", "fiscal year", "annual")):
+                score -= 7
+            if score > best[0]:
+                best = (score, amount, _extract_growth_from_context(context))
+    return (best[1], best[2])
+
+
+def _statement_value_pair(flat_text: str, label_pattern: str) -> tuple[Optional[float], Optional[float]]:
+    match = _search(
+        rf"{label_pattern}\s+\$?\s*(?P<current>[0-9,]+(?:\.[0-9]+)?)\s+\$?\s*(?P<prior>[0-9,]+(?:\.[0-9]+)?)",
+        flat_text,
+    )
+    if not match:
+        return (None, None)
+    return (_parse_number(match.group("current")), _parse_number(match.group("prior")))
+
+
+def _merge_profit_signal(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in incoming.items():
+        if key == "special_item_detected":
+            merged[key] = bool(merged.get(key)) or bool(value)
+            continue
+        if not _has_value(merged.get(key)) and _has_value(value):
+            merged[key] = value
+    return merged
+
+
+def _extract_profit_signal(flat_text: str) -> dict[str, Any]:
+    signal: dict[str, Any] = {
+        "special_item_detected": any(marker in flat_text.lower() for marker in SPECIAL_ITEM_CONTEXT_MARKERS),
+    }
+    reported_current, reported_prior = _statement_value_pair(
+        flat_text,
+        r"Net income,\s+as reported(?:\s*\([0-9]+\))?",
+    )
+    adjusted_current, adjusted_prior = _statement_value_pair(
+        flat_text,
+        r"Net income,\s+as adjusted(?:\s*\([0-9]+\))?",
+    )
+    reported_eps, reported_prior_eps = _statement_value_pair(
+        flat_text,
+        r"Diluted earnings per share,\s+as reported(?:\s*\([0-9]+\))?",
+    )
+    adjusted_eps, adjusted_prior_eps = _statement_value_pair(
+        flat_text,
+        r"Diluted earnings per share,\s+as adjusted(?:\s*\([0-9]+\))?",
+    )
+    signal.update(
+        _clean_mapping(
+            {
+                "reported_net_income_bn": _bn_from_millions(reported_current) if reported_current is not None and reported_current > 100 else reported_current,
+                "reported_prior_net_income_bn": _bn_from_millions(reported_prior) if reported_prior is not None and reported_prior > 100 else reported_prior,
+                "reported_eps": reported_eps,
+                "reported_prior_eps": reported_prior_eps,
+                "adjusted_net_income_bn": _bn_from_millions(adjusted_current) if adjusted_current is not None and adjusted_current > 100 else adjusted_current,
+                "adjusted_prior_net_income_bn": _bn_from_millions(adjusted_prior) if adjusted_prior is not None and adjusted_prior > 100 else adjusted_prior,
+                "adjusted_eps": adjusted_eps,
+                "adjusted_prior_eps": adjusted_prior_eps,
+            }
+        )
+    )
+
+    narrative_patterns = [
+        (
+            "reported",
+            rf"(?:^|[.;:!?]\s+|•\s+|\u2022\s+)GAAP(?:\s+\w+){{0,4}}\s+net income(?:[^.;]{{0,140}}?)\$\s*(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>billion|million)(?:[^.;]{{0,120}}?)(?:or|and)\s+\$?(?P<eps>[0-9]+(?:\.[0-9]+)?)\s+per share",
+        ),
+        (
+            "adjusted",
+            rf"(?:^|[.;:!?]\s+|•\s+|\u2022\s+)(?:Adjusted|Non-GAAP)(?:\s+\w+){{0,4}}\s+net income(?:[^.;]{{0,140}}?)\$\s*(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>billion|million)(?:[^.;]{{0,120}}?)(?:or|and)\s+\$?(?P<eps>[0-9]+(?:\.[0-9]+)?)\s+per share",
+        ),
+        (
+            "reported",
+            rf"(?:^|[.;:!?]\s+|•\s+|\u2022\s+)(?:Net income|Net earnings|Earnings attributable to [A-Za-z& .]+)(?:[^.;]{{0,120}}?)\$\s*(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>billion|million)(?:[^.;]{{0,120}}?)(?:or|and)\s+\$?(?P<eps>[0-9]+(?:\.[0-9]+)?)\s+per share",
+        ),
+    ]
+    for bucket, pattern in narrative_patterns:
+        match = _search(pattern, flat_text)
+        if not match:
+            continue
+        amount = _bn_from_unit(match.group("amount"), match.group("unit"))
+        eps = _parse_number(match.group("eps"))
+        excerpt = _match_excerpt(flat_text, match)
+        prefix = "adjusted" if bucket == "adjusted" else "reported"
+        signal = _merge_profit_signal(
+            signal,
+            {
+                f"{prefix}_net_income_bn": amount,
+                f"{prefix}_eps": eps,
+                f"{prefix}_context": excerpt,
+            },
+        )
+    return signal
+
+
+def _should_prefer_adjusted_profit_signal(
+    signal: dict[str, Any],
+    revenue_bn: Optional[float],
+) -> bool:
+    adjusted = signal.get("adjusted_net_income_bn")
+    if adjusted is None:
+        return False
+    reported = signal.get("reported_net_income_bn")
+    if reported is None:
+        return bool(signal.get("special_item_detected"))
+    if not bool(signal.get("special_item_detected")):
+        return False
+    gap = abs(float(adjusted) - float(reported))
+    gap_threshold = max(0.35, float(revenue_bn or 0.0) * 0.08)
+    if gap < gap_threshold:
+        return False
+    if abs(float(reported)) < 1e-6:
+        return True
+    ratio = abs(float(adjusted)) / max(abs(float(reported)), 1e-6)
+    if ratio >= 1.35:
+        return True
+    if revenue_bn not in (None, 0):
+        reported_margin = abs(float(reported)) / float(revenue_bn)
+        adjusted_margin = abs(float(adjusted)) / float(revenue_bn)
+        if reported_margin <= 0.12 and adjusted_margin >= reported_margin + 0.08:
+            return True
+    return False
+
+
 def _extract_narrative_eps(flat_text: str) -> tuple[Optional[float], Optional[float]]:
     patterns = [
         r"(?:diluted\s+)?earnings per share(?:\s+\(gaap\))?(?:\s+(?:was|were|of))?\s+\$?(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<context>.{0,120})",
@@ -6570,52 +6739,67 @@ def _parse_generic(
     net_income_bn = None
     net_income_yoy_pct = None
     gaap_eps = None
+    non_gaap_eps = None
     gaap_eps_yoy_pct = None
     gross_margin_pct = None
     operating_cash_flow_bn = None
     free_cash_flow_bn = None
+    profit_signal: dict[str, Any] = {}
 
     for material in metric_materials:
         flat = material["flat_text"]
+        profit_signal = _merge_profit_signal(profit_signal, _extract_profit_signal(flat))
         if revenue_bn is None:
-            revenue_bn, revenue_yoy_pct = _extract_narrative_metric(
+            revenue_bn, revenue_yoy_pct = _extract_company_level_narrative_metric(
                 flat,
-                r"(?:total\s+)?(?:net\s+)?(?:revenue|revenues|sales)",
+                r"(?:net operating\s+revenue|total\s+net\s+revenue|total\s+revenue(?:s)?|net\s+revenue(?:s)?|revenue(?:s)?|sales)",
             )
         if operating_income_bn is None:
-            operating_income_bn, _ = _extract_narrative_metric(flat, r"(?:operating income|income from operations)")
-        if net_income_bn is None:
-            net_income_bn, net_income_yoy_pct = _extract_narrative_metric(
-                flat,
-                r"(?:net income|net earnings|earnings attributable to [A-Za-z& .]+)",
+            operating_income_bn, _ = _extract_company_level_narrative_metric(flat, r"(?:operating income|income from operations)")
+        if net_income_bn is None and profit_signal.get("reported_net_income_bn") is not None:
+            net_income_bn = float(profit_signal["reported_net_income_bn"])
+            net_income_yoy_pct = _pct_change(
+                profit_signal.get("reported_net_income_bn"),
+                profit_signal.get("reported_prior_net_income_bn"),
             )
         if gaap_eps is None:
-            gaap_eps, gaap_eps_yoy_pct = _extract_narrative_eps(flat)
+            if profit_signal.get("reported_eps") is not None:
+                gaap_eps = float(profit_signal["reported_eps"])
+                gaap_eps_yoy_pct = _pct_change(
+                    profit_signal.get("reported_eps"),
+                    profit_signal.get("reported_prior_eps"),
+                )
+            else:
+                gaap_eps, gaap_eps_yoy_pct = _extract_narrative_eps(flat)
+        if non_gaap_eps is None and profit_signal.get("adjusted_eps") is not None:
+            non_gaap_eps = float(profit_signal["adjusted_eps"])
         if gross_margin_pct is None:
             gross_margin_pct = _extract_pct_metric(flat, ["Gross margin", "gross margin"])
         if operating_cash_flow_bn is None:
-            operating_cash_flow_bn, _ = _extract_narrative_metric(
+            operating_cash_flow_bn, _ = _extract_company_level_narrative_metric(
                 flat,
                 r"(?:operating cash flow|cash flow from operations|net cash provided by operating activities)",
             )
         if free_cash_flow_bn is None:
-            free_cash_flow_bn, _ = _extract_narrative_metric(flat, r"(?:free cash flow)")
+            free_cash_flow_bn, _ = _extract_company_level_narrative_metric(flat, r"(?:free cash flow)")
 
     if quarterly_sec is not None:
         sec_flat = quarterly_sec["flat_text"]
-        revenue_bn = revenue_bn or _extract_table_metric(
+        table_revenue_bn, table_revenue_prior_bn, table_revenue_yoy_pct = _extract_table_metric(
             sec_flat,
             ["Total revenue", "Total revenues", "Total net sales", "Net sales", "Net revenues", "Revenue", "Revenues"],
-        )[0]
-        revenue_yoy_pct = revenue_yoy_pct or _extract_table_metric(
-            sec_flat,
-            ["Total revenue", "Total revenues", "Total net sales", "Net sales", "Net revenues", "Revenue", "Revenues"],
-        )[2]
+        )
+        if table_revenue_bn is not None:
+            revenue_bn = table_revenue_bn
+        if revenue_yoy_pct is None and table_revenue_yoy_pct is not None:
+            revenue_yoy_pct = table_revenue_yoy_pct
+        elif revenue_yoy_pct is None:
+            revenue_yoy_pct = _pct_change(table_revenue_bn, table_revenue_prior_bn)
         operating_income_bn = operating_income_bn or _extract_table_metric(
             sec_flat,
             ["Operating income", "Income from operations"],
         )[0]
-        net_income_bn = net_income_bn or _extract_table_metric(
+        table_net_income_bn, table_net_income_prior_bn, table_net_income_yoy_pct = _extract_table_metric(
             sec_flat,
             [
                 "Net income",
@@ -6625,19 +6809,11 @@ def _parse_generic(
                 "Net income attributable to common shareholders",
                 "Net income attributable to Berkshire Hathaway shareholders",
             ],
-        )[0]
+        )
+        if net_income_bn is None and table_net_income_bn is not None:
+            net_income_bn = table_net_income_bn
         if net_income_yoy_pct is None:
-            net_income_yoy_pct = _extract_table_metric(
-                sec_flat,
-                [
-                    "Net income",
-                    "Net income available to common shareholders",
-                    "Net income attributable to Walmart",
-                    "Net income attributable to Costco",
-                    "Net income attributable to common shareholders",
-                    "Net income attributable to Berkshire Hathaway shareholders",
-                ],
-            )[2]
+            net_income_yoy_pct = table_net_income_yoy_pct if table_net_income_yoy_pct is not None else _pct_change(table_net_income_bn, table_net_income_prior_bn)
         if gross_margin_pct is None:
             gross_margin_pct = _extract_pct_metric(sec_flat, ["Gross margin", "gross margin"])
             if gross_margin_pct is None:
@@ -6654,6 +6830,32 @@ def _parse_generic(
         if gaap_eps is None:
             gaap_eps, prior_eps = _per_share_row(sec_flat, "Diluted")
             gaap_eps_yoy_pct = _pct_change(gaap_eps, prior_eps)
+        if non_gaap_eps is None and profit_signal.get("adjusted_eps") is not None:
+            non_gaap_eps = float(profit_signal["adjusted_eps"])
+
+    uses_adjusted_profit = _should_prefer_adjusted_profit_signal(profit_signal, revenue_bn)
+    if uses_adjusted_profit:
+        adjusted_net_income_bn = profit_signal.get("adjusted_net_income_bn")
+        if adjusted_net_income_bn is not None:
+            net_income_bn = float(adjusted_net_income_bn)
+            adjusted_yoy_pct = _pct_change(
+                profit_signal.get("adjusted_net_income_bn"),
+                profit_signal.get("adjusted_prior_net_income_bn"),
+            )
+            if adjusted_yoy_pct is not None:
+                net_income_yoy_pct = adjusted_yoy_pct
+        if gaap_eps is None and profit_signal.get("reported_eps") is not None:
+            gaap_eps = float(profit_signal["reported_eps"])
+            gaap_eps_yoy_pct = _pct_change(
+                profit_signal.get("reported_eps"),
+                profit_signal.get("reported_prior_eps"),
+            )
+    elif net_income_bn is None and profit_signal.get("adjusted_net_income_bn") is not None:
+        net_income_bn = float(profit_signal["adjusted_net_income_bn"])
+        net_income_yoy_pct = _pct_change(
+            profit_signal.get("adjusted_net_income_bn"),
+            profit_signal.get("adjusted_prior_net_income_bn"),
+        )
 
     ending_equity_bn = _extract_ending_equity_bn(metric_materials)
     if ending_equity_bn is None and sec is not None:
@@ -6698,6 +6900,7 @@ def _parse_generic(
         "operating_cash_flow_bn": operating_cash_flow_bn,
         "free_cash_flow_bn": free_cash_flow_bn,
         "gaap_eps": gaap_eps,
+        "non_gaap_eps": non_gaap_eps,
         "gaap_eps_yoy_pct": gaap_eps_yoy_pct,
         "ending_equity_bn": ending_equity_bn,
         "segments": segments,
@@ -6707,11 +6910,21 @@ def _parse_generic(
         "driver": driver or "关键 KPI 已切到动态抓取的官方原文口径",
         "coverage_notes": [
             "当前公司的季度 KPI、结构与摘要已改为优先解析自动发现的官方 release / SEC filing，而不是依赖预写静态样本。"
-        ],
+        ]
+        + (
+            [
+                "当季官方材料同时披露 reported 与 adjusted 利润口径且存在特殊项目扰动时，系统会优先采用 adjusted 净利润做可比展示，并保留 EPS 口径区分。"
+            ]
+            if uses_adjusted_profit
+            else []
+        ),
     }
     if revenue_bn is None and net_income_bn is None:
         return {}
-    return _finalize(company, fallback, facts, materials)
+    parsed = _finalize(company, fallback, facts, materials)
+    if uses_adjusted_profit:
+        parsed["profit_basis"] = "adjusted_special_items"
+    return parsed
 
 
 COMPANY_PARSERS = {

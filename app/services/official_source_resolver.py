@@ -1419,12 +1419,19 @@ def resolve_official_sources(
             return
         progress_callback(max(0.0, min(1.0, float(progress))), message)
 
+    source_config = dict(company.get("official_source") or {})
     existing_sources = list(existing_sources or [])
     cache_key = (
         str(company.get("id") or ""),
         str(calendar_quarter or ""),
         str(period_end or ""),
         bool(prefer_sec_only),
+        tuple(str(item).upper() for item in list(source_config.get("release_forms") or [])),
+        tuple(str(item).upper() for item in list(source_config.get("filing_forms") or [])),
+        tuple(str(item).lower() for item in list(source_config.get("release_document_hints") or [])),
+        tuple(str(item).lower() for item in list(source_config.get("release_document_excludes") or [])),
+        tuple(str(item).lower() for item in list(source_config.get("filing_document_hints") or [])),
+        tuple(str(item).lower() for item in list(source_config.get("filing_document_excludes") or [])),
         tuple(
             (
                 str(item.get("url") or ""),
@@ -1439,7 +1446,6 @@ def resolve_official_sources(
     if not refresh and cache_key in RESOLVED_SOURCES_MEMORY_CACHE:
         notify(1.0, "已复用进程内官方源发现缓存。")
         return copy.deepcopy(RESOLVED_SOURCES_MEMORY_CACHE[cache_key])
-    source_config = dict(company.get("official_source") or {})
     sec_cik = _sec_cik_for_calendar_quarter(source_config, calendar_quarter)
     sitemap_urls = [str(item).strip() for item in list(source_config.get("discovery_sitemaps") or []) if str(item).strip()]
     if os.environ.get(DISABLE_FETCH_ENV) == "1":
