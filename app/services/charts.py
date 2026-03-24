@@ -2597,6 +2597,34 @@ def _entry_structure_items(entry: dict[str, object]) -> tuple[list[dict[str, obj
     return [], None
 
 
+def _normalized_entry_structure_items(entry: dict[str, object]) -> tuple[list[dict[str, object]], Optional[str]]:
+    items, basis = _entry_structure_items(entry)
+    if not items:
+        return [], basis
+    value_total = sum(float(item.get("value_bn") or 0.0) for item in items if item.get("value_bn") is not None)
+    share_total = sum(float(item.get("share_pct") or 0.0) for item in items if item.get("share_pct") is not None)
+    normalized: list[dict[str, object]] = []
+    if value_total > 0:
+        for item in items:
+            value = float(item.get("value_bn") or 0.0)
+            if value <= 0:
+                continue
+            payload = dict(item)
+            payload["share_pct"] = value / value_total * 100
+            normalized.append(payload)
+        return normalized, basis
+    if share_total > 0:
+        for item in items:
+            share = float(item.get("share_pct") or 0.0)
+            if share <= 0:
+                continue
+            payload = dict(item)
+            payload["share_pct"] = share / share_total * 100
+            normalized.append(payload)
+        return normalized, basis
+    return [], basis
+
+
 def _dominant_history_structure_basis(entries: list[dict[str, object]]) -> str:
     observed = [
         basis
@@ -2797,7 +2825,14 @@ def render_structure_transition_svg(entries: list[dict[str, object]], colors: di
         f'<rect x="0" y="0" width="{width}" height="{height}" rx="28" fill="#FFFFFF"/>',
         '<text x="32" y="36" font-size="18" font-weight="700" fill="#0F172A">结构迁移与集中度变化</text>',
     ]
-    complete = all(_entry_structure_items(entry)[0] for entry in entries)
+    normalized_entries = [
+        {
+            **dict(entry),
+            "_normalized_structure_items": _normalized_entry_structure_items(entry)[0],
+        }
+        for entry in entries
+    ]
+    complete = all(list(entry.get("_normalized_structure_items") or []) for entry in normalized_entries)
     structure_basis = _dominant_history_structure_basis(entries)
     structure_label = "业务分部" if structure_basis != "geography" else "地区结构"
     if not complete:
@@ -2818,13 +2853,13 @@ def render_structure_transition_svg(entries: list[dict[str, object]], colors: di
     chart_height = 190
     step_x = chart_width / max(1, len(entries))
     bar_width = step_x * 0.66
-    latest_items = _entry_structure_items(entries[-1])[0]
+    latest_items = list(normalized_entries[-1].get("_normalized_structure_items") or [])
     segment_names = [str(segment.get("name") or "Business") for segment in latest_items]
     palette = _segment_palette(segment_names, colors, primary)
-    for index, entry in enumerate(entries):
+    for index, entry in enumerate(normalized_entries):
         x = left + index * step_x + step_x * 0.17
         y_cursor = top + chart_height
-        for segment in _entry_structure_items(entry)[0]:
+        for segment in list(entry.get("_normalized_structure_items") or []):
             share_pct = float(segment["share_pct"])
             part_height = share_pct / 100 * chart_height
             y_cursor -= part_height
@@ -2834,8 +2869,8 @@ def render_structure_transition_svg(entries: list[dict[str, object]], colors: di
         body.append(
             f'<text x="{x + bar_width/2:.1f}" y="{top+chart_height+22:.1f}" text-anchor="middle" font-size="11" fill="#64748B">{_escape(str(entry["quarter_label"]))}</text>'
         )
-    first = max(_entry_structure_items(entries[0])[0], key=lambda item: float(item.get("share_pct") or 0.0))
-    last = max(_entry_structure_items(entries[-1])[0], key=lambda item: float(item.get("share_pct") or 0.0))
+    first = max(list(normalized_entries[0].get("_normalized_structure_items") or []), key=lambda item: float(item.get("share_pct") or 0.0))
+    last = max(list(normalized_entries[-1].get("_normalized_structure_items") or []), key=lambda item: float(item.get("share_pct") or 0.0))
     legend_items = segment_names[:6]
     legend_rows = 1 if len(legend_items) <= 3 else 2
     legend_y = 280 if legend_rows == 1 else 266

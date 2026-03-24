@@ -20,7 +20,7 @@ from scripts import audit_dynamic_reports
 from app.config import DATA_DIR
 from app.db import init_db
 from app.main import app
-from app.services.charts import render_income_statement_svg, render_statement_translation_svg
+from app.services.charts import render_income_statement_svg, render_statement_translation_svg, render_structure_transition_svg
 from app.services.local_data import get_company, get_quarter_fixture
 from app.services.local_data import _build_companyfacts_series
 from app.services.local_data import get_supported_quarters
@@ -2576,6 +2576,31 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertEqual(payload["narrative_provenance"]["qna"]["status"], "official_material_inferred")
         self.assertEqual(payload["call_panel"]["title"], "当前无完整电话会实录，展示推断问答主题")
         self.assertIn("当前没有完整 transcript", payload["section_meta"]["management_qna"]["note"])
+
+    def test_structure_transition_chart_normalizes_each_quarter_to_ratio_view(self) -> None:
+        svg = render_structure_transition_svg(
+            [
+                {
+                    "quarter_label": "2024Q1",
+                    "segments": [
+                        {"name": "A", "value_bn": 60.0, "share_pct": 75.0},
+                        {"name": "B", "value_bn": 40.0, "share_pct": 50.0},
+                    ],
+                    "structure_basis": "segment",
+                },
+                {
+                    "quarter_label": "2024Q2",
+                    "segments": [
+                        {"name": "A", "value_bn": 55.0, "share_pct": 70.0},
+                        {"name": "B", "value_bn": 45.0, "share_pct": 55.0},
+                    ],
+                    "structure_basis": "segment",
+                },
+            ],
+            {"A": "#111827", "B": "#2563EB"},
+            "#2563EB",
+        )
+        self.assertIn("头部业务分部占比：A 60.0% → A 55.0%", svg)
 
     @patch("app.services.institutional_views._fetch_rss")
     def test_institutional_views_extract_head_firms(self, mock_fetch_rss: object) -> None:
