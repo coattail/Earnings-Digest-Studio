@@ -64,7 +64,7 @@ REPORT_JOB_FUTURES_LOCK = threading.Lock()
 ProgressCallback = Callable[[float, str, str], None]
 RECENT_REPORT_CACHE_TTL_SECONDS = 6 * 60 * 60
 HISTORICAL_REPORT_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
-REPORT_PAYLOAD_SCHEMA_VERSION = 16
+REPORT_PAYLOAD_SCHEMA_VERSION = 19
 FULL_COVERAGE_ENV = "EARNINGS_DIGEST_REQUIRE_FULL_COVERAGE"
 FULL_COVERAGE_READY_MAP_PATH = APP_DIR.parent / "data" / "cache" / "full-coverage-ready-quarters.json"
 HISTORICAL_OFFICIAL_QUARTER_CACHE_DIR = CACHE_DIR / "historical-official-quarter-cache"
@@ -958,7 +958,17 @@ def _excerpt_text(text: Optional[str], limit: int) -> str:
     normalized = re.sub(r"\s+", " ", str(text or "")).strip()
     if len(normalized) <= limit:
         return normalized
-    return normalized[: limit - 1].rstrip(" ,.;:") + "..."
+    search_window = normalized[: limit + 1]
+    preferred_cutoff = max(
+        search_window.rfind(token)
+        for token in ("。", "！", "？", "；", ".", "!", "?", ";", "，", ",", " ")
+    )
+    minimum_boundary = max(12, int(limit * 0.55))
+    if preferred_cutoff >= minimum_boundary:
+        if search_window[preferred_cutoff] == " ":
+            return search_window[:preferred_cutoff].rstrip(" ,.;:，；")
+        return search_window[: preferred_cutoff + 1].rstrip(" ,.;:，；")
+    return normalized[:limit].rstrip(" ,.;:，；")
 
 
 def _parse_iso_date(value: Optional[str]) -> Optional[date]:
@@ -982,18 +992,118 @@ def _historical_official_cache_is_temporally_aligned(
     if period_end is None:
         return True
     delta_days = (source_date - period_end).days
+    current_segments = [item for item in list(cached_payload.get("current_segments") or []) if isinstance(item, dict)]
+    current_geographies = [item for item in list(cached_payload.get("current_geographies") or []) if isinstance(item, dict)]
+    latest_kpis = dict(cached_payload.get("latest_kpis") or {})
+    if (
+        not latest_kpis
+        and not current_segments
+        and current_geographies
+        and all(
+            str(item.get("scope") or "").casefold() in {"annual_filing", "quarterly_mapped_from_official_geography"}
+            for item in current_geographies
+        )
+    ):
+        # Geography-only annual fallbacks are intentionally borrowed from the
+        # nearest annual filing and stay useful longer than quarter-exact KPI caches.
+        return -400 <= delta_days <= 820
     return -30 <= delta_days <= 220
 
 
+def _salvage_stale_historical_cache_structures(
+    company: dict[str, Any],
+    entry: dict[str, Any],
+    cached_payload: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    if entry.get("revenue_bn") in (None, 0) or entry.get("net_income_bn") is None:
+        return None
+    if entry.get("segments") and entry.get("geographies"):
+        return None
+    current_segments = [dict(item) for item in list(cached_payload.get("current_segments") or []) if isinstance(item, dict)]
+    current_geographies = [dict(item) for item in list(cached_payload.get("current_geographies") or []) if isinstance(item, dict)]
+    if not current_segments and not current_geographies:
+        return None
+    trusted_revenue = entry.get("revenue_bn")
+    has_segments = bool(_normalize_historical_segments(company, current_segments, trusted_revenue))
+    has_geographies = bool(_normalize_historical_geographies(current_geographies, trusted_revenue))
+    if not has_segments and not has_geographies:
+        return None
+    return {
+        "latest_kpis": {},
+        "current_segments": current_segments,
+        "current_geographies": current_geographies,
+        "source_url": "",
+        "source_date": "",
+        "profit_basis": cached_payload.get("profit_basis"),
+        "structure_only_from_stale_cache": True,
+    }
+
+
 def _prepare_call_quote_cards(cards: list[dict[str, Any]]) -> list[dict[str, str]]:
+    def has_cjk(text: str) -> bool:
+        return bool(re.search(r"[\u4e00-\u9fff]", text))
+
+    def looks_english(text: str) -> bool:
+        stripped = str(text or "").strip()
+        if not stripped:
+            return False
+        latin_count = sum(char.isascii() and char.isalpha() for char in stripped)
+        return latin_count >= 6 and not has_cjk(stripped)
+
+    def localize_speaker(value: str) -> str:
+        normalized = re.sub(r"\s+", " ", str(value or "")).strip()
+        lowered = normalized.casefold()
+        if not normalized:
+            return "管理层"
+        if has_cjk(normalized):
+            return normalized
+        if lowered in {"management", "management context"}:
+            return "管理层"
+        if lowered == "guidance context":
+            return "指引语境"
+        if re.fullmatch(r"[A-Za-z][A-Za-z .,'-]{1,80}", normalized):
+            return normalized
+        return "管理层原话"
+
+    def localize_source_label(value: str) -> str:
+        normalized = re.sub(r"\s+", " ", str(value or "")).strip()
+        lowered = normalized.casefold()
+        if not normalized:
+            return "官方材料"
+        if has_cjk(normalized):
+            return normalized
+        if "earnings release" in lowered or "quarterly results" in lowered:
+            return "财报新闻稿"
+        if "shareholder deck" in lowered or "update deck" in lowered or "presentation" in lowered:
+            return "演示材料"
+        if "transcript" in lowered or "call summary" in lowered or "earnings call" in lowered:
+            return "电话会材料"
+        if any(token in lowered for token in ("form 10-q", "form 10-k", "8-k", "6-k", "20-f", "sec filing")):
+            return "SEC 文件"
+        if "official materials" in lowered:
+            return "官方材料"
+        if "system coverage note" in lowered:
+            return "系统覆盖说明"
+        return "官方材料"
+
     prepared: list[dict[str, str]] = []
     for index, item in enumerate(cards[:3]):
+        speaker = re.sub(r"\s+", " ", str(item.get("speaker") or "Management")).strip()
+        quote = re.sub(r"\s+", " ", str(item.get("quote") or "")).strip()
+        analysis = re.sub(r"\s+", " ", str(item.get("analysis") or "")).strip()
+        source_label = re.sub(r"\s+", " ", str(item.get("source_label") or "")).strip()
+        if looks_english(quote) and has_cjk(analysis):
+            display_quote = analysis
+            display_detail = ""
+        else:
+            display_quote = quote or analysis
+            display_detail = analysis if analysis and analysis != display_quote else ""
         prepared.append(
             {
-                "speaker": re.sub(r"\s+", " ", str(item.get("speaker") or "Management")).strip(),
-                "quote": re.sub(r"\s+", " ", str(item.get("quote") or "")).strip(),
-                "analysis": re.sub(r"\s+", " ", str(item.get("analysis") or "")).strip(),
-                "source_label": re.sub(r"\s+", " ", str(item.get("source_label") or "")).strip(),
+                "speaker": localize_speaker(speaker),
+                "quote": display_quote,
+                "analysis": display_detail,
+                "source_label": localize_source_label(source_label),
             }
         )
     return prepared
@@ -1086,7 +1196,7 @@ def _compose_summary_headline(
         guidance_label = "下一季指引中枢" if guidance.get("mode") == "official" else "下一阶段收入参考"
         headline += f"；{guidance_label} {format_money_bn(guidance_revenue, money_symbol)}，较本季 {format_pct(guidance_delta, signed=True)}"
     elif guidance.get("mode") == "official_context" and guidance.get("commentary"):
-        headline += f"；{_excerpt_text(str(guidance.get('commentary') or ''), 28)}"
+        headline += "；管理层给出了下一阶段官方经营展望，详见指引页"
     return f"{headline}。"
 
 
@@ -1095,6 +1205,7 @@ def _build_layered_takeaways(
     fixture: dict[str, Any],
     history: list[dict[str, Any]],
     money_symbol: str,
+    merged_sources: list[dict[str, Any]],
 ) -> list[dict[str, str]]:
     latest = history[-1]
     latest_kpis = fixture["latest_kpis"]
@@ -1139,18 +1250,27 @@ def _build_layered_takeaways(
             f"{guidance.get('comparison_label') or ('下一季收入指引' if guidance.get('mode') == 'official' else '下一阶段收入参考')}较本季 {format_pct(next_delta, signed=True)}"
         )
     elif guidance.get("commentary"):
-        next_parts.append(_excerpt_text(str(guidance.get("commentary") or ""), 44))
+        next_parts.append(_excerpt_text(str(guidance.get("commentary") or ""), 84))
     next_body = "；".join(part for part in next_parts if part)
     if next_body and not next_body.endswith("。"):
         next_body += "。"
     if not next_body:
         next_body = "继续跟踪下一阶段收入基线、利润率方向与管理层语气是否同步改善。"
 
-    return [
+    takeaways = [
         {"title": "发生了什么", "body": "，".join(part for part in happened if part) + "。"},
         {"title": "为什么重要", "body": why_body},
         {"title": "接下来怎么看", "body": next_body},
     ]
+    for item in takeaways:
+        source_anchor, verification = _layered_takeaway_anchor(
+            str(item.get("title") or ""),
+            merged_sources=merged_sources,
+            guidance=guidance,
+        )
+        item["source_anchor"] = source_anchor
+        item["verification"] = verification
+    return takeaways
 
 
 def _build_expectation_panel(
@@ -1203,13 +1323,13 @@ def _build_expectation_panel(
         )
     commentary = _clean_summary_fragment(str(guidance.get("commentary") or ""))
     if commentary:
-        bullets.append(_excerpt_text(commentary, 82) + ("。" if not commentary.endswith("。") else ""))
+        bullets.append(commentary + ("。" if not commentary.endswith("。") else ""))
     if len(chips) < 3 and commentary:
         chips.append(
             {
                 "label": "官方语境",
                 "value": "管理层表述",
-                "note": _excerpt_text(commentary, 26),
+                "note": "详见本页原文整理",
             }
         )
     if not bullets:
@@ -2205,7 +2325,7 @@ def _enrich_history_with_official_structures(
         period = str(entry["quarter_label"])
         cached_parsed = _load_historical_official_quarter_cache(str(company["id"]), period)
         if cached_parsed is not None and not _historical_official_cache_is_temporally_aligned(entry, cached_parsed):
-            cached_parsed = None
+            cached_parsed = _salvage_stale_historical_cache_structures(company, entry, cached_parsed)
         if cached_parsed is None:
             fixture = get_quarter_fixture(str(company["id"]), period)
             base_sources = list(fixture.get("sources") or []) if fixture else []
@@ -2245,6 +2365,7 @@ def _enrich_history_with_official_structures(
             }
             _store_historical_official_quarter_cache(str(company["id"]), period, cached_parsed)
         latest_kpis = dict(cached_parsed.get("latest_kpis") or {})
+        stale_structure_only = bool(cached_parsed.get("structure_only_from_stale_cache"))
         profit_basis = str(cached_parsed.get("profit_basis") or "")
         if profit_basis == "adjusted_special_items" and latest_kpis.get("net_income_bn") is not None:
             net_income_bn = latest_kpis.get("net_income_bn")
@@ -2329,11 +2450,14 @@ def _enrich_history_with_official_structures(
         if parsed_geographies:
             entry["geographies"] = parsed_geographies
         if (
-            latest_kpis.get("revenue_bn") is not None
-            or latest_kpis.get("net_income_bn") is not None
-            or latest_kpis.get("ending_equity_bn") is not None
-            or parsed_segments
-            or parsed_geographies
+            not stale_structure_only
+            and (
+                latest_kpis.get("revenue_bn") is not None
+                or latest_kpis.get("net_income_bn") is not None
+                or latest_kpis.get("ending_equity_bn") is not None
+                or parsed_segments
+                or parsed_geographies
+            )
         ):
             entry["source_type"] = "official_release"
         source_url = str(cached_parsed.get("source_url") or "")
@@ -2484,7 +2608,7 @@ def generate_historical_insights(
         insights.append(
             {
                 "title": "指引延续性",
-                "body": _excerpt_text(str(guidance.get("commentary") or ""), 118),
+                "body": _excerpt_text(str(guidance.get("commentary") or ""), 180),
                 "evidence": f"下一季收入指引 {format_money_bn(guidance.get('revenue_bn'), money_symbol)}。",
             }
         )
@@ -2492,7 +2616,7 @@ def generate_historical_insights(
         insights.append(
             {
                 "title": "管理层展望口径",
-                "body": _excerpt_text(str(guidance.get("commentary") or ""), 118),
+                "body": _excerpt_text(str(guidance.get("commentary") or ""), 180),
                 "evidence": "公司未给出数值 top-line 指引，因此本页以官方表述叠加经营基线阅读。",
             }
         )
@@ -2500,7 +2624,7 @@ def generate_historical_insights(
         insights.append(
             {
                 "title": "经营基线对照",
-                "body": _excerpt_text(str(guidance.get("commentary") or ""), 118),
+                "body": _excerpt_text(str(guidance.get("commentary") or ""), 180),
                 "evidence": f"基线收入 {format_money_bn(guidance.get('revenue_bn'), money_symbol)}。",
             }
         )
@@ -2670,7 +2794,7 @@ def _transcript_highlights(text: str) -> list[str]:
         else:
             fallback.append(chunk)
     selected = preferred[:3] if preferred else fallback[:3]
-    return [_excerpt_text(item, 260) for item in selected[:3]]
+    return [_excerpt_text(item, 360) for item in selected[:3]]
 
 
 def _automatic_transcript_summary(source_materials: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -2742,6 +2866,285 @@ def _merge_sources_with_materials(
         material = material_lookup.get((str(source.get("url") or ""), str(source.get("label") or "")))
         merged.append({**source, "material": material})
     return merged
+
+
+def _parse_calendar_quarter_token(value: Optional[str]) -> Optional[tuple[int, int]]:
+    match = re.fullmatch(r"(\d{4})Q([1-4])", str(value or "").strip())
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _shift_calendar_quarter(value: Optional[str], delta: int) -> Optional[str]:
+    parsed = _parse_calendar_quarter_token(value)
+    if parsed is None:
+        return None
+    year, quarter = parsed
+    ordinal = year * 4 + (quarter - 1) + int(delta)
+    if ordinal < 0:
+        return None
+    shifted_year, shifted_index = divmod(ordinal, 4)
+    return f"{shifted_year}Q{shifted_index + 1}"
+
+
+def _source_material_is_ready(source: Optional[dict[str, Any]]) -> bool:
+    material = (source or {}).get("material") or {}
+    return str(material.get("status") or "") in {"fetched", "cached"}
+
+
+def _pick_best_source(
+    sources: list[dict[str, Any]],
+    *,
+    preferred_kinds: tuple[str, ...] = (),
+    preferred_roles: tuple[str, ...] = (),
+) -> Optional[dict[str, Any]]:
+    if not sources:
+        return None
+
+    def score(source: dict[str, Any]) -> tuple[int, int, int, int, str]:
+        kind = str(source.get("kind") or "")
+        role = str(source.get("role") or "")
+        label = str(source.get("label") or "").strip().lower()
+        kind_rank = len(preferred_kinds) - preferred_kinds.index(kind) if kind in preferred_kinds else 0
+        role_rank = len(preferred_roles) - preferred_roles.index(role) if role in preferred_roles else 0
+        ready_rank = 2 if _source_material_is_ready(source) else 1 if source.get("url") else 0
+        readable_label_rank = 0 if any(token in label for token in (".htm", ".html", ".txt", ".pdf", "ex99", "8-k")) else 1
+        date_rank = 0
+        parsed_date = _parse_iso_date(str(source.get("date") or ""))
+        if parsed_date is not None:
+            date_rank = parsed_date.toordinal()
+        return kind_rank, role_rank, ready_rank, readable_label_rank, f"{date_rank:08d}"
+
+    return max(sources, key=score, default=None)
+
+
+def _format_source_anchor(source: Optional[dict[str, Any]], fallback: str = "结构化季度财务序列") -> str:
+    if not source:
+        return fallback
+    label = str(source.get("label") or "").strip()
+    material = source.get("material") or {}
+    material_title = str(material.get("title") or "").strip()
+    generic_titles = {"document", "source", "material", "filing"}
+    if (
+        material_title
+        and material_title.casefold() not in generic_titles
+        and (not label or ".htm" in label.lower() or len(material_title) + 12 < len(label))
+    ):
+        label = material_title
+    if not label:
+        label = fallback
+    date_text = str(source.get("date") or "").strip()
+    return f"{label} | {date_text}" if date_text else label
+
+
+def _guidance_mode_label(mode: str) -> str:
+    return {
+        "official": "官方数值指引",
+        "official_context": "官方展望语境",
+        "proxy": "经营基线对照",
+    }.get(str(mode or "proxy"), "经营口径")
+
+
+def _layered_takeaway_anchor(
+    title: str,
+    *,
+    merged_sources: list[dict[str, Any]],
+    guidance: dict[str, Any],
+) -> tuple[str, str]:
+    if title == "发生了什么":
+        source = _pick_best_source(
+            merged_sources,
+            preferred_kinds=("official_release", "sec_filing", "presentation", "structured_financials"),
+            preferred_roles=("earnings_release",),
+        )
+        return _format_source_anchor(source), "收入、净利润与同比/环比"
+    if title == "为什么重要":
+        source = _pick_best_source(
+            merged_sources,
+            preferred_kinds=("sec_filing", "presentation", "official_release", "structured_financials"),
+            preferred_roles=("earnings_release",),
+        )
+        return _format_source_anchor(source), "利润率、头部结构占比与近四季中枢"
+    if guidance.get("mode") == "official":
+        source = _pick_best_source(
+            merged_sources,
+            preferred_kinds=("official_release", "sec_filing", "presentation"),
+            preferred_roles=("earnings_call", "earnings_release"),
+        )
+        return _format_source_anchor(source), "下一阶段收入口径与管理层语气"
+    if guidance.get("mode") == "official_context":
+        source = _pick_best_source(
+            merged_sources,
+            preferred_kinds=("official_release", "presentation", "sec_filing"),
+            preferred_roles=("earnings_call", "earnings_release"),
+        )
+        return _format_source_anchor(source), "官方展望语境与经营基线"
+    source = _pick_best_source(
+        merged_sources,
+        preferred_kinds=("structured_financials", "official_release", "sec_filing"),
+    )
+    return _format_source_anchor(source), "经营基线、收入中枢与利润率方向"
+
+
+def _build_guidance_change_panel(
+    company_id: str,
+    calendar_quarter: str,
+    fixture: dict[str, Any],
+    history: list[dict[str, Any]],
+    money_symbol: str,
+) -> dict[str, Any]:
+    guidance = dict(fixture.get("guidance") or {})
+    latest_kpis = dict(fixture.get("latest_kpis") or {})
+    current_mode = str(guidance.get("mode") or "proxy")
+    current_revenue = guidance.get("revenue_bn")
+    current_low = guidance.get("revenue_low_bn")
+    current_high = guidance.get("revenue_high_bn")
+    current_margin = guidance.get("gaap_gross_margin_pct") or guidance.get("adjusted_ebitda_margin_pct")
+    current_actual = _value_or_history(latest_kpis.get("revenue_bn"), history[-1].get("revenue_bn") if history else None)
+    previous_actual = history[-2].get("revenue_bn") if len(history) > 1 else None
+    previous_quarter = _shift_calendar_quarter(calendar_quarter, -1)
+    previous_fixture = get_quarter_fixture(company_id, previous_quarter) if previous_quarter else None
+    bullets: list[str] = []
+    source_anchor = ""
+
+    if previous_fixture:
+        previous_guidance = dict(previous_fixture.get("guidance") or {})
+        previous_mode = str(previous_guidance.get("mode") or "proxy")
+        previous_revenue = previous_guidance.get("revenue_bn")
+        previous_low = previous_guidance.get("revenue_low_bn")
+        previous_high = previous_guidance.get("revenue_high_bn")
+        previous_margin = previous_guidance.get("gaap_gross_margin_pct") or previous_guidance.get("adjusted_ebitda_margin_pct")
+        previous_label = str(previous_fixture.get("fiscal_label") or previous_quarter)
+        current_label = str(fixture.get("fiscal_label") or calendar_quarter)
+        source_anchor = f"对照 {previous_label} 与 {current_label} 两期管理层口径"
+
+        if previous_revenue is not None and current_actual not in (None, 0):
+            realized_delta = (float(current_actual) / float(previous_revenue) - 1) * 100
+            bullets.append(
+                f"{previous_label} 时管理层给出的本季收入口径约 {format_money_bn(previous_revenue, money_symbol)}，"
+                f"本季实际为 {format_money_bn(current_actual, money_symbol)}，兑现 {format_pct(realized_delta, signed=True)}。"
+            )
+        elif previous_low is not None and previous_high is not None and current_actual is not None:
+            bullets.append(
+                f"{previous_label} 给出的本季收入区间为 {format_money_bn(previous_low, money_symbol)} 到 "
+                f"{format_money_bn(previous_high, money_symbol)}，当前已可直接对照本季实际是否落在区间内。"
+            )
+
+        if current_revenue is not None and previous_revenue is not None:
+            delta = (float(current_revenue) / float(previous_revenue) - 1) * 100
+            bullets.append(
+                f"本次下一阶段收入口径 {format_money_bn(current_revenue, money_symbol)}，相对上一季管理层给出的下一阶段口径 "
+                f"{format_money_bn(previous_revenue, money_symbol)} 变化 {format_pct(delta, signed=True)}。"
+            )
+        elif current_low is not None and current_high is not None and previous_low is not None and previous_high is not None:
+            current_mid = (float(current_low) + float(current_high)) / 2
+            previous_mid = (float(previous_low) + float(previous_high)) / 2
+            delta = (current_mid / previous_mid - 1) * 100 if previous_mid else 0.0
+            bullets.append(
+                f"本次收入指引区间中枢约 {format_money_bn(current_mid, money_symbol)}，上一季对应口径中枢约 "
+                f"{format_money_bn(previous_mid, money_symbol)}，顺序变化 {format_pct(delta, signed=True)}。"
+            )
+
+        if current_mode != previous_mode:
+            bullets.append(
+                f"披露口径已从{_guidance_mode_label(previous_mode)}切换为{_guidance_mode_label(current_mode)}，"
+                "说明管理层在这一季愿意给出的前瞻信息密度发生了变化。"
+            )
+        elif current_margin is not None and previous_margin is not None:
+            margin_delta = float(current_margin) - float(previous_margin)
+            bullets.append(
+                f"利润率口径从 {format_pct(previous_margin)} 变化到 {format_pct(current_margin)}，"
+                f"边际变化 {format_pct(margin_delta, signed=True)}。"
+            )
+
+    if not bullets:
+        source_anchor = "当前以历史序列与本季官方材料做方向性对照"
+        if current_revenue is not None and previous_actual not in (None, 0):
+            sequential_delta = (float(current_revenue) / float(previous_actual) - 1) * 100
+            bullets.append(
+                f"上一自然季度实际收入为 {format_money_bn(previous_actual, money_symbol)}，当前下一阶段口径约 "
+                f"{format_money_bn(current_revenue, money_symbol)}，顺序变化 {format_pct(sequential_delta, signed=True)}。"
+            )
+        bullets.append(
+            "上一季官方指引缓存尚未就绪时，本页先对照上一季实际与当前管理层口径，判断方向是上修、持平还是收缩。"
+        )
+        if current_mode != "official":
+            bullets.append(
+                f"当前口径仍属于{_guidance_mode_label(current_mode)}，因此更适合看方向与语气，而不是把它当成精确市场一致预期。"
+            )
+
+    return {
+        "title": "相对上一季口径变化",
+        "bullets": bullets[:3],
+        "source_anchor": source_anchor,
+    }
+
+
+def _signal_bucket(label: str, note: str) -> str:
+    combined = f"{label} {note}".lower()
+    if any(token in combined for token in ("利润", "毛利", "净利", "margin", "盈利", "费用", "杠杆")):
+        return "margin"
+    if any(token in combined for token in ("结构", "披露", "集中", "mix", "地区", "分部")):
+        return "structure"
+    return "growth"
+
+
+def _build_signal_scenarios(
+    items: list[dict[str, Any]],
+    *,
+    direction: str,
+    latest: dict[str, Any],
+    history: list[dict[str, Any]],
+    guidance: dict[str, Any],
+    source_anchor: str,
+    money_symbol: str,
+) -> list[dict[str, str]]:
+    baseline = _build_generic_guidance(history)
+    revenue_reference = guidance.get("revenue_bn") or baseline.get("revenue_bn") or latest.get("revenue_bn")
+    margin_reference = (
+        guidance.get("gaap_gross_margin_pct")
+        or guidance.get("adjusted_ebitda_margin_pct")
+        or baseline.get("gaap_gross_margin_pct")
+        or latest.get("gross_margin_pct")
+        or latest.get("net_margin_pct")
+    )
+    scenarios: list[dict[str, str]] = []
+    for item in list(items or [])[:2]:
+        label = str(item.get("label") or "").strip()
+        note = re.sub(r"\s+", " ", str(item.get("note") or "")).strip()
+        bucket = _signal_bucket(label, note)
+        if direction == "risk":
+            if bucket == "margin":
+                trigger = f"若利润率重新掉到 {format_pct(margin_reference)} 下方，或费用率继续抬升。"
+                verify = "重点看毛利率、经营利润率、费用率与现金兑现是否同步转弱。"
+            elif bucket == "structure":
+                trigger = "若头部业务或地区继续过度集中，而第二曲线没有接上。"
+                verify = "重点看头部结构占比、次主线增速与管理层是否补充结构解释。"
+            else:
+                trigger = f"若下一阶段收入落到 {format_money_bn(revenue_reference, money_symbol)} 下方，或同比继续放缓。"
+                verify = "重点看收入同比/环比、头部业务增速与需求相关原文表述。"
+            impact = note or "若该风险兑现，收入中枢和利润预期都可能被下修。"
+        else:
+            if bucket == "margin":
+                trigger = f"若利润率能够站稳在 {format_pct(margin_reference)} 附近并继续改善。"
+                verify = "重点看毛利率、经营利润率、现金流与费用纪律是否同向改善。"
+            elif bucket == "structure":
+                trigger = "若头部业务继续增长，同时第二增长曲线开始接力。"
+                verify = "重点看分部/地区结构迁移、增量贡献与管理层结构口径。"
+            else:
+                trigger = f"若下一阶段收入高于 {format_money_bn(revenue_reference, money_symbol)}，且主线业务继续提速。"
+                verify = "重点看收入增速、头部业务体量与 TTM 趋势是否同步上修。"
+            impact = note or "若该催化剂兑现，收入与利润中枢都有继续上修空间。"
+        scenarios.append(
+            {
+                "label": label or ("主要风险" if direction == "risk" else "主要催化剂"),
+                "trigger": trigger,
+                "impact": impact,
+                "verify": verify,
+                "source_anchor": source_anchor,
+            }
+        )
+    return scenarios
 
 
 def _source_material_warnings(source_materials: list[dict[str, Any]]) -> list[str]:
@@ -4177,13 +4580,42 @@ def build_report_payload(
     current_detail_cards = _build_current_detail_cards(company, fixture, history, structure_dimension, money_symbol)
     cash_panel = _build_cash_quality_panel(company, fixture, history[-1], money_symbol)
     guidance_panel = _build_guidance_panel(fixture, history[-1], money_symbol)
+    guidance_change_panel = _build_guidance_change_panel(company_id, calendar_quarter, fixture, history, money_symbol)
     expectation_panel = _build_expectation_panel(fixture, history, money_symbol)
     call_panel = _build_call_panel(fixture, transcript_summary, qna_topics, narrative_provenance)
     history_summary_cards = _build_history_summary_cards(history, money_symbol)
     takeaways = _normalize_takeaways(fixture["takeaways"], fixture["latest_kpis"], history[-1], money_symbol)
-    layered_takeaways = _build_layered_takeaways(company, fixture, history, money_symbol)
+    layered_takeaways = _build_layered_takeaways(company, fixture, history, money_symbol, merged_sources)
     institutional_digest = _build_institutional_digest(institutional_views)
     income_statement = _build_income_statement_snapshot(company, fixture, history)
+    risk_source = _pick_best_source(
+        merged_sources,
+        preferred_kinds=("official_release", "presentation", "sec_filing", "structured_financials"),
+        preferred_roles=("earnings_call", "earnings_release"),
+    )
+    catalyst_source = _pick_best_source(
+        merged_sources,
+        preferred_kinds=("official_release", "presentation", "sec_filing", "structured_financials"),
+        preferred_roles=("earnings_call", "earnings_release"),
+    )
+    risk_scenarios = _build_signal_scenarios(
+        list(fixture.get("risks") or []),
+        direction="risk",
+        latest=history[-1],
+        history=history,
+        guidance=fixture["guidance"],
+        source_anchor=_format_source_anchor(risk_source, narrative_provenance["risks"]["label"]),
+        money_symbol=money_symbol,
+    )
+    catalyst_scenarios = _build_signal_scenarios(
+        list(fixture.get("catalysts") or []),
+        direction="catalyst",
+        latest=history[-1],
+        history=history,
+        guidance=fixture["guidance"],
+        source_anchor=_format_source_anchor(catalyst_source, narrative_provenance["catalysts"]["label"]),
+        money_symbol=money_symbol,
+    )
     uses_official_context = _guidance_uses_official_context(fixture["guidance"])
     if fixture["guidance"]["mode"] == "official":
         guidance_title = "业绩指引页 · 下一季指引"
@@ -4328,6 +4760,7 @@ def build_report_payload(
         "guidance_title": guidance_title,
         "guidance_note": guidance_note,
         "guidance_panel": guidance_panel,
+        "guidance_change_panel": guidance_change_panel,
         "expectation_panel": expectation_panel,
         "current_segments": fixture["current_segments"],
         "current_geographies": fixture["current_geographies"],
@@ -4343,6 +4776,8 @@ def build_report_payload(
         "qna_themes": qna_topics,
         "risks": fixture["risks"],
         "catalysts": fixture["catalysts"],
+        "risk_scenarios": risk_scenarios,
+        "catalyst_scenarios": catalyst_scenarios,
         "evidence_cards": fixture["evidence_cards"],
         "transcript_summary": transcript_summary,
         "historical_cube": history,
@@ -4572,6 +5007,9 @@ def ensure_report_payload_defaults(payload: dict[str, Any]) -> dict[str, Any]:
             normalized["visuals"] = visuals
     if not isinstance(normalized.get("quality_report"), dict):
         normalized["quality_report"] = evaluate_report_payload(normalized)
+    normalized.setdefault("guidance_change_panel", {"title": "相对上一季口径变化", "bullets": [], "source_anchor": ""})
+    normalized.setdefault("risk_scenarios", [])
+    normalized.setdefault("catalyst_scenarios", [])
     return normalized
 
 

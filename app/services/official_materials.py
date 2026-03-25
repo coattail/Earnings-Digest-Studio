@@ -61,7 +61,17 @@ def _excerpt(text: str, limit: int = 240) -> str:
     normalized = _normalize_whitespace(text)
     if len(normalized) <= limit:
         return normalized
-    return normalized[: limit - 3].rstrip() + "..."
+    search_window = normalized[: limit + 1]
+    preferred_cutoff = max(
+        search_window.rfind(token)
+        for token in ("。", "！", "？", "；", ".", "!", "?", ";", "，", ",", " ")
+    )
+    minimum_boundary = max(36, int(limit * 0.55))
+    if preferred_cutoff >= minimum_boundary:
+        if search_window[preferred_cutoff] == " ":
+            return search_window[:preferred_cutoff].rstrip(" ,.;:，；")
+        return search_window[: preferred_cutoff + 1].rstrip(" ,.;:，；")
+    return normalized[:limit].rstrip(" ,.;:，；")
 
 
 def _html_to_text(raw_bytes: bytes) -> tuple[str, str]:
@@ -394,10 +404,101 @@ def _material_cache_is_fresh(source: dict[str, Any], cached: dict[str, Any]) -> 
     return age_seconds <= _material_cache_ttl_seconds(source, cached)
 
 
+def _material_text_quality_issue(
+    source: dict[str, Any],
+    *,
+    title: str,
+    text: str,
+    content_type: str,
+    suffix: str,
+) -> str:
+    normalized_text = _normalize_whitespace(text)
+    lowered = f"{str(title or '').lower()} {normalized_text.lower()}".strip()
+    if not normalized_text:
+        return "empty extracted text"
+
+    obvious_error_phrases = (
+        "access denied",
+        "forbidden",
+        "page not found",
+        "404 not found",
+        "request unsuccessful",
+        "temporarily unavailable",
+        "enable javascript",
+        "javascript is disabled",
+        "please turn javascript on",
+        "are you a robot",
+        "captcha",
+    )
+    for phrase in obvious_error_phrases:
+        if phrase in lowered:
+            return f"unusable source page: {phrase}"
+
+    kind = str(source.get("kind") or "").casefold()
+    role = str(source.get("role") or "").casefold()
+    if kind not in {"official_release", "presentation", "call_summary", "sec_filing"} and role not in {
+        "earnings_release",
+        "earnings_commentary",
+        "earnings_presentation",
+        "earnings_call",
+        "sec_filing",
+    }:
+        return ""
+
+    if len(normalized_text) >= 180:
+        return ""
+
+    # Short HTML/TXT captures for official materials are usually shells, event stubs, or thin wrappers.
+    html_or_text = suffix in {".html", ".htm", ".txt"} or "html" in content_type.lower() or "text" in content_type.lower()
+    has_material_signal = any(
+        keyword in lowered
+        for keyword in (
+            "revenue",
+            "earnings",
+            "financial results",
+            "quarterly results",
+            "guidance",
+            "margin",
+            "operator",
+            "question-and-answer",
+            "prepared remarks",
+            "cash flow",
+            "net income",
+            "conference call",
+            "webcast replay",
+        )
+    )
+    if html_or_text and not has_material_signal:
+        return f"insufficient extracted text ({len(normalized_text)} chars)"
+    return ""
+
+
 def _write_material_meta(meta_path: Path, metadata: dict[str, Any]) -> dict[str, Any]:
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     return metadata
+
+
+def _maybe_refresh_cached_excerpt(
+    cached: dict[str, Any],
+    *,
+    meta_path: Path,
+) -> dict[str, Any]:
+    text_path_value = str(cached.get("text_path") or "")
+    if not text_path_value:
+        return cached
+    text_path = Path(text_path_value)
+    if not text_path.exists():
+        return cached
+    current_text = text_path.read_text(encoding="utf-8", errors="ignore").strip()
+    refreshed_excerpt = _excerpt(current_text)
+    if str(cached.get("excerpt") or "") == refreshed_excerpt and int(cached.get("text_length") or 0) == len(current_text):
+        return cached
+    updated = dict(cached)
+    updated["excerpt"] = refreshed_excerpt
+    updated["text_length"] = len(current_text)
+    _write_material_meta(meta_path, updated)
+    return updated
 
 
 def _maybe_upgrade_cached_html_ocr(
@@ -546,6 +647,7 @@ def _fetch_material(
         notify(0.2, f"读取缓存：{source.get('label', 'Source')}")
         cached = _maybe_upgrade_cached_html_ocr(dict(cached), root=root, key=key, meta_path=meta_path)
         cached = _maybe_upgrade_cached_pdf_ocr(dict(cached), meta_path=meta_path)
+        cached = _maybe_refresh_cached_excerpt(dict(cached), meta_path=meta_path)
         cached["status"] = "cached"
         cached["from_cache"] = True
         notify(1.0, f"已复用缓存：{source.get('label', 'Source')}")
@@ -585,13 +687,25 @@ def _fetch_material(
                     text = f"{text}\n\n{ocr_text}".strip()
         text_path = root / f"{key}.txt"
         text_path.write_text(text, encoding="utf-8")
+        quality_issue = _material_text_quality_issue(
+            source,
+            title=title,
+            text=text,
+            content_type=content_type,
+            suffix=suffix,
+        )
+        status = "fetched"
+        error = ""
+        if quality_issue:
+            status = "error"
+            error = quality_issue
         metadata = {
             "label": source.get("label", "Source"),
             "url": source.get("url", ""),
             "kind": source.get("kind", "source"),
             "role": source.get("role", source.get("kind", "source")),
             "date": source.get("date", ""),
-            "status": "fetched",
+            "status": status,
             "from_cache": False,
             "content_type": content_type,
             "title": title or source.get("label", ""),
@@ -600,8 +714,11 @@ def _fetch_material(
             "raw_path": str(raw_path),
             "text_path": str(text_path),
             "fetched_at": now_iso(),
-            "error": "",
+            "error": error,
         }
+        if quality_issue:
+            notify(1.0, f"已识别低质量材料：{source.get('label', 'Source')}")
+            return _write_material_meta(meta_path, metadata)
         notify(1.0, f"已完成材料处理：{source.get('label', 'Source')}")
         return _write_material_meta(meta_path, metadata)
     except Exception as exc:

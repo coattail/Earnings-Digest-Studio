@@ -610,6 +610,42 @@ a {
   line-height: 1.42;
 }
 
+.page[data-fit="tight"] .takeaway-meta,
+.page[data-fit="tight"] .panel-mini-title,
+.page[data-fit="tight"] .panel-source,
+.page[data-fit="tight"] .scenario-card small {
+  font-size: 9px;
+  line-height: 1.26;
+}
+
+.page[data-fit="tight"] .scenario-card strong {
+  font-size: 11px;
+}
+
+.page[data-fit="tight"] .scenario-card p {
+  font-size: 9.7px;
+  line-height: 1.28;
+}
+
+.page[data-fit="tight"] .signal-note,
+.page[data-fit="tight"] .street-view-card p,
+.page[data-fit="tight"] .street-view-card a,
+.page[data-fit="tight"] .street-view-points,
+.page[data-fit="tight"] .source-excerpt {
+  font-size: 11px;
+  line-height: 1.34;
+}
+
+.page[data-fit="tight"] .insight-card strong {
+  font-size: 14px;
+  line-height: 1.32;
+}
+
+.page[data-fit="tight"] .insight-card small {
+  font-size: 10.5px;
+  line-height: 1.26;
+}
+
 .page[data-fit="dense"] .page-head {
   margin-bottom: 8px;
   padding-bottom: 6px;
@@ -668,6 +704,47 @@ a {
 .page[data-fit="dense"] .thesis-item p {
   font-size: 11.4px;
   line-height: 1.36;
+}
+
+.page[data-fit="dense"] .takeaway-meta,
+.page[data-fit="dense"] .panel-mini-title,
+.page[data-fit="dense"] .panel-source,
+.page[data-fit="dense"] .scenario-card small {
+  font-size: 8.2px;
+  line-height: 1.18;
+}
+
+.page[data-fit="dense"] .scenario-card {
+  padding: 8px 9px;
+}
+
+.page[data-fit="dense"] .scenario-card strong {
+  font-size: 10.2px;
+  line-height: 1.18;
+}
+
+.page[data-fit="dense"] .scenario-card p {
+  font-size: 8.9px;
+  line-height: 1.2;
+}
+
+.page[data-fit="dense"] .signal-note,
+.page[data-fit="dense"] .street-view-card p,
+.page[data-fit="dense"] .street-view-card a,
+.page[data-fit="dense"] .street-view-points,
+.page[data-fit="dense"] .source-excerpt {
+  font-size: 10.2px;
+  line-height: 1.24;
+}
+
+.page[data-fit="dense"] .insight-card strong {
+  font-size: 12.4px;
+  line-height: 1.24;
+}
+
+.page[data-fit="dense"] .insight-card small {
+  font-size: 9.7px;
+  line-height: 1.2;
 }
 
 .page:last-child {
@@ -1072,6 +1149,14 @@ a {
   font-size: 13px;
   line-height: 1.54;
   color: #1e293b;
+}
+
+.takeaway-meta {
+  display: block;
+  margin-top: 7px;
+  font-size: 10px;
+  line-height: 1.38;
+  color: #64748b;
 }
 
 .thesis-item.compact {
@@ -1779,6 +1864,71 @@ a {
   color: #475569;
 }
 
+.panel-mini-title {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: #64748b;
+}
+
+.panel-followup-list {
+  margin-bottom: 0;
+}
+
+.panel-source {
+  margin-top: 6px !important;
+  font-size: 10px !important;
+  line-height: 1.32 !important;
+  color: #64748b !important;
+}
+
+.scenario-stack {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.scenario-card {
+  padding: 10px 11px;
+  border-radius: 16px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  background: rgba(255, 255, 255, 0.88);
+}
+
+.scenario-card strong {
+  display: block;
+  margin-bottom: 5px;
+  font-size: 12px;
+  line-height: 1.25;
+  color: #1e293b;
+}
+
+.scenario-card p {
+  margin: 0 0 4px;
+  font-size: 10.4px;
+  line-height: 1.34;
+  color: #334155;
+}
+
+.scenario-card p:last-of-type {
+  margin-bottom: 0;
+}
+
+.scenario-card span {
+  font-weight: 700;
+  color: #475569;
+}
+
+.scenario-card small {
+  display: block;
+  margin-top: 5px;
+  font-size: 8.8px;
+  line-height: 1.24;
+  color: #64748b;
+}
+
 .signal-followup-panels .quote-card {
   padding: 10px 12px 9px;
 }
@@ -1917,10 +2067,10 @@ a {
   font-size: 12.5px;
   line-height: 1.54;
   color: #334155;
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+  overflow: visible;
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .signal-meta {
@@ -2060,10 +2210,10 @@ a {
 }
 
 .street-view-points li {
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+  overflow: visible;
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .street-view-card p {
@@ -2071,20 +2221,20 @@ a {
   font-size: 13px;
   line-height: 1.55;
   color: #334155;
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+  overflow: visible;
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .street-view-card a {
   color: #1d4ed8;
   font-size: 12px;
   line-height: 1.5;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+  overflow: visible;
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .street-view-empty {
@@ -2151,6 +2301,29 @@ a {
 .page-risks .quote-card small {
   font-size: 8.2px;
   line-height: 1.18;
+}
+
+.page.page-risks[data-fit="dense"] .signal-followup-panels {
+  gap: 10px;
+}
+
+.page.page-risks[data-fit="dense"] .signal-followup-panels .text-panel {
+  padding: 8px 10px 8px;
+}
+
+.page.page-risks[data-fit="dense"] .signal-followup-panels .text-panel h3 {
+  margin-bottom: 4px;
+  font-size: 14px;
+}
+
+.page.page-risks[data-fit="dense"] .signal-followup-panels .text-panel p {
+  font-size: 10px;
+  line-height: 1.2;
+}
+
+.page.page-risks[data-fit="dense"] .scenario-stack {
+  gap: 6px;
+  margin-top: 6px;
 }
 
 .page-views .street-view-grid {
@@ -2352,17 +2525,18 @@ a {
   margin: 8px 0;
   font-size: 15px;
   line-height: 1.42;
-  display: -webkit-box;
-  -webkit-line-clamp: 5;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+  overflow: visible;
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .insight-card small {
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+  display: block;
+  overflow: visible;
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .source-grid {
@@ -2389,20 +2563,19 @@ a {
   font-size: 11.5px;
   line-height: 1.5;
   color: #475569;
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+  overflow: visible;
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .source-card a {
   color: #1d4ed8;
   font-size: 12px;
   word-break: break-all;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+  overflow: visible;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .summary-list,

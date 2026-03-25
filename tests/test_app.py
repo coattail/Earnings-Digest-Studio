@@ -9,10 +9,11 @@ import time
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
+import app.services.official_materials as official_materials
 import app.services.reports as reports_service
 import app.services.official_source_resolver as source_resolver
 from scripts import audit_dynamic_reports
@@ -24,9 +25,14 @@ from app.services.charts import render_income_statement_svg, render_statement_tr
 from app.services.local_data import get_company, get_quarter_fixture
 from app.services.local_data import _build_companyfacts_series
 from app.services.local_data import get_supported_quarters
+from app.services.local_data import normalize_calendar_quarter_input, resolve_company_reference
 from app.services.institutional_views import get_institutional_views
 from app.services.official_parsers import parse_official_materials
 from app.services.official_parsers import _apple_legacy_geographies
+from app.services.official_parsers import _extract_company_geographies
+from app.services.official_parsers import _extract_company_segments
+from app.services.official_parsers import _extract_generic_guidance
+from app.services.official_parsers import _extract_quote_cards
 from app.services.official_parsers import _extract_table_metric
 from app.services.official_parsers import _merge_parsed_payload
 from app.services.official_parsers import _prefer_richer_geographies
@@ -515,8 +521,8 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
             require_full_coverage=True,
         )
         self.assertEqual(quality["status"], "pass")
-        release_issue = next(item for item in quality["issues"] if item["code"] == "full_coverage_source_role_missing_earnings_release")
-        self.assertEqual(release_issue["severity"], "major")
+        codes = {item["code"] for item in quality["issues"]}
+        self.assertNotIn("full_coverage_source_role_missing_earnings_release", codes)
 
     def test_recompute_history_derivatives_rebuilds_ttm_roe_from_equity(self) -> None:
         history = [
@@ -555,6 +561,31 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         self.assertIn("2024Q4", series_payload["periods"])
         self.assertEqual(series_payload["series"]["revenue"]["2024Q4"], 130_000_000_000)
         self.assertEqual(series_payload["series"]["earnings"]["2024Q4"], 12_000_000_000)
+
+    def test_historical_official_cache_alignment_allows_geography_only_annual_fallback_cache(self) -> None:
+        entry = {"period_end": "2011-06-30"}
+        cached_payload = {
+            "latest_kpis": {},
+            "current_segments": [],
+            "current_geographies": [
+                {"name": "Europe", "value_bn": 3.377, "scope": "annual_filing"},
+                {"name": "Retail", "value_bn": 211.734, "scope": "annual_filing"},
+            ],
+            "source_date": "2013-03-01",
+        }
+        self.assertTrue(reports_service._historical_official_cache_is_temporally_aligned(entry, cached_payload))
+
+    def test_historical_official_cache_alignment_keeps_strict_window_for_metric_caches(self) -> None:
+        entry = {"period_end": "2009-06-30"}
+        cached_payload = {
+            "latest_kpis": {"revenue_bn": 31.2},
+            "current_segments": [{"name": "BNSF", "value_bn": 5.851}],
+            "current_geographies": [
+                {"name": "Europe", "value_bn": 28.954, "scope": "quarterly_mapped_from_official_geography"},
+            ],
+            "source_date": "2011-02-28",
+        }
+        self.assertFalse(reports_service._historical_official_cache_is_temporally_aligned(entry, cached_payload))
 
     @patch("app.services.local_data.get_company_series")
     def test_get_supported_quarters_filters_periods_without_core_metrics(self, mock_get_company_series: object) -> None:
@@ -965,6 +996,62 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         self.assertTrue(second[0]["segments"])
         self.assertTrue(second[0]["geographies"])
         self.assertAlmostEqual(second[0]["equity_bn"], 21.0)
+
+    def test_enrich_history_with_official_structures_reuses_stale_cache_structures_without_overwriting_metrics(self) -> None:
+        company = get_company("nvidia")
+        history = [
+            {
+                "quarter_label": "2023Q1",
+                "calendar_quarter": "2023Q1",
+                "period_end": "2023-04-30",
+                "revenue_bn": 7.192,
+                "net_income_bn": 2.043,
+                "gross_margin_pct": None,
+                "revenue_yoy_pct": 19.0,
+                "net_income_yoy_pct": 26.0,
+                "equity_bn": None,
+                "roe_pct": None,
+                "segments": [],
+                "geographies": [],
+                "source_type": "structured_financial_series",
+                "source_url": "",
+            }
+        ]
+        stale_snapshot = {
+            "latest_kpis": {
+                "revenue_bn": 70.0,
+                "net_income_bn": 20.0,
+                "gaap_gross_margin_pct": 90.0,
+            },
+            "current_segments": [
+                {"name": "Data Center", "value_bn": 4.284},
+                {"name": "Gaming", "value_bn": 2.24},
+                {"name": "Professional Visualization", "value_bn": 0.295},
+                {"name": "Automotive", "value_bn": 0.296},
+                {"name": "OEM and Other", "value_bn": 0.077},
+            ],
+            "current_geographies": [
+                {"name": "United States", "value_bn": 4.198},
+                {"name": "International", "value_bn": 2.992},
+            ],
+            "source_url": "https://example.com/nvidia/2025q1",
+            "source_date": "2025-05-24",
+        }
+
+        with patch("app.services.reports._load_historical_official_quarter_cache", return_value=stale_snapshot):
+            with patch("app.services.reports.resolve_official_sources", side_effect=AssertionError("should reuse stale structures")):
+                with patch("app.services.reports.hydrate_source_materials", side_effect=AssertionError("should reuse stale structures")):
+                    with patch("app.services.reports.parse_official_materials", side_effect=AssertionError("should reuse stale structures")):
+                        enriched = _enrich_history_with_official_structures(company, history)
+
+        self.assertAlmostEqual(enriched[0]["revenue_bn"], 7.192, places=3)
+        self.assertAlmostEqual(enriched[0]["net_income_bn"], 2.043, places=3)
+        self.assertIsNone(enriched[0]["gross_margin_pct"])
+        self.assertEqual(enriched[0]["source_type"], "structured_financial_series")
+        self.assertEqual(enriched[0].get("source_url"), "")
+        self.assertNotIn("release_date", enriched[0])
+        self.assertEqual(len(enriched[0]["segments"]), 5)
+        self.assertEqual(len(enriched[0]["geographies"]), 2)
 
     def test_incomplete_historical_segment_snapshot_is_rejected_and_backfilled(self) -> None:
         company = get_company("apple")
@@ -2379,6 +2466,18 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
             )
         )
 
+    def test_ir_temporal_alignment_rejects_wrong_hyphenated_quarter_link(self) -> None:
+        self.assertFalse(
+            _ir_temporal_alignment(
+                {
+                    "url": "https://investors.broadcom.com/news-releases/news-release-details/broadcom-inc-reports-second-quarter-fiscal-year-2026-results",
+                    "text": "Read more",
+                },
+                target_years={"2026"},
+                allowed_quarters={1},
+            )
+        )
+
     def test_ir_role_keywords_require_real_call_or_presentation_signal(self) -> None:
         announce_link = {
             "url": "https://investors.broadcom.com/news-releases/news-release-details/broadcom-inc-announce-first-quarter-fiscal-year-2026-financial",
@@ -2394,6 +2493,121 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
             "text": "Events and Presentations",
         }
         self.assertFalse(_ir_role_keywords_match(generic_link, "earnings_presentation"))
+
+    def test_ir_role_keywords_reject_upcoming_call_event_page(self) -> None:
+        upcoming_call_link = {
+            "url": "https://investors.broadcom.com/news-releases/news-release-details/broadcom-inc-will-host-first-quarter-fiscal-year-2026-conference-call",
+            "text": "Broadcom Inc. Will Host First Quarter Fiscal Year 2026 Conference Call",
+        }
+        self.assertFalse(_ir_role_keywords_match(upcoming_call_link, "earnings_call"))
+
+    def test_material_text_quality_issue_accepts_short_real_release_excerpt(self) -> None:
+        issue = official_materials._material_text_quality_issue(
+            {
+                "kind": "official_release",
+                "role": "earnings_release",
+            },
+            title="Quarterly results",
+            text=(
+                "Revenue was $10.2 billion, up 12% year over year, while net income was $2.4 billion. "
+                "Management raised full-year guidance for operating margin."
+            ),
+            content_type="text/plain",
+            suffix=".txt",
+        )
+        self.assertEqual(issue, "")
+
+    def test_extract_generic_guidance_supports_currency_prefix_and_plus_minus_percent(self) -> None:
+        guidance = _extract_generic_guidance(
+            {
+                "flat_text": "Revenue is expected to be between US$34.6 billion and US$35.8 billion. "
+                "For the following quarter, revenue is expected to be $43.0 billion, plus or minus two%.",
+            }
+        )
+        self.assertEqual(guidance["mode"], "official")
+        self.assertAlmostEqual(guidance["revenue_low_bn"], 34.6, places=2)
+        self.assertAlmostEqual(guidance["revenue_high_bn"], 35.8, places=2)
+
+        tolerance_guidance = _extract_generic_guidance(
+            {
+                "flat_text": "Revenue is expected to be $43.0 billion, plus or minus two%.",
+            }
+        )
+        self.assertEqual(tolerance_guidance["mode"], "official")
+        self.assertAlmostEqual(tolerance_guidance["revenue_bn"], 43.0, places=2)
+        self.assertIn("±2%", tolerance_guidance["commentary"])
+
+    def test_extract_quote_cards_accepts_noted_and_filters_operator(self) -> None:
+        cards = _extract_quote_cards(
+            {
+                "label": "Example transcript",
+                "raw_text": (
+                    "Operator: \"Please stand by while we assemble the queue for today's earnings call and replay details.\" "
+                    "Management noted, \"Demand remained strong across AI infrastructure, enterprise refresh, and software attach, "
+                    "and we are seeing that momentum carry into the next quarter with improving supply conditions.\" "
+                    "CFO remarked: \"Gross margin expanded meaningfully this quarter because mix improved, costs eased, and "
+                    "execution across the manufacturing network was more disciplined than a year ago.\""
+                )
+            }
+        )
+        self.assertEqual(len(cards), 2)
+        self.assertTrue(all(card["speaker"] != "Operator" for card in cards))
+        self.assertIn("Management", cards[0]["speaker"])
+        self.assertIn("Gross margin expanded", cards[1]["quote"])
+
+    def test_extract_company_segments_uses_dynamic_segment_order_profiles(self) -> None:
+        text = (
+            "Advertising services revenue increased 18% to $12.3 billion. "
+            "Subscription services revenue increased 10% to $9.1 billion. "
+            "Online stores revenue was $55.0 billion. "
+            "Third-party seller services revenue rose 11% to $36.5 billion."
+        )
+        segments = _extract_company_segments(
+            "amazon",
+            [
+                {
+                    "label": "Amazon release",
+                    "kind": "official_release",
+                    "raw_text": text,
+                    "flat_text": text,
+                }
+            ],
+        )
+        names = [item["name"] for item in segments]
+        self.assertIn("Advertising services", names)
+        self.assertIn("Subscription services", names)
+        self.assertIn("Third-party seller services", names)
+
+    @patch.dict(os.environ, {"EARNINGS_DIGEST_DISABLE_SOURCE_FETCH": ""}, clear=False)
+    @patch("app.services.official_materials.httpx.Client")
+    def test_fetch_material_marks_javascript_shell_as_error(self, mock_http_client: object) -> None:
+        response = Mock()
+        response.content = b"<html><head><title>Access Denied</title></head><body>Please enable JavaScript to continue.</body></html>"
+        response.headers = {"content-type": "text/html; charset=utf-8"}
+        response.raise_for_status.return_value = None
+        client = Mock()
+        client.get.return_value = response
+        mock_http_client.return_value.__enter__.return_value = client
+        mock_http_client.return_value.__exit__.return_value = False
+
+        source = {
+            "label": "Example release",
+            "url": "https://example.com/releases/q4-results",
+            "kind": "official_release",
+            "role": "earnings_release",
+            "date": "2025-12-31",
+        }
+        cache_root = self._backup_root / "materials-cache"
+        cache_root.mkdir(parents=True, exist_ok=True)
+
+        with patch("app.services.official_materials._source_cache_dir", return_value=cache_root):
+            material = official_materials._fetch_material("apple", "2025Q4", source, refresh=True)
+
+        self.assertEqual(material["status"], "error")
+        self.assertTrue(
+            "access denied" in material["error"] or "enable javascript" in material["error"]
+        )
+        self.assertTrue(Path(material["text_path"]).exists())
 
     @patch("app.services.official_source_resolver._attachment_rows")
     @patch("app.services.official_source_resolver._fetch_text")
@@ -2548,6 +2762,142 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertEqual(payload["history_window"], 16)
         self.assertTrue(payload["supported_quarters"])
         self.assertNotIn("2005Q4", payload["supported_quarters"])
+
+    def test_company_reference_resolver_accepts_name_ticker_and_chinese(self) -> None:
+        self.assertEqual(resolve_company_reference("NVIDIA")["id"], "nvidia")
+        self.assertEqual(resolve_company_reference("nvda")["id"], "nvidia")
+        self.assertEqual(resolve_company_reference("英伟达")["id"], "nvidia")
+        self.assertEqual(resolve_company_reference("Amazon")["id"], "amazon")
+
+    def test_normalize_calendar_quarter_input_accepts_common_formats(self) -> None:
+        self.assertEqual(normalize_calendar_quarter_input("2025Q4"), "2025Q4")
+        self.assertEqual(normalize_calendar_quarter_input("2025 Q4"), "2025Q4")
+        self.assertEqual(normalize_calendar_quarter_input("Q4 2025"), "2025Q4")
+        self.assertEqual(normalize_calendar_quarter_input("2025年第4季度"), "2025Q4")
+
+    @patch("app.main.export_html_to_pdf")
+    def test_skill_report_api_accepts_company_name_and_quarter(self, mock_export_pdf: object) -> None:
+        mock_export_pdf.return_value = "/tmp/nvidia-2025q4.pdf"
+        response = self.client.post(
+            "/skill/reports",
+            json={"company": "NVIDIA", "quarter": "Q4 2025", "history_window": 12},
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["company_id"], "nvidia")
+        self.assertEqual(payload["ticker"], "NVDA")
+        self.assertEqual(payload["calendar_quarter"], "2025Q4")
+        self.assertIn("/reports/", payload["preview_url"])
+        self.assertIn("/reports/", payload["pdf_download_url"])
+        self.assertIsNone(payload["pdf_error"])
+        self.assertIsInstance(payload["diagnostics"], list)
+
+    def test_skill_report_api_returns_clear_company_resolution_error(self) -> None:
+        response = self.client.post(
+            "/skill/reports",
+            json={"company": "zzzz-unlisted", "quarter": "2025Q4", "history_window": 12},
+        )
+        self.assertEqual(response.status_code, 404)
+        detail = response.json()["detail"]
+        self.assertIn("Unknown company reference", detail["message"])
+        self.assertEqual(detail["diagnostics"][0]["code"], "company_not_resolved")
+
+    def test_skill_report_api_returns_clear_quarter_format_error(self) -> None:
+        response = self.client.post(
+            "/skill/reports",
+            json={"company": "NVDA", "quarter": "quarter twenty five four", "history_window": 12},
+        )
+        self.assertEqual(response.status_code, 400)
+        detail = response.json()["detail"]
+        self.assertEqual(detail["diagnostics"][0]["code"], "quarter_not_normalized")
+        self.assertTrue(detail["diagnostics"][0]["suggestions"])
+
+    @patch("app.main.create_report", side_effect=RuntimeError("cache directory missing"))
+    def test_skill_report_api_wraps_unexpected_runtime_error(self, _mock_create_report: object) -> None:
+        response = self.client.post(
+            "/skill/reports",
+            json={"company": "NVDA", "quarter": "2025Q4", "history_window": 12},
+        )
+        self.assertEqual(response.status_code, 500)
+        detail = response.json()["detail"]
+        self.assertEqual(detail["diagnostics"][0]["code"], "unexpected_runtime_error")
+        self.assertIn("cache directory missing", detail["message"])
+
+    @patch("app.main.create_report_job")
+    def test_skill_report_job_api_accepts_company_name_and_quarter(self, mock_create_report_job: object) -> None:
+        mock_create_report_job.return_value = {
+            "job_id": "job-123",
+            "company_id": "nvidia",
+            "calendar_quarter": "2025Q4",
+            "history_window": 12,
+            "status": "queued",
+            "progress": 0.02,
+            "stage": "queued",
+            "message": "queued",
+            "report_id": None,
+            "error": None,
+            "preview_url": None,
+            "export_pdf_url": None,
+        }
+        response = self.client.post(
+            "/skill/report-jobs",
+            json={"company": "英伟达", "quarter": "2025年第4季度", "history_window": 12},
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["job_id"], "job-123")
+        self.assertEqual(payload["company_id"], "nvidia")
+        self.assertEqual(payload["ticker"], "NVDA")
+        self.assertEqual(payload["calendar_quarter"], "2025Q4")
+        self.assertEqual(payload["status"], "queued")
+        self.assertIsNone(payload["pdf_download_url"])
+        self.assertEqual(payload["diagnostics"], [])
+
+    @patch("app.main.update_report_pdf")
+    @patch("app.main.export_html_to_pdf")
+    @patch("app.main.render_report_html")
+    @patch("app.main.get_report")
+    @patch("app.main.get_report_job")
+    def test_skill_report_job_status_endpoint_exports_pdf_when_completed(
+        self,
+        mock_get_report_job: object,
+        mock_get_report: object,
+        mock_render_report_html: object,
+        mock_export_pdf: object,
+        mock_update_report_pdf: object,
+    ) -> None:
+        mock_get_report_job.return_value = {
+            "job_id": "job-456",
+            "company_id": "nvidia",
+            "calendar_quarter": "2025Q4",
+            "history_window": 12,
+            "status": "completed",
+            "progress": 1.0,
+            "stage": "completed",
+            "message": "done",
+            "report_id": "report-456",
+            "error": None,
+            "preview_url": "/reports/report-456/preview",
+            "export_pdf_url": "/reports/report-456/export.pdf",
+        }
+        mock_get_report.return_value = {
+            "id": "report-456",
+            "company_id": "nvidia",
+            "calendar_quarter": "2025Q4",
+            "pdf_path": "",
+            "payload": {"company_id": "nvidia", "calendar_quarter": "2025Q4"},
+        }
+        mock_render_report_html.return_value = "<html>report</html>"
+        mock_export_pdf.return_value = "/tmp/report-456.pdf"
+
+        response = self.client.get("/skill/report-jobs/job-456")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["pdf_download_url"], "/reports/report-456/download.pdf")
+        self.assertIsNone(payload["pdf_error"])
+        self.assertIsInstance(payload["diagnostics"], list)
+        mock_update_report_pdf.assert_called_once_with("report-456", "/tmp/report-456.pdf")
 
     def test_curated_report_api_round_trip(self) -> None:
         response = self.client.post(
@@ -3514,6 +3864,58 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertEqual(sanitized["management_theme_items"], [])
         self.assertEqual(sanitized["quotes"], [])
 
+    def test_temporal_sanitizer_strips_future_years_from_direct_output_lists(self) -> None:
+        sanitized = _sanitize_temporal_narrative_facts(
+            {
+                "headline": "2026 年新业务会成为核心估值锚点。",
+                "takeaways": ["2026 年投入会继续上升。", "本季利润率已经改善。"],
+                "management_themes": [
+                    {"label": "AI 扩张", "score": 82, "note": "管理层把 2026 年扩张列为重点。"},
+                    {"label": "利润修复", "score": 74, "note": "本季毛利率已经改善。"},
+                ],
+                "risks": [
+                    {"label": "2026 指引兑现", "score": 65, "note": "未来 2026 年高投入可能继续压制利润。"},
+                    {"label": "库存波动", "score": 58, "note": "库存与需求错配仍需观察。"},
+                ],
+                "catalysts": [
+                    {"label": "2026 新平台", "score": 80, "note": "新平台会在 2026 年放量。"},
+                    {"label": "当季执行改善", "score": 72, "note": "执行效率本季已有改善。"},
+                ],
+                "call_quote_cards": [
+                    {
+                        "speaker": "Management",
+                        "quote": "We expect 2026 to be a breakout year.",
+                        "analysis": "这是对 2026 的直接展望。",
+                        "source_label": "Source",
+                    },
+                    {
+                        "speaker": "Management",
+                        "quote": "Gross margin improved this quarter.",
+                        "analysis": "这是对当季表现的总结。",
+                        "source_label": "Source",
+                    },
+                ],
+                "evidence_cards": [
+                    {"title": "2026 plan", "text": "2026 年扩产与费用上行是主线。", "source_label": "Source"},
+                    {"title": "Current quarter", "text": "本季毛利率已改善。", "source_label": "Source"},
+                ],
+            },
+            {"fiscal_label": "2021Q1"},
+        )
+
+        self.assertIsNone(sanitized["headline"])
+        self.assertEqual(sanitized["takeaways"], ["本季利润率已经改善。"])
+        self.assertEqual(len(sanitized["management_themes"]), 1)
+        self.assertEqual(sanitized["management_themes"][0]["label"], "利润修复")
+        self.assertEqual(len(sanitized["risks"]), 1)
+        self.assertEqual(sanitized["risks"][0]["label"], "库存波动")
+        self.assertEqual(len(sanitized["catalysts"]), 1)
+        self.assertEqual(sanitized["catalysts"][0]["label"], "当季执行改善")
+        self.assertEqual(len(sanitized["call_quote_cards"]), 1)
+        self.assertIn("Gross margin improved", sanitized["call_quote_cards"][0]["quote"])
+        self.assertEqual(len(sanitized["evidence_cards"]), 1)
+        self.assertEqual(sanitized["evidence_cards"][0]["title"], "Current quarter")
+
     def test_meta_parser_historical_release_uses_period_correct_narrative(self) -> None:
         release_path = self._write_temp_text(
             "meta-historical-release.txt",
@@ -4023,6 +4425,194 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertEqual([item["name"] for item in parsed["current_geographies"]], ["United States", "Other International", "Canada"])
         self.assertAlmostEqual(parsed["current_geographies"][0]["value_bn"], 48.569, places=3)
 
+    def test_extract_company_geographies_uses_raw_html_sec_table(self) -> None:
+        sec_raw_html_path = self._write_temp_text(
+            "costco-sec-table.html",
+            (
+                "<html><body><table>"
+                "<tr><th>12 Weeks Ended</th><th>November 23, 2025</th><th>November 24, 2024</th></tr>"
+                "<tr><th>(In millions)</th><th></th><th></th></tr>"
+                "<tr><td>United States</td><td>$ 48,569</td><td>$ 45,088</td></tr>"
+                "<tr><td>Canada</td><td>$ 9,073</td><td>$ 8,404</td></tr>"
+                "<tr><td>Other International</td><td>$ 9,665</td><td>$ 8,659</td></tr>"
+                "<tr><td>Total</td><td>$ 67,307</td><td>$ 62,151</td></tr>"
+                "</table></body></html>"
+            ),
+        )
+
+        geographies = _extract_company_geographies(
+            "costco",
+            [
+                {
+                    "label": "Costco Form 10-Q",
+                    "kind": "sec_filing",
+                    "status": "cached",
+                    "raw_text": "placeholder text without structured region values",
+                    "flat_text": "placeholder text without structured region values",
+                    "raw_path": sec_raw_html_path,
+                },
+            ],
+            67.307,
+        )
+
+        self.assertEqual([item["name"] for item in geographies], ["United States", "Other International", "Canada"])
+        self.assertAlmostEqual(geographies[0]["value_bn"], 48.569, places=3)
+
+    def test_extract_company_segments_prefers_raw_html_table_metrics(self) -> None:
+        raw_html_path = self._write_temp_text(
+            "amazon-segments.html",
+            (
+                "<html><body><table>"
+                "<tr><th>Net sales</th><th>Three months ended September 30, 2025</th><th>Three months ended September 30, 2024</th></tr>"
+                "<tr><th>(In millions)</th><th></th><th></th></tr>"
+                "<tr><td>Online stores</td><td>61,406</td><td>57,270</td></tr>"
+                "<tr><td>Third-party seller services</td><td>38,852</td><td>34,150</td></tr>"
+                "<tr><td>Advertising services</td><td>15,318</td><td>14,332</td></tr>"
+                "<tr><td>Subscription services</td><td>12,345</td><td>10,500</td></tr>"
+                "</table></body></html>"
+            ),
+        )
+
+        segments = _extract_company_segments(
+            "amazon",
+            [
+                {
+                    "label": "Amazon Form 10-Q",
+                    "kind": "sec_filing",
+                    "status": "cached",
+                    "raw_text": "placeholder text without structured segment values",
+                    "flat_text": "placeholder text without structured segment values",
+                    "raw_path": raw_html_path,
+                }
+            ],
+        )
+
+        segment_map = {item["name"]: item["value_bn"] for item in segments}
+        self.assertAlmostEqual(segment_map["Online stores"], 61.406, places=3)
+        self.assertAlmostEqual(segment_map["Third-party seller services"], 38.852, places=3)
+        self.assertAlmostEqual(segment_map["Advertising services"], 15.318, places=3)
+        self.assertAlmostEqual(segment_map["Subscription services"], 12.345, places=3)
+
+    def test_extract_company_segments_prefers_three_month_columns_over_ytd_columns(self) -> None:
+        raw_html_path = self._write_temp_text(
+            "amazon-segments-ytd.html",
+            (
+                "<html><body><table>"
+                "<tr><th>Nine months ended</th><th>September 30, 2025</th><th>September 30, 2024</th><th>Three months ended</th><th>September 30, 2025</th><th>September 30, 2024</th></tr>"
+                "<tr><th>(In millions)</th><th></th><th></th><th></th><th></th></tr>"
+                "<tr><td>Online stores</td><td>180,500</td><td>169,000</td><td>61,406</td><td>57,270</td></tr>"
+                "<tr><td>Third-party seller services</td><td>113,700</td><td>101,200</td><td>38,852</td><td>34,150</td></tr>"
+                "<tr><td>Advertising services</td><td>44,900</td><td>40,800</td><td>15,318</td><td>14,332</td></tr>"
+                "<tr><td>Subscription services</td><td>36,200</td><td>31,100</td><td>12,345</td><td>10,500</td></tr>"
+                "</table></body></html>"
+            ),
+        )
+
+        segments = _extract_company_segments(
+            "amazon",
+            [
+                {
+                    "label": "Amazon Form 10-Q",
+                    "kind": "sec_filing",
+                    "status": "cached",
+                    "raw_text": "placeholder text without structured segment values",
+                    "flat_text": "placeholder text without structured segment values",
+                    "raw_path": raw_html_path,
+                }
+            ],
+        )
+
+        segment_map = {item["name"]: item["value_bn"] for item in segments}
+        self.assertAlmostEqual(segment_map["Online stores"], 61.406, places=3)
+        self.assertAlmostEqual(segment_map["Third-party seller services"], 38.852, places=3)
+        self.assertAlmostEqual(segment_map["Advertising services"], 15.318, places=3)
+        self.assertAlmostEqual(segment_map["Subscription services"], 12.345, places=3)
+
+    def test_generic_parser_extracts_statement_metrics_from_raw_html_sec_table(self) -> None:
+        sec_text_path = self._write_temp_text(
+            "oracle-sec-placeholder.txt",
+            "Condensed consolidated statements of operations.",
+        )
+        sec_raw_html_path = self._write_temp_text(
+            "oracle-sec-statement.html",
+            (
+                "<html><body><table>"
+                "<tr><th>Three months ended</th><th>May 31, 2025</th><th>May 31, 2024</th></tr>"
+                "<tr><th>(In millions)</th><th></th><th></th></tr>"
+                "<tr><td>Total revenues</td><td>14,100</td><td>13,050</td></tr>"
+                "<tr><td>Total cost of revenues</td><td>4,935</td><td>4,698</td></tr>"
+                "<tr><td>Gross profit</td><td>9,165</td><td>8,352</td></tr>"
+                "<tr><td>Research and development</td><td>2,115</td><td>2,020</td></tr>"
+                "<tr><td>Selling, general and administrative</td><td>3,102</td><td>2,950</td></tr>"
+                "<tr><td>Operating income</td><td>3,948</td><td>3,382</td></tr>"
+                "<tr><td>Income before taxes</td><td>3,650</td><td>3,121</td></tr>"
+                "<tr><td>Net income</td><td>3,400</td><td>3,036</td></tr>"
+                "</table></body></html>"
+            ),
+        )
+
+        parsed = parse_official_materials(
+            get_company("oracle"),
+            {"fiscal_label": "2025Q4", "coverage_notes": []},
+            [
+                {
+                    "label": "Oracle Form 10-Q",
+                    "kind": "sec_filing",
+                    "status": "cached",
+                    "text_path": sec_text_path,
+                    "raw_path": sec_raw_html_path,
+                }
+            ],
+        )
+
+        self.assertAlmostEqual(parsed["latest_kpis"]["revenue_bn"], 14.1, places=3)
+        self.assertAlmostEqual(parsed["latest_kpis"]["net_income_bn"], 3.4, places=3)
+        self.assertAlmostEqual(parsed["latest_kpis"]["gaap_gross_margin_pct"], 65.0, places=1)
+        opex_names = [item["name"] for item in parsed["income_statement"]["opex_breakdown"]]
+        self.assertIn("Research and development", opex_names)
+        self.assertIn("Selling, general and administrative", opex_names)
+
+    def test_generic_parser_prefers_three_month_statement_columns_over_ytd_columns(self) -> None:
+        sec_text_path = self._write_temp_text(
+            "oracle-sec-ytd-placeholder.txt",
+            "Condensed consolidated statements of operations.",
+        )
+        sec_raw_html_path = self._write_temp_text(
+            "oracle-sec-ytd-statement.html",
+            (
+                "<html><body><table>"
+                "<tr><th>Nine months ended</th><th>May 31, 2025</th><th>May 31, 2024</th><th>Three months ended</th><th>May 31, 2025</th><th>May 31, 2024</th></tr>"
+                "<tr><th>(In millions)</th><th></th><th></th><th></th><th></th></tr>"
+                "<tr><td>Total revenues</td><td>42,100</td><td>38,700</td><td>14,100</td><td>13,050</td></tr>"
+                "<tr><td>Total cost of revenues</td><td>14,820</td><td>13,995</td><td>4,935</td><td>4,698</td></tr>"
+                "<tr><td>Gross profit</td><td>27,280</td><td>24,705</td><td>9,165</td><td>8,352</td></tr>"
+                "<tr><td>Research and development</td><td>6,322</td><td>6,005</td><td>2,115</td><td>2,020</td></tr>"
+                "<tr><td>Selling, general and administrative</td><td>9,245</td><td>8,870</td><td>3,102</td><td>2,950</td></tr>"
+                "<tr><td>Operating income</td><td>11,713</td><td>9,830</td><td>3,948</td><td>3,382</td></tr>"
+                "<tr><td>Income before taxes</td><td>10,820</td><td>9,110</td><td>3,650</td><td>3,121</td></tr>"
+                "<tr><td>Net income</td><td>10,102</td><td>8,864</td><td>3,400</td><td>3,036</td></tr>"
+                "</table></body></html>"
+            ),
+        )
+
+        parsed = parse_official_materials(
+            get_company("oracle"),
+            {"calendar_quarter": "2025Q2", "fiscal_label": "2025Q2"},
+            [
+                {
+                    "label": "Oracle Form 10-Q",
+                    "kind": "sec_filing",
+                    "status": "cached",
+                    "text_path": sec_text_path,
+                    "raw_path": sec_raw_html_path,
+                }
+            ],
+        )
+
+        self.assertAlmostEqual(parsed["latest_kpis"]["revenue_bn"], 14.1, places=3)
+        self.assertAlmostEqual(parsed["latest_kpis"]["net_income_bn"], 3.4, places=3)
+        self.assertAlmostEqual(parsed["latest_kpis"]["gaap_gross_margin_pct"], 65.0, places=1)
+
     def test_costco_parser_extracts_legacy_release_table_metrics(self) -> None:
         release_path = self._write_temp_text(
             "costco-legacy-release.txt",
@@ -4265,6 +4855,23 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertIn("2011", target_years)
         self.assertIn("q4 fy2011", fiscal_terms)
         self.assertNotIn("q3", calendar_terms)
+
+    def test_quarter_reference_terms_include_period_end_year_for_non_calendar_year_companies(self) -> None:
+        company = get_company("apple")
+
+        calendar_terms, fiscal_terms, target_years, allowed_quarters = _quarter_reference_terms(
+            company,
+            "2021Q4",
+            "2021-12-25",
+        )
+
+        self.assertEqual(allowed_quarters, {1})
+        self.assertIn("2021", target_years)
+        self.assertIn("2022", target_years)
+        self.assertIn("q1 fy2022", fiscal_terms)
+        self.assertIn("quarter ended december 2021", fiscal_terms)
+        self.assertIn("2021", calendar_terms)
+        self.assertIn("2022", calendar_terms)
 
     def test_quarter_reference_terms_keep_calendar_quarter_for_calendar_year_companies(self) -> None:
         company = get_company("alphabet")

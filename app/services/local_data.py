@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+from difflib import SequenceMatcher
 from functools import lru_cache
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -43,6 +44,130 @@ def get_company(company_id: str) -> dict[str, Any]:
         return dict(COMPANY_REGISTRY[company_id])
     except KeyError as exc:
         raise KeyError(f"Unknown company id: {company_id}") from exc
+
+
+def _normalize_company_reference_token(value: str) -> str:
+    text = str(value or "").strip().casefold()
+    if not text:
+        return ""
+    text = text.replace("&", " and ")
+    text = re.sub(
+        r"\b(incorporated|inc|corp|corporation|company|co|limited|ltd|holdings|holding|group|plc|sa|nv|classa|classb|classc)\b",
+        " ",
+        text,
+    )
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", text)
+
+
+def _company_reference_aliases(company: dict[str, Any]) -> set[str]:
+    aliases = {
+        str(company.get("id") or ""),
+        str(company.get("slug") or ""),
+        str(company.get("ticker") or ""),
+        str(company.get("name") or ""),
+        str(company.get("english_name") or ""),
+    }
+    english_name = str(company.get("english_name") or "").strip()
+    if english_name:
+        aliases.add(english_name.replace(".", ""))
+        aliases.add(english_name.replace(",", ""))
+    return {
+        normalized
+        for normalized in (_normalize_company_reference_token(alias) for alias in aliases)
+        if normalized
+    }
+
+
+def suggest_company_matches(reference: str, limit: int = 5) -> list[dict[str, str]]:
+    normalized_reference = _normalize_company_reference_token(reference)
+    if not normalized_reference:
+        return []
+    scored: list[tuple[float, dict[str, str]]] = []
+    for company in list_companies():
+        aliases = _company_reference_aliases(company)
+        best_score = 0.0
+        for alias in aliases:
+            ratio = SequenceMatcher(None, normalized_reference, alias).ratio()
+            if alias.startswith(normalized_reference) or normalized_reference.startswith(alias):
+                ratio = max(ratio, 0.92)
+            elif normalized_reference in alias or alias in normalized_reference:
+                ratio = max(ratio, 0.84)
+            best_score = max(best_score, ratio)
+        if best_score < 0.55:
+            continue
+        scored.append(
+            (
+                best_score,
+                {
+                    "company_id": str(company.get("id") or ""),
+                    "name": str(company.get("name") or ""),
+                    "english_name": str(company.get("english_name") or ""),
+                    "ticker": str(company.get("ticker") or ""),
+                },
+            )
+        )
+    ranked = sorted(scored, key=lambda item: (-item[0], item[1]["company_id"]))
+    return [item for _, item in ranked[: max(1, int(limit))]]
+
+
+def resolve_company_reference(reference: str) -> dict[str, Any]:
+    normalized_reference = _normalize_company_reference_token(reference)
+    if not normalized_reference:
+        raise ValueError("Company reference is empty.")
+    exact_matches = [
+        company
+        for company in list_companies()
+        if normalized_reference in _company_reference_aliases(company)
+    ]
+    if len(exact_matches) == 1:
+        return dict(exact_matches[0])
+    if len(exact_matches) > 1:
+        ranked_exact = sorted(exact_matches, key=lambda item: item["display_order"])
+        return dict(ranked_exact[0])
+
+    suggestions = suggest_company_matches(reference, limit=5)
+    if suggestions:
+        top = suggestions[0]
+        top_aliases = _company_reference_aliases(top)
+        top_score = max(
+            SequenceMatcher(None, normalized_reference, alias).ratio()
+            for alias in top_aliases
+        )
+        if top_score >= 0.82:
+            return get_company(top["company_id"])
+        suggestion_text = ", ".join(f"{item['english_name']} ({item['ticker']})" for item in suggestions[:3])
+        raise KeyError(f"Unknown company reference: {reference}. Closest matches: {suggestion_text}")
+    raise KeyError(f"Unknown company reference: {reference}")
+
+
+def normalize_calendar_quarter_input(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("Quarter is empty.")
+    compact = re.sub(r"\s+", "", raw).upper()
+    direct_match = re.fullmatch(r"(\d{4})Q([1-4])", compact)
+    if direct_match:
+        return f"{direct_match.group(1)}Q{direct_match.group(2)}"
+
+    patterns = [
+        r"^\s*(\d{4})\s*[-/]?\s*Q([1-4])\s*$",
+        r"^\s*Q([1-4])\s*[-/]?\s*(\d{4})\s*$",
+        r"^\s*(\d{4})\s*年\s*Q([1-4])\s*$",
+        r"^\s*(\d{4})\s*年\s*第?\s*([1-4])\s*季度\s*$",
+        r"^\s*(\d{4})\s*(?:QUARTER|QTR)\s*([1-4])\s*$",
+        r"^\s*(?:QUARTER|QTR)\s*([1-4])\s*(\d{4})\s*$",
+    ]
+    for pattern in patterns:
+        match = re.fullmatch(pattern, raw, re.IGNORECASE)
+        if not match:
+            continue
+        first, second = match.group(1), match.group(2)
+        if len(first) == 4:
+            year, quarter = first, second
+        else:
+            year, quarter = second, first
+        return f"{int(year):04d}Q{int(quarter)}"
+    raise ValueError(f"Unsupported quarter format: {value}. Expected formats like 2025Q4 or Q4 2025.")
 
 
 def get_quarter_fixture(company_id: str, calendar_quarter: str) -> Optional[dict[str, Any]]:

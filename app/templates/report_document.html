@@ -119,6 +119,13 @@
               <article class="thesis-item">
                 <span>{{ item.title }}</span>
                 <p>{{ item.body }}</p>
+                {% if item.source_anchor or item.verification %}
+                <small class="takeaway-meta">
+                  {% if item.source_anchor %}依据：{{ item.source_anchor }}{% endif %}
+                  {% if item.source_anchor and item.verification %} · {% endif %}
+                  {% if item.verification %}核对：{{ item.verification }}{% endif %}
+                </small>
+                {% endif %}
               </article>
               {% endfor %}
             </div>
@@ -175,6 +182,19 @@
             </ul>
             {% else %}
             <p>{{ report.guidance.commentary }}</p>
+            {% endif %}
+            {% if report.guidance_change_panel.bullets %}
+            <div class="panel-followup">
+              <strong class="panel-mini-title">{{ report.guidance_change_panel.title }}</strong>
+              <ul class="summary-list compact panel-followup-list">
+                {% for item in report.guidance_change_panel.bullets %}
+                <li>{{ item }}</li>
+                {% endfor %}
+              </ul>
+              {% if report.guidance_change_panel.source_anchor %}
+              <p class="panel-source">依据：{{ report.guidance_change_panel.source_anchor }}</p>
+              {% endif %}
+            </div>
             {% endif %}
           </article>
           <article class="text-panel">
@@ -268,20 +288,32 @@
           <article class="text-panel">
             <h3>本季风险视角</h3>
             <p><strong>来源：</strong>{{ report.narrative_provenance.risks.label }}。{{ report.narrative_provenance.risks.detail }}</p>
-            <ul class="warning-list">
-              {% for item in report.risks[:3] %}
-              <li><strong>{{ item.label }}</strong>：{{ item.note }}</li>
+            <div class="scenario-stack">
+              {% for item in report.risk_scenarios[:1] %}
+              <article class="scenario-card">
+                <strong>{{ item.label }}</strong>
+                <p><span>触发：</span>{{ item.trigger }}</p>
+                <p><span>影响：</span>{{ item.impact }}</p>
+                <p><span>验证：</span>{{ item.verify }}</p>
+                <small>依据：{{ item.source_anchor }}</small>
+              </article>
               {% endfor %}
-            </ul>
+            </div>
           </article>
           <article class="text-panel">
             <h3>本季催化剂视角</h3>
             <p><strong>来源：</strong>{{ report.narrative_provenance.catalysts.label }}。{{ report.narrative_provenance.catalysts.detail }}</p>
-            <ul class="warning-list">
-              {% for item in report.catalysts[:3] %}
-              <li><strong>{{ item.label }}</strong>：{{ item.note }}</li>
+            <div class="scenario-stack">
+              {% for item in report.catalyst_scenarios[:1] %}
+              <article class="scenario-card">
+                <strong>{{ item.label }}</strong>
+                <p><span>触发：</span>{{ item.trigger }}</p>
+                <p><span>影响：</span>{{ item.impact }}</p>
+                <p><span>验证：</span>{{ item.verify }}</p>
+                <small>依据：{{ item.source_anchor }}</small>
+              </article>
               {% endfor %}
-            </ul>
+            </div>
           </article>
         </div>
       </section>

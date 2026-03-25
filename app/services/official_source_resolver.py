@@ -263,7 +263,19 @@ def _submissions_window_rows(
 
 
 def _document_tokens(*values: str) -> str:
-    return " ".join(str(value or "").lower() for value in values)
+    tokens: list[str] = []
+    for value in values:
+        lowered = str(value or "").lower().strip()
+        if not lowered:
+            continue
+        tokens.append(lowered)
+        normalized = re.sub(r"(?<=\d)(?=[a-z])|(?<=[a-z])(?=\d)", " ", lowered)
+        normalized = re.sub(r"[-_/]+", " ", normalized)
+        normalized = re.sub(r"[^a-z0-9.% ]+", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        if normalized and normalized != lowered:
+            tokens.append(normalized)
+    return " ".join(tokens)
 
 
 def _url_slug_text(url: str) -> str:
@@ -807,21 +819,34 @@ def _quarter_reference_terms(
     target_date = _parse_date(period_end)
     fiscal_year, fiscal_quarter = _fiscal_period_reference(company, period_end)
     if target_date is not None and fiscal_year is not None and fiscal_quarter is not None:
+        target_years.add(str(target_date.year))
         target_years.add(str(fiscal_year))
         allowed_quarters.add(fiscal_quarter)
         ordinal = {1: "first", 2: "second", 3: "third", 4: "fourth"}[fiscal_quarter]
+        month_name = target_date.strftime("%B").lower()
+        short_month_name = target_date.strftime("%b").lower()
         fiscal_terms.update(
             {
                 f"q{fiscal_quarter} fy{fiscal_year}",
+                f"fy{fiscal_year} q{fiscal_quarter}",
+                f"fy{fiscal_year}q{fiscal_quarter}",
                 f"q{fiscal_quarter} fiscal year {fiscal_year}",
                 f"fiscal year {fiscal_year} q{fiscal_quarter}",
                 f"{ordinal} quarter fiscal year {fiscal_year}",
                 f"fiscal year {fiscal_year} {ordinal} quarter",
                 f"fy{str(fiscal_year)[-2:]} q{fiscal_quarter}",
-                f"quarter ended {target_date.strftime('%B').lower()} {target_date.day}, {fiscal_year}",
+                f"quarter ended {month_name} {target_date.day}, {fiscal_year}",
+                f"quarter ended {month_name} {target_date.day} {fiscal_year}",
+                f"quarter ended {month_name} {target_date.year}",
+                f"quarter ended {short_month_name} {target_date.day} {target_date.year}",
+                f"ended {month_name} {target_date.day}, {target_date.year}",
+                f"ended {month_name} {target_date.day} {target_date.year}",
+                f"{month_name} quarter {target_date.year}",
+                f"{short_month_name} quarter {target_date.year}",
             }
         )
         calendar_terms.add(str(fiscal_year))
+        calendar_terms.add(str(target_date.year))
     return calendar_terms, fiscal_terms, target_years, allowed_quarters
 
 
@@ -952,7 +977,23 @@ def _ir_temporal_alignment(
 
 def _ir_role_keywords_match(link: dict[str, str], role: str) -> bool:
     tokens = _document_tokens(link.get("url", ""), link.get("text", ""))
+    looks_like_upcoming_event = any(
+        keyword in tokens
+        for keyword in (
+            "to announce",
+            "will host",
+            "will hold",
+            "scheduled to discuss",
+            "scheduled for",
+            "register here",
+            "register now",
+            "upcoming event",
+        )
+    )
+    has_archived_call_signal = any(keyword in tokens for keyword in ("transcript", "prepared remarks", "replay", "archive"))
     if role == "earnings_call":
+        if looks_like_upcoming_event and not has_archived_call_signal:
+            return False
         return any(keyword in tokens for keyword in ("webcast", "transcript", "earnings call", "conference call", "prepared remarks", "call replay"))
     if role == "earnings_presentation":
         if any(keyword in tokens for keyword in ("events and presentations", "past events", "upcoming events", "quarterly results")):
@@ -1620,6 +1661,12 @@ def resolve_official_sources(
             )
         resolved.extend(related_sources)
         resolved_roles = {str(item.get("role") or "") for item in resolved}
+        has_ir_release = any(
+            str(item.get("role") or "") == "earnings_release"
+            and ir_url
+            and _same_domain(ir_url, str(item.get("url") or ""))
+            for item in resolved
+        )
         missing_roles = {
             role
             for role in {"earnings_release", "earnings_call", "earnings_presentation"}

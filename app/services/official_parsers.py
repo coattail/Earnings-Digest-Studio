@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import calendar
 import copy
+from html import unescape
 from itertools import combinations
 import re
 from pathlib import Path
@@ -10,6 +11,7 @@ import time
 from typing import Any, Callable, Optional
 
 from .charts import format_money_bn, format_pct
+from .local_data import get_company
 from .official_materials import hydrate_source_materials
 from .official_source_resolver import resolve_official_sources
 
@@ -147,6 +149,433 @@ def _clean_text(text: str) -> str:
 
 def _flatten_text(text: str) -> str:
     return re.sub(r"\s+", " ", _clean_text(text)).strip()
+
+
+def _normalize_html_table_key(text: str) -> str:
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(text or "").lower())
+
+
+def _extract_html_tables(html_text: str) -> list[list[list[str]]]:
+    tables: list[list[list[str]]] = []
+    for table_html in re.findall(r"<table\b.*?</table>", str(html_text or ""), re.IGNORECASE | re.DOTALL):
+        rows: list[list[str]] = []
+        for row_html in re.findall(r"<tr\b.*?</tr>", table_html, re.IGNORECASE | re.DOTALL):
+            cells: list[str] = []
+            for _, cell_html in re.findall(r"<t[dh]\b([^>]*)>(.*?)</t[dh]>", row_html, re.IGNORECASE | re.DOTALL):
+                cleaned = re.sub(r"<br\s*/?>", " ", cell_html, flags=re.IGNORECASE)
+                cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+                cleaned = unescape(cleaned)
+                cleaned = re.sub(r"\s+", " ", cleaned).strip()
+                if cleaned:
+                    cells.append(cleaned)
+            normalized_cells: list[str] = []
+            for cell in cells:
+                if cell in {")", "%"} and normalized_cells:
+                    normalized_cells[-1] = f"{normalized_cells[-1]}{cell}"
+                    continue
+                normalized_cells.append(cell)
+            if normalized_cells:
+                rows.append(normalized_cells)
+        if rows:
+            tables.append(rows)
+    return tables
+
+
+def _material_raw_html_text(material: dict[str, Any]) -> str:
+    cached = material.get("_raw_html_text")
+    if isinstance(cached, str):
+        return cached
+    raw_path = Path(str(material.get("raw_path") or ""))
+    if not raw_path.exists() or raw_path.suffix.lower() not in {".html", ".htm"}:
+        material["_raw_html_text"] = ""
+        return ""
+    try:
+        html_text = raw_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        html_text = ""
+    material["_raw_html_text"] = html_text
+    return html_text
+
+
+def _material_html_tables(material: dict[str, Any]) -> list[list[list[str]]]:
+    cached = material.get("_html_tables")
+    if isinstance(cached, list):
+        return cached
+    html_text = _material_raw_html_text(material)
+    tables = _extract_html_tables(html_text) if html_text else []
+    material["_html_tables"] = tables
+    return tables
+
+
+def _html_table_scale(rows: list[list[str]]) -> float:
+    header_text = " ".join(" ".join(row[:4]) for row in rows[:6]).lower()
+    if "in billions" in header_text or "billions" in header_text:
+        return 1_000_000_000
+    if "in millions" in header_text or "millions" in header_text:
+        return 1_000_000
+    if "in thousands" in header_text or "thousands" in header_text:
+        return 1_000
+    return 1
+
+
+def _infer_html_table_scale(values: list[float], base_scale: float) -> float:
+    if base_scale != 1 or not values:
+        return base_scale
+    max_abs = max(abs(value) for value in values)
+    if max_abs >= 100_000:
+        return 1_000
+    if max_abs >= 100:
+        return 1_000_000
+    return 1
+
+
+def _find_html_table_row(
+    rows: list[list[str]],
+    labels: list[str],
+) -> list[str] | None:
+    row_map = {
+        _normalize_html_table_key(row[0]): row
+        for row in rows
+        if row and len(row) > 1 and str(row[0] or "").strip()
+    }
+    normalized_labels = [_normalize_html_table_key(label) for label in labels if str(label or "").strip()]
+    for normalized_label in normalized_labels:
+        for key, row in row_map.items():
+            if key == normalized_label or key.startswith(normalized_label):
+                return row
+    return None
+
+
+def _html_row_numeric_series(row: list[str] | None) -> list[float]:
+    if row is None:
+        return []
+    values: list[float] = []
+    for cell in row[1:]:
+        cell_text = str(cell or "")
+        if "%" in cell_text:
+            continue
+        parsed = _parse_number(cell_text)
+        if parsed is None:
+            continue
+        values.append(parsed)
+    if len(values) >= 3 and abs(values[0] - round(values[0])) < 1e-9 and 0 <= values[0] <= 999:
+        trailing_values = values[1:]
+        if trailing_values and max(abs(value) for value in trailing_values) > max(abs(values[0]) * 100, 10_000):
+            values = trailing_values
+    return values
+
+
+def _extract_html_table_metric_from_rows(
+    rows: list[list[str]],
+    labels: list[str],
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    row = _find_html_table_row(rows, labels)
+    series = _html_row_numeric_series(row)
+    if len(series) < 2:
+        return (None, None, None)
+    scale = _infer_html_table_scale(series[:2], _html_table_scale(rows))
+    current = round(float(series[0]) * scale / 1_000_000_000, 3)
+    prior = round(float(series[1]) * scale / 1_000_000_000, 3)
+    return (current, prior, _pct_change(current, prior))
+
+
+def _extract_html_table_metric_from_material(
+    material: dict[str, Any],
+    labels: list[str],
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    best: tuple[Optional[float], Optional[float], Optional[float]] = (None, None, None)
+    best_score: tuple[int, float] = (-1, -1.0)
+    for rows in _material_html_tables(material):
+        current, prior, yoy = _extract_html_statement_metric_from_rows(rows, labels, None)
+        if current is None:
+            continue
+        score = (int(prior is not None), float(current))
+        if score > best_score:
+            best = (current, prior, yoy)
+            best_score = score
+    return best
+
+
+def _statement_span_from_html_header(cell_text: str) -> Optional[int]:
+    normalized = _normalize_html_table_key(cell_text)
+    if not normalized:
+        return None
+    if "threemonthsended" in normalized or "quarterended" in normalized:
+        return 1
+    if "sixmonthsended" in normalized:
+        return 2
+    if "ninemonthsended" in normalized:
+        return 3
+    if "yearended" in normalized or "twelvemonthsended" in normalized or "twelvemonthsended" in normalized:
+        return 4
+    chinese_match = re.search(r"(12|[369]|十二|三|六|九)个月", str(cell_text or ""))
+    if chinese_match:
+        token = chinese_match.group(1)
+        return {"3": 1, "三": 1, "6": 2, "六": 2, "9": 3, "九": 3, "12": 4, "十二": 4}.get(token)
+    return None
+
+
+def _calendar_quarter_from_html_date_label(cell_text: str) -> Optional[str]:
+    cell = str(cell_text or "").strip()
+    if not cell:
+        return None
+    quarter_match = re.fullmatch(r"Q([1-4])\s+(\d{4})", cell, re.IGNORECASE)
+    if quarter_match:
+        return f"{int(quarter_match.group(2))}Q{int(quarter_match.group(1))}"
+    month_match = re.search(r"([A-Za-z]{3,9})\s+(\d{1,2})(?:,)?\s+(\d{4})", cell)
+    if month_match:
+        month_token = month_match.group(1).strip().lower()[:3]
+        month_lookup = {
+            "jan": 1,
+            "feb": 2,
+            "mar": 3,
+            "apr": 4,
+            "may": 5,
+            "jun": 6,
+            "jul": 7,
+            "aug": 8,
+            "sep": 9,
+            "oct": 10,
+            "nov": 11,
+            "dec": 12,
+        }
+        month = month_lookup.get(month_token)
+        if month is not None:
+            return f"{int(month_match.group(3))}Q{((month - 1) // 3) + 1}"
+    chinese_match = re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月", cell)
+    if chinese_match:
+        year = int(chinese_match.group(1))
+        month = int(chinese_match.group(2))
+        if 1 <= month <= 12:
+            return f"{year}Q{((month - 1) // 3) + 1}"
+    iso_match = re.search(r"(\d{4})-(\d{2})-(\d{2})", cell)
+    if iso_match:
+        year = int(iso_match.group(1))
+        month = int(iso_match.group(2))
+        if 1 <= month <= 12:
+            return f"{year}Q{((month - 1) // 3) + 1}"
+    return None
+
+
+def _distribute_html_statement_periods(
+    quarters: list[str],
+    spans: list[int],
+) -> list[dict[str, Any]]:
+    if not quarters:
+        return []
+    normalized_spans = [int(span) for span in spans if int(span or 0) > 0]
+    if not normalized_spans:
+        normalized_spans = [1]
+    if len(normalized_spans) > len(quarters):
+        normalized_spans = normalized_spans[: len(quarters)]
+    columns: list[dict[str, Any]] = []
+    cursor = 0
+    remaining_groups = len(normalized_spans)
+    for index, span in enumerate(normalized_spans):
+        remaining_quarters = len(quarters) - cursor
+        if remaining_quarters <= 0:
+            break
+        slots = 1 if remaining_groups <= 1 else max(1, remaining_quarters // remaining_groups)
+        if index == len(normalized_spans) - 1:
+            slots = remaining_quarters
+        for quarter in quarters[cursor : cursor + slots]:
+            columns.append({"quarter": quarter, "span": span})
+        cursor += slots
+        remaining_groups -= 1
+    if cursor < len(quarters):
+        columns.extend({"quarter": quarter, "span": normalized_spans[-1]} for quarter in quarters[cursor:])
+    return columns
+
+
+def _extract_html_statement_period_columns(rows: list[list[str]]) -> list[dict[str, Any]]:
+    header_rows = rows[:6]
+    for row_index, row in enumerate(header_rows):
+        spans = [span for span in (_statement_span_from_html_header(cell) for cell in row) if span is not None]
+        row_quarters = [quarter for quarter in (_calendar_quarter_from_html_date_label(cell) for cell in row) if quarter]
+        if spans and row_quarters:
+            return _distribute_html_statement_periods(row_quarters, spans)
+        if spans and row_index + 1 < len(header_rows):
+            next_row_quarters = [
+                quarter
+                for quarter in (_calendar_quarter_from_html_date_label(cell) for cell in header_rows[row_index + 1])
+                if quarter
+            ]
+            if next_row_quarters:
+                return _distribute_html_statement_periods(next_row_quarters, spans)
+    fallback_quarters = [
+        quarter
+        for row in header_rows
+        for quarter in (_calendar_quarter_from_html_date_label(cell) for cell in row)
+        if quarter
+    ]
+    return [{"quarter": quarter, "span": 1} for quarter in fallback_quarters]
+
+
+def _previous_year_quarter(calendar_quarter: str) -> Optional[str]:
+    match = re.fullmatch(r"(\d{4})Q([1-4])", str(calendar_quarter or ""))
+    if not match:
+        return None
+    return f"{int(match.group(1)) - 1}Q{int(match.group(2))}"
+
+
+def _choose_html_statement_column_indexes(
+    columns: list[dict[str, Any]],
+    target_calendar_quarter: Optional[str],
+) -> Optional[tuple[int, int]]:
+    direct_columns = [
+        (index, str(column.get("quarter") or ""))
+        for index, column in enumerate(columns)
+        if int(column.get("span") or 1) == 1 and str(column.get("quarter") or "")
+    ]
+    if target_calendar_quarter:
+        prior_quarter = _previous_year_quarter(target_calendar_quarter)
+        current_index = next((index for index, quarter in direct_columns if quarter == target_calendar_quarter), None)
+        prior_index = next((index for index, quarter in direct_columns if quarter == prior_quarter), None)
+        if current_index is not None and prior_index is not None:
+            return (current_index, prior_index)
+    if len(direct_columns) >= 2:
+        return (direct_columns[0][0], direct_columns[1][0])
+    return None
+
+
+def _extract_html_statement_metric_from_rows(
+    rows: list[list[str]],
+    labels: list[str],
+    target_calendar_quarter: Optional[str],
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    row = _find_html_table_row(rows, labels)
+    if row is None:
+        return (None, None, None)
+    columns = _extract_html_statement_period_columns(rows)
+    if columns:
+        series = _html_row_numeric_series(row)
+        if len(series) >= len(columns):
+            series = series[: len(columns)]
+            indexes = _choose_html_statement_column_indexes(columns, target_calendar_quarter)
+            if indexes is not None:
+                current_raw = series[indexes[0]]
+                prior_raw = series[indexes[1]]
+                scale = _infer_html_table_scale([current_raw, prior_raw], _html_table_scale(rows))
+                current = round(float(current_raw) * scale / 1_000_000_000, 3)
+                prior = round(float(prior_raw) * scale / 1_000_000_000, 3)
+                return (current, prior, _pct_change(current, prior))
+    return _extract_html_table_metric_from_rows(rows, labels)
+
+
+GENERIC_STATEMENT_ROW_ALIASES: dict[str, tuple[str, ...]] = {
+    "revenue": ("Revenue", "Revenues", "Total revenue", "Total revenues", "Net revenue", "Net revenues", "Net sales", "Total net sales"),
+    "cost_of_revenue": ("Cost of revenue", "Cost of revenues", "Cost of sales", "Total cost of revenue", "Total cost of sales"),
+    "gross_profit": ("Gross profit", "Gross margin"),
+    "sales_marketing": ("Sales and marketing", "Sales and marketing expense", "Selling and marketing"),
+    "general_admin": ("General and administrative", "General and administrative expense", "Administrative expense"),
+    "sgna": ("Selling, general and administrative", "Selling general and administrative", "Selling, general, and administrative"),
+    "rnd": ("Research and development", "Research and development expense", "Research and development costs"),
+    "fulfillment": ("Fulfillment", "Fulfillment expense"),
+    "operating_expenses": ("Operating expenses", "Total operating expenses", "Costs and expenses"),
+    "operating_income": ("Operating income", "Income from operations", "Operating profit"),
+    "pretax_income": ("Income before taxes", "Income before income taxes", "Income before tax", "Pretax income", "Profit before tax"),
+    "tax": ("Income tax expense", "Provision for income taxes", "Tax expense"),
+    "net_income": ("Net income", "Net earnings", "Profit", "Net income attributable to common shareholders"),
+}
+
+
+def _extract_generic_statement_from_html_tables(
+    material: dict[str, Any],
+    target_calendar_quarter: Optional[str] = None,
+) -> dict[str, Any]:
+    best: dict[str, Any] = {}
+    best_score = -1
+
+    for rows in _material_html_tables(material):
+        extracted: dict[str, Any] = {}
+        for field_name, labels in GENERIC_STATEMENT_ROW_ALIASES.items():
+            current_bn, prior_bn, yoy_pct = _extract_html_statement_metric_from_rows(
+                rows,
+                list(labels),
+                target_calendar_quarter,
+            )
+            if current_bn is None:
+                continue
+            extracted[f"{field_name}_bn"] = current_bn
+            extracted[f"{field_name}_prior_bn"] = prior_bn
+            extracted[f"{field_name}_yoy_pct"] = yoy_pct
+
+        revenue_bn = extracted.get("revenue_bn")
+        if revenue_bn is None:
+            continue
+
+        sgna_bn = extracted.get("sgna_bn")
+        if sgna_bn is None:
+            sgna_parts = [
+                extracted.get("sales_marketing_bn"),
+                extracted.get("general_admin_bn"),
+                extracted.get("fulfillment_bn"),
+            ]
+            if any(value is not None for value in sgna_parts):
+                sgna_bn = round(sum(float(value or 0.0) for value in sgna_parts), 3)
+                extracted["sgna_bn"] = sgna_bn
+
+        gross_profit_bn = extracted.get("gross_profit_bn")
+        cost_of_revenue_bn = extracted.get("cost_of_revenue_bn")
+        if gross_profit_bn is None and revenue_bn is not None and cost_of_revenue_bn is not None:
+            gross_profit_bn = round(float(revenue_bn) - float(cost_of_revenue_bn), 3)
+            extracted["gross_profit_bn"] = gross_profit_bn
+        if cost_of_revenue_bn is None and revenue_bn is not None and gross_profit_bn is not None:
+            cost_of_revenue_bn = round(float(revenue_bn) - float(gross_profit_bn), 3)
+            extracted["cost_of_revenue_bn"] = cost_of_revenue_bn
+
+        operating_income_bn = extracted.get("operating_income_bn")
+        operating_expenses_bn = extracted.get("operating_expenses_bn")
+        if operating_expenses_bn is None and gross_profit_bn is not None and operating_income_bn is not None:
+            operating_expenses_bn = round(float(gross_profit_bn) - float(operating_income_bn), 3)
+            extracted["operating_expenses_bn"] = operating_expenses_bn
+
+        annotations: list[dict[str, Any]] = []
+        if gross_profit_bn is not None and revenue_bn not in (None, 0):
+            gross_margin_pct = round(float(gross_profit_bn) / float(revenue_bn) * 100, 1)
+            extracted["gross_margin_pct"] = gross_margin_pct
+            annotations.append({"title": "毛利率", "value": format_pct(gross_margin_pct), "note": "来自官方利润表行项目。", "color": "#2563EB"})
+        if operating_income_bn is not None and revenue_bn not in (None, 0):
+            operating_margin_pct = round(float(operating_income_bn) / float(revenue_bn) * 100, 1)
+            extracted["operating_margin_pct"] = operating_margin_pct
+            annotations.append({"title": "营业利润率", "value": format_pct(operating_margin_pct), "note": "由官方收入与营业利润计算。", "color": "#0EA5E9"})
+        if extracted.get("net_income_bn") is not None and revenue_bn not in (None, 0):
+            net_margin_pct = round(float(extracted["net_income_bn"]) / float(revenue_bn) * 100, 1)
+            extracted["net_margin_pct"] = net_margin_pct
+            annotations.append({"title": "净利率", "value": format_pct(net_margin_pct), "note": "由官方收入与净利润计算。", "color": "#14B8A6"})
+
+        opex_breakdown: list[dict[str, Any]] = []
+        for name, value_bn, color in (
+            ("Research and development", extracted.get("rnd_bn"), "#E11D48"),
+            ("Selling, general and administrative", extracted.get("sgna_bn"), "#F43F5E"),
+            ("Sales and marketing", extracted.get("sales_marketing_bn"), "#FB7185"),
+            ("General and administrative", extracted.get("general_admin_bn"), "#FDA4AF"),
+        ):
+            if value_bn is None or revenue_bn in (None, 0):
+                continue
+            opex_breakdown.append(
+                {
+                    "name": name,
+                    "value_bn": round(float(value_bn), 3),
+                    "pct_of_revenue": round(float(value_bn) / float(revenue_bn) * 100, 1),
+                    "color": color,
+                }
+            )
+
+        extracted["income_statement"] = _clean_mapping(
+            {
+                "subtitle": "利润表页优先采用官方 HTML 财报表格行项目，并自动计算毛利率与费用占比。",
+                "sources": [],
+                "opex_breakdown": opex_breakdown,
+                "annotations": annotations[:3],
+            }
+        )
+        score = sum(1 for key in ("revenue_bn", "cost_of_revenue_bn", "gross_profit_bn", "operating_income_bn", "pretax_income_bn", "net_income_bn") if extracted.get(key) is not None)
+        if score > best_score:
+            best = extracted
+            best_score = score
+
+    return best
 
 
 def _load_materials(
@@ -760,6 +1189,29 @@ def _bn_from_unit(token: Optional[str], unit: Optional[str]) -> Optional[float]:
     return value
 
 
+def _percent_token_value(token: Optional[str]) -> Optional[float]:
+    parsed = _parse_number(token)
+    if parsed is not None:
+        return parsed
+    normalized = re.sub(r"[^a-z-]+", " ", str(token or "").lower()).strip()
+    if not normalized:
+        return None
+    word_map = {
+        "zero": 0.0,
+        "one": 1.0,
+        "two": 2.0,
+        "three": 3.0,
+        "four": 4.0,
+        "five": 5.0,
+        "six": 6.0,
+        "seven": 7.0,
+        "eight": 8.0,
+        "nine": 9.0,
+        "ten": 10.0,
+    }
+    return word_map.get(normalized)
+
+
 def _extract_growth_from_context(text: str) -> Optional[float]:
     increased_match = _search(r"(?:up|increased|grew|rose)\s+([0-9]+(?:\.[0-9]+)?)\s*%", text)
     if increased_match:
@@ -1223,6 +1675,82 @@ COMPANY_SEGMENT_PROFILES: dict[str, list[dict[str, Any]]] = {
     ],
 }
 
+
+def _segment_label_variants(label: str) -> list[str]:
+    normalized = " ".join(str(label or "").split()).strip()
+    if not normalized:
+        return []
+    variants = [normalized]
+    replacements = [
+        (" & ", " and "),
+        (" and ", " & "),
+        ("-", " "),
+        (" ", "-"),
+        (", and ", " and "),
+        (", ", " "),
+    ]
+    for old, new in replacements:
+        if old in normalized:
+            variants.append(" ".join(normalized.replace(old, new).split()).strip())
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in variants:
+        key = item.casefold()
+        if not item or key in seen:
+            continue
+        deduped.append(item)
+        seen.add(key)
+    return deduped
+
+
+def _segment_profiles_for_company(company_id: str) -> list[dict[str, Any]]:
+    predefined = list(COMPANY_SEGMENT_PROFILES.get(company_id, []))
+    try:
+        company = get_company(company_id)
+    except Exception:
+        company = {}
+
+    alias_map = {
+        str(alias).strip(): str(canonical).strip()
+        for alias, canonical in dict(company.get("segment_aliases") or {}).items()
+        if str(alias).strip() and str(canonical).strip()
+    }
+    canonical_aliases: dict[str, list[str]] = {}
+    for alias, canonical in alias_map.items():
+        canonical_aliases.setdefault(canonical, []).append(alias)
+
+    merged: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+
+    def add_profile(name: str, labels: list[str]) -> None:
+        normalized_name = str(name or "").strip()
+        if not normalized_name or normalized_name.casefold() in seen_names:
+            return
+        expanded_labels: list[str] = []
+        seen_labels: set[str] = set()
+        for label in labels:
+            for variant in _segment_label_variants(label):
+                key = variant.casefold()
+                if key in seen_labels:
+                    continue
+                expanded_labels.append(variant)
+                seen_labels.add(key)
+        if not expanded_labels:
+            return
+        merged.append({"name": normalized_name, "labels": expanded_labels})
+        seen_names.add(normalized_name.casefold())
+
+    for profile in predefined:
+        profile_name = str(profile.get("name") or "").strip()
+        profile_labels = [str(item).strip() for item in list(profile.get("labels") or []) if str(item).strip()]
+        add_profile(profile_name, profile_labels + canonical_aliases.get(profile_name, []))
+
+    for segment_name in list(company.get("segment_order") or []):
+        canonical_name = str(segment_name or "").strip()
+        add_profile(canonical_name, [canonical_name] + canonical_aliases.get(canonical_name, []))
+
+    return merged
+
 COMPANY_SEGMENT_RATIO_BOUNDS: dict[str, tuple[float, float]] = {
     "visa": (0.55, 1.55),
 }
@@ -1284,6 +1812,39 @@ GEOGRAPHY_PROFILES: list[list[dict[str, Any]]] = [
     ],
 ]
 
+GENERIC_GEOGRAPHY_LABELS: list[dict[str, Any]] = [
+    {"name": "United States", "labels": ["United States", "U.S.", "U.S", "US"]},
+    {"name": "Canada", "labels": ["Canada"]},
+    {"name": "United States and Canada", "labels": ["United States and Canada", "United States & Canada", "US & Canada"]},
+    {"name": "North America", "labels": ["North America"]},
+    {"name": "Americas", "labels": ["Americas"]},
+    {"name": "Americas Excluding U.S.", "labels": ["Other Americas", "Americas Excluding United States", "Americas Excluding U.S."]},
+    {"name": "Latin America / Caribbean", "labels": ["Latin America/Caribbean", "Latin America / Caribbean"]},
+    {"name": "Europe", "labels": ["Europe"]},
+    {
+        "name": "Europe, the Middle East and Africa",
+        "labels": [
+            "Europe, the Middle East and Africa",
+            "Europe, Middle East and Africa",
+            "Europe/Middle East/Africa",
+            "Europe / Middle East / Africa",
+        ],
+    },
+    {"name": "EMEA", "labels": ["EMEA"]},
+    {"name": "Asia Pacific", "labels": ["Asia Pacific", "Asia-Pacific", "APAC"]},
+    {"name": "APJ", "labels": ["APJ", "Asia Pacific and Japan"]},
+    {"name": "Japan", "labels": ["Japan"]},
+    {"name": "Greater China", "labels": ["Greater China"]},
+    {"name": "China", "labels": ["China"]},
+    {"name": "Taiwan", "labels": ["Taiwan"]},
+    {"name": "South Korea", "labels": ["South Korea", "Korea"]},
+    {"name": "Rest of Asia Pacific", "labels": ["Rest of Asia Pacific", "Rest of Asia-Pacific"]},
+    {"name": "Rest of World", "labels": ["Rest of World"]},
+    {"name": "International", "labels": ["International"]},
+    {"name": "Other International", "labels": ["Other International"]},
+    {"name": "Other countries", "labels": ["Other countries"]},
+]
+
 
 def _geography(name: str, value_bn: Optional[float], yoy_pct: Optional[float]) -> Optional[dict[str, Any]]:
     if value_bn is None:
@@ -1301,6 +1862,39 @@ def _annual_geography(name: str, current_bn: Optional[float], prior_bn: Optional
         return None
     item["scope"] = "annual_filing"
     return item
+
+
+def _extract_generic_geographies_from_html_tables(
+    material: dict[str, Any],
+    revenue_bn: Optional[float],
+) -> list[dict[str, Any]]:
+    best: list[dict[str, Any]] = []
+    for rows in _material_html_tables(material):
+        extracted: list[dict[str, Any]] = []
+        for region in GENERIC_GEOGRAPHY_LABELS:
+            current_bn, prior_bn, yoy_pct = _extract_html_table_metric_from_rows(rows, list(region["labels"]))
+            if current_bn is None:
+                continue
+            item = _geography(str(region["name"]), current_bn, yoy_pct if yoy_pct is not None else _pct_change(current_bn, prior_bn))
+            if item is not None:
+                extracted.append(item)
+        if len(extracted) < 2:
+            continue
+        deduped: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in extracted:
+            name = str(item.get("name") or "").casefold()
+            if not name or name in seen:
+                continue
+            deduped.append(item)
+            seen.add(name)
+        if len(deduped) < 2:
+            continue
+        ranked = sorted(deduped, key=lambda item: float(item.get("value_bn") or 0.0), reverse=True)
+        best = _prefer_richer_geographies(best, ranked, revenue_bn)
+    if best and _is_annual_material(material):
+        return [{**item, "scope": "annual_filing"} for item in best]
+    return best
 
 
 def _calendar_quarter_from_fallback(fallback: dict[str, Any]) -> Optional[str]:
@@ -1454,6 +2048,15 @@ def _sanitize_temporal_narrative_facts(facts: dict[str, Any], fallback: dict[str
             cleaned.append(item)
         return cleaned
 
+    def sanitize_takeaway_list(items: Any) -> list[str]:
+        cleaned: list[str] = []
+        for item in list(items or []):
+            text = str(item or "").strip()
+            if not text or not keep_text(text):
+                continue
+            cleaned.append(text)
+        return cleaned
+
     def sanitize_quote_list(items: Any) -> list[dict[str, Any]]:
         cleaned: list[dict[str, Any]] = []
         for item in list(items or []):
@@ -1464,13 +2067,40 @@ def _sanitize_temporal_narrative_facts(facts: dict[str, Any], fallback: dict[str
             cleaned.append(item)
         return cleaned
 
-    for key in ("management_theme_items", "qna_theme_items", "risk_items", "catalyst_items"):
+    def sanitize_text_card_list(items: Any, *, title_key: str = "title", text_key: str = "text") -> list[dict[str, Any]]:
+        cleaned: list[dict[str, Any]] = []
+        for item in list(items or []):
+            if not isinstance(item, dict):
+                continue
+            if not keep_text(str(item.get(title_key) or "")) or not keep_text(str(item.get(text_key) or "")):
+                continue
+            cleaned.append(item)
+        return cleaned
+
+    for key in (
+        "management_theme_items",
+        "qna_theme_items",
+        "risk_items",
+        "catalyst_items",
+        "management_themes",
+        "qna_themes",
+        "risks",
+        "catalysts",
+    ):
         if key in sanitized:
             sanitized[key] = sanitize_theme_list(sanitized.get(key))
     if "quotes" in sanitized:
         sanitized["quotes"] = sanitize_quote_list(sanitized.get("quotes"))
+    if "call_quote_cards" in sanitized:
+        sanitized["call_quote_cards"] = sanitize_quote_list(sanitized.get("call_quote_cards"))
+    if "evidence_cards" in sanitized:
+        sanitized["evidence_cards"] = sanitize_text_card_list(sanitized.get("evidence_cards"))
+    if "takeaways" in sanitized:
+        sanitized["takeaways"] = sanitize_takeaway_list(sanitized.get("takeaways"))
     if not keep_text(str(sanitized.get("driver") or "")):
         sanitized["driver"] = None
+    if not keep_text(str(sanitized.get("headline") or "")):
+        sanitized["headline"] = None
 
     guidance = dict(sanitized.get("guidance") or {})
     if guidance and not keep_text(str(guidance.get("commentary") or "")):
@@ -2276,6 +2906,19 @@ def _extract_company_geographies(
     best_score = -1
     annual_fallback: list[dict[str, Any]] = []
     annual_fallback_score = -1
+    generic_table_match: list[dict[str, Any]] = []
+    generic_table_annual_fallback: list[dict[str, Any]] = []
+
+    for material in ordered_materials:
+        if material.get("kind") != "sec_filing":
+            continue
+        extracted = _extract_generic_geographies_from_html_tables(material, revenue_bn)
+        if len(extracted) < 2:
+            continue
+        if _is_annual_material(material):
+            generic_table_annual_fallback = _prefer_richer_geographies(generic_table_annual_fallback, extracted, revenue_bn)
+            continue
+        generic_table_match = _prefer_richer_geographies(generic_table_match, extracted, revenue_bn)
 
     for profile in GEOGRAPHY_PROFILES:
         for material in ordered_materials:
@@ -2305,6 +2948,8 @@ def _extract_company_geographies(
                     for item in sorted(extracted, key=lambda item: float(item.get("value_bn") or 0.0), reverse=True)
                 ]
                 annual_fallback_score = score
+    best_match = _prefer_richer_geographies(best_match, generic_table_match, revenue_bn)
+    annual_fallback = _prefer_richer_geographies(annual_fallback, generic_table_annual_fallback, revenue_bn)
     return best_match or annual_fallback
 
 
@@ -2354,6 +2999,9 @@ def _extract_segment_metric(
     flat_text = material["flat_text"]
 
     def _table_metric() -> tuple[Optional[float], Optional[float], Optional[float]]:
+        html_current, html_prior, html_yoy = _extract_html_table_metric_from_material(material, labels)
+        if html_current is not None:
+            return (html_current, html_prior, html_yoy)
         if raw_text:
             current, prior, yoy = _extract_table_metric(raw_text, labels)
             if current is not None:
@@ -2379,7 +3027,7 @@ def _extract_segment_metric(
 
 
 def _extract_company_segments(company_id: str, materials: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    profiles = COMPANY_SEGMENT_PROFILES.get(company_id, [])
+    profiles = _segment_profiles_for_company(company_id)
     if not profiles:
         return []
     narrative_materials = [item for item in materials if item.get("kind") in {"official_release", "presentation"}]
@@ -2485,9 +3133,10 @@ def _extract_generic_guidance(material: Optional[dict[str, Any]]) -> dict[str, A
     if material is None:
         return {}
     flat_text = material["flat_text"]
+    currency_prefix = r"(?:us\$|u\.s\.\$|usd\s+|eur\s+|€|\$)?\s*"
     range_patterns = [
-        r"(?:expects?|expected|guidance|outlook).{0,120}?(?:revenue|revenues|sales).{0,80}?between\s+\$?([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)\s+and\s+\$?([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
-        r"(?:revenue|revenues|sales).{0,40}?(?:is|are)\s+expected.{0,40}?between\s+\$?([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)\s+and\s+\$?([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
+        rf"(?:expects?|expected|guidance|outlook).{{0,120}}?(?:revenue|revenues|sales).{{0,80}}?between\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)\s+and\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
+        rf"(?:revenue|revenues|sales).{{0,40}}?(?:is|are)\s+expected.{{0,40}}?between\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)\s+and\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
     ]
     for pattern in range_patterns:
         range_match = _search(pattern, flat_text)
@@ -2503,9 +3152,25 @@ def _extract_generic_guidance(material: Optional[dict[str, Any]]) -> dict[str, A
             "comparison_label": "下一季收入指引",
             "commentary": _guidance_midpoint_commentary(low_bn, high_bn, extra="官方原文已给出明确收入区间。"),
         }
+    tolerance_match = _search(
+        rf"(?:revenue|revenues|sales).{{0,40}}?(?:is|are)\s+expected.{{0,40}}?{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)\s*,?\s*(?:plus\s+or\s+minus|±)\s*([0-9]+(?:\.[0-9]+)?|zero|one|two|three|four|five|six|seven|eight|nine|ten)\s*%",
+        flat_text,
+    )
+    if tolerance_match:
+        revenue_bn = _bn_from_unit(tolerance_match.group(1), tolerance_match.group(2))
+        tolerance_pct = _percent_token_value(tolerance_match.group(3))
+        commentary = f"官方原文给出的收入展望约为 {format_money_bn(revenue_bn)}。"
+        if tolerance_pct is not None:
+            commentary = f"下一季收入指引约为 {format_money_bn(revenue_bn)}，容差约 ±{tolerance_pct:g}%。"
+        return {
+            "mode": "official",
+            "revenue_bn": revenue_bn,
+            "comparison_label": "下一季收入指引",
+            "commentary": commentary,
+        }
     point_patterns = [
-        r"(?:expects?|expected|guidance|outlook).{0,120}?(?:revenue|revenues|sales).{0,40}?\$?([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
-        r"(?:revenue|revenues|sales).{0,40}?(?:is|are)\s+expected.{0,40}?\$?([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
+        rf"(?:expects?|expected|guidance|outlook).{{0,120}}?(?:revenue|revenues|sales).{{0,40}}?{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
+        rf"(?:revenue|revenues|sales).{{0,40}}?(?:is|are)\s+expected.{{0,40}}?{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
     ]
     for pattern in point_patterns:
         point_match = _search(pattern, flat_text)
@@ -2534,9 +3199,12 @@ def _extract_quote_cards(material: Optional[dict[str, Any]]) -> list[dict[str, s
     if material is None:
         return []
     raw_text = _clean_text(str(material.get("raw_text") or ""))
+    source_label = str(material.get("label") or "Official materials")
+    quote_verbs = r"(?:said|stated|noted|added|commented|remarked|explained)"
     patterns = [
-        r"[“\"]([^\"”]{40,320})[”\"],?\s+said\s+([^.,\n]+)",
-        r"([^.,\n]+?)\s+said[:,]?\s+[“\"]([^\"”]{40,320})[”\"]",
+        rf"[“\"]([^\"”]{{40,320}})[”\"],?\s+{quote_verbs}\s+([^.,\n]+)",
+        rf"([^.,\n]+?)\s+{quote_verbs}[:,]?\s+[“\"]([^\"”]{{40,320}})[”\"]",
+        rf"([^:\n]{{3,120}}):\s*[“\"]([^\"”]{{40,320}})[”\"]",
     ]
     cards: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -2548,6 +3216,8 @@ def _extract_quote_cards(material: Optional[dict[str, Any]]) -> list[dict[str, s
             else:
                 speaker = _flatten_text(match.group(1))
                 quote = _flatten_text(match.group(2))
+            if speaker.lower() in {"operator", "question", "analyst"}:
+                continue
             key = (speaker, quote)
             if len(quote) < 40 or key in seen:
                 continue
@@ -2556,7 +3226,7 @@ def _extract_quote_cards(material: Optional[dict[str, Any]]) -> list[dict[str, s
                     speaker,
                     quote,
                     "管理层原文已被动态抓取，本页优先保留最能概括当季经营重心的官方表述。",
-                    material["label"],
+                    source_label,
                 )
             )
             seen.add(key)
@@ -2638,8 +3308,9 @@ def _generic_takeaways(
         lines.append("；".join(quality_bits) + "。")
 
     guidance = facts.get("guidance") or {}
-    if guidance.get("commentary"):
-        lines.append(str(guidance["commentary"]))
+    guidance_commentary = str(guidance.get("commentary") or "").strip()
+    if guidance_commentary:
+        lines.append(guidance_commentary)
     elif facts.get("driver"):
         lines.append(str(facts["driver"]))
     return lines[:3]
@@ -2650,6 +3321,7 @@ def _generic_evidence_cards(company: dict[str, Any], facts: dict[str, Any]) -> l
     primary_source = facts.get("primary_source_label", "Official materials")
     structure_source = facts.get("structure_source_label", primary_source)
     guidance = facts.get("guidance") or {}
+    guidance_commentary = str(guidance.get("commentary") or "").strip()
     cards: list[dict[str, Any]] = []
     revenue_bn = facts.get("revenue_bn")
     operating_income_bn = facts.get("operating_income_bn")
@@ -2689,11 +3361,11 @@ def _generic_evidence_cards(company: dict[str, Any], facts: dict[str, Any]) -> l
             }
         )
 
-    if guidance.get("commentary"):
+    if guidance_commentary:
         cards.append(
             {
                 "title": "展望与管理层语境",
-                "text": str(guidance["commentary"]),
+                "text": guidance_commentary,
                 "source_label": facts.get("guidance_source_label", primary_source),
             }
         )
@@ -2780,8 +3452,9 @@ def _generic_management_themes(company: dict[str, Any], facts: dict[str, Any]) -
             )
         )
     guidance = facts.get("guidance") or {}
-    if guidance.get("commentary"):
-        items.append(_theme("管理层展望", 72, str(guidance["commentary"])))
+    guidance_commentary = str(guidance.get("commentary") or "").strip()
+    if guidance_commentary:
+        items.append(_theme("管理层展望", 72, guidance_commentary))
     deduped: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in items:
@@ -2844,10 +3517,11 @@ def _generic_qna_themes(company: dict[str, Any], facts: dict[str, Any]) -> list[
             )
         )
     guidance = facts.get("guidance") or {}
-    if guidance.get("mode") == "official":
-        items.append(_theme("指引兑现度", 82, str(guidance["commentary"])))
-    elif guidance.get("commentary"):
-        items.append(_theme("官方展望与经营基线", 72, str(guidance["commentary"])))
+    guidance_commentary = str(guidance.get("commentary") or "").strip()
+    if guidance.get("mode") == "official" and guidance_commentary:
+        items.append(_theme("指引兑现度", 82, guidance_commentary))
+    elif guidance_commentary:
+        items.append(_theme("官方展望与经营基线", 72, guidance_commentary))
     deduped: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in items:
@@ -2897,8 +3571,9 @@ def _generic_risks(company: dict[str, Any], facts: dict[str, Any]) -> list[dict[
             )
         )
     guidance = facts.get("guidance") or {}
-    if guidance.get("mode") == "official":
-        items.append(_theme("指引下沿压力", 66, str(guidance["commentary"])))
+    guidance_commentary = str(guidance.get("commentary") or "").strip()
+    if guidance.get("mode") == "official" and guidance_commentary:
+        items.append(_theme("指引下沿压力", 66, guidance_commentary))
     deduped: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in items:
@@ -2939,10 +3614,11 @@ def _generic_catalysts(company: dict[str, Any], facts: dict[str, Any]) -> list[d
             )
         )
     guidance = facts.get("guidance") or {}
-    if guidance.get("mode") == "official":
-        items.append(_theme("官方指引支撑", 78, str(guidance["commentary"])))
-    elif guidance.get("commentary"):
-        items.append(_theme("管理层积极语境", 70, str(guidance["commentary"])))
+    guidance_commentary = str(guidance.get("commentary") or "").strip()
+    if guidance.get("mode") == "official" and guidance_commentary:
+        items.append(_theme("官方指引支撑", 78, guidance_commentary))
+    elif guidance_commentary:
+        items.append(_theme("管理层积极语境", 70, guidance_commentary))
     deduped: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in items:
@@ -6745,6 +7421,7 @@ def _parse_generic(
     operating_cash_flow_bn = None
     free_cash_flow_bn = None
     profit_signal: dict[str, Any] = {}
+    income_statement: dict[str, Any] = {}
 
     for material in metric_materials:
         flat = material["flat_text"]
@@ -6761,6 +7438,11 @@ def _parse_generic(
             net_income_yoy_pct = _pct_change(
                 profit_signal.get("reported_net_income_bn"),
                 profit_signal.get("reported_prior_net_income_bn"),
+            )
+        if net_income_bn is None:
+            net_income_bn, net_income_yoy_pct = _extract_company_level_narrative_metric(
+                flat,
+                r"(?:net income|net earnings|earnings attributable to [A-Za-z& .]+)",
             )
         if gaap_eps is None:
             if profit_signal.get("reported_eps") is not None:
@@ -6785,11 +7467,31 @@ def _parse_generic(
 
     if quarterly_sec is not None:
         sec_flat = quarterly_sec["flat_text"]
+        html_statement = _extract_generic_statement_from_html_tables(
+            quarterly_sec,
+            str(fallback.get("calendar_quarter") or ""),
+        )
+        html_statement_revenue_bn = html_statement.get("revenue_bn") if html_statement else None
+        if html_statement:
+            if html_statement.get("revenue_bn") is not None:
+                revenue_bn = float(html_statement["revenue_bn"])
+            if revenue_yoy_pct is None and html_statement.get("revenue_yoy_pct") is not None:
+                revenue_yoy_pct = float(html_statement["revenue_yoy_pct"])
+            if operating_income_bn is None and html_statement.get("operating_income_bn") is not None:
+                operating_income_bn = float(html_statement["operating_income_bn"])
+            if net_income_bn is None and html_statement.get("net_income_bn") is not None:
+                net_income_bn = float(html_statement["net_income_bn"])
+            if net_income_yoy_pct is None and html_statement.get("net_income_yoy_pct") is not None:
+                net_income_yoy_pct = float(html_statement["net_income_yoy_pct"])
+            if gross_margin_pct is None and html_statement.get("gross_margin_pct") is not None:
+                gross_margin_pct = float(html_statement["gross_margin_pct"])
+            if not income_statement and isinstance(html_statement.get("income_statement"), dict):
+                income_statement = dict(html_statement["income_statement"])
         table_revenue_bn, table_revenue_prior_bn, table_revenue_yoy_pct = _extract_table_metric(
             sec_flat,
             ["Total revenue", "Total revenues", "Total net sales", "Net sales", "Net revenues", "Revenue", "Revenues"],
         )
-        if table_revenue_bn is not None:
+        if table_revenue_bn is not None and html_statement_revenue_bn is None:
             revenue_bn = table_revenue_bn
         if revenue_yoy_pct is None and table_revenue_yoy_pct is not None:
             revenue_yoy_pct = table_revenue_yoy_pct
@@ -6905,6 +7607,7 @@ def _parse_generic(
         "ending_equity_bn": ending_equity_bn,
         "segments": segments,
         "geographies": geographies,
+        "income_statement": income_statement,
         "guidance": guidance,
         "quotes": quotes,
         "driver": driver or "关键 KPI 已切到动态抓取的官方原文口径",

@@ -265,9 +265,9 @@ def evaluate_report_payload(
             if role == "sec_filing" and has_structured_financials:
                 continue
             if role not in extracted_roles:
-                severity = "critical"
                 if role == "earnings_release" and has_release_surrogate and has_dense_context:
-                    severity = "major"
+                    continue
+                severity = "critical"
                 issues.append(_issue(severity, f"full_coverage_source_role_missing_{role}", f"缺少可解析的官方材料角色：{role}。"))
         has_call_source = any(role in extracted_roles for role in ("earnings_commentary", "earnings_call", "earnings_presentation"))
         if not has_call_source and (len(qna_themes) < 3 and len(call_quote_cards) < 2):

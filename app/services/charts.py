@@ -1065,15 +1065,17 @@ def _statement_row_svg(
         8.8 if compact and icon_key else 9.6 if icon_key else 10.2 if compact else 11.8,
         2,
     )
-    english_excerpt = _trim_note(label_en, 20 if compact else 24)
+    english_lines = _wrap_visual_text_lines(label_en, 16.5 if compact else 20.5, 2)
     meta_excerpt = _trim_note(meta_text, 24 if compact else 34)
     label_font = 10.6 if compact else 12.2
     label_line_height = 9.8 if compact else 11.2
     english_font = 8.8
+    english_line_height = 8.8
     label_block_height = label_font + max(len(label_lines) - 1, 0) * label_line_height
     content_mid = y + height / 2
-    show_english = (not compact) and bool(english_excerpt) and len(label_lines) == 1 and height >= 54
-    combined_block_height = label_block_height + (english_font + 5.5 if show_english else 0.0)
+    show_english = (not compact) and bool(english_lines) and len(label_lines) == 1 and height >= 54
+    english_block_height = english_font + max(len(english_lines) - 1, 0) * english_line_height
+    combined_block_height = label_block_height + (english_block_height + 5.5 if show_english else 0.0)
     block_top = y + max(6.0 if compact else 8.0, (height - combined_block_height) / 2)
     label_y = block_top + label_font * 0.86
     english_y = block_top + label_block_height + 5.5 + english_font * 0.84
@@ -1106,7 +1108,16 @@ def _statement_row_svg(
         )
     )
     if show_english:
-        body.append(f'<text x="{label_x:.1f}" y="{english_y:.1f}" font-size="{english_font}" fill="#64748B">{_escape(english_excerpt)}</text>')
+        body.append(
+            _text_block(
+                label_x,
+                english_y,
+                english_lines,
+                font_size=english_font,
+                fill="#64748B",
+                line_height=english_line_height,
+            )
+        )
     body.append(
         f'<text x="{x + width - 16:.1f}" y="{value_y:.1f}" text-anchor="end" font-size="{value_font}" font-weight="800" fill="#0F172A">{_escape(value_text)}</text>'
     )
@@ -2384,7 +2395,17 @@ def _trim_note(text: Any, limit: int = 108) -> str:
     normalized = re.sub(r"\s+", " ", str(text or "")).strip()
     if len(normalized) <= limit:
         return normalized
-    return normalized[: limit - 1].rstrip() + "..."
+    search_window = normalized[: limit + 1]
+    preferred_cutoff = max(
+        search_window.rfind(token)
+        for token in ("。", "！", "？", "；", ".", "!", "?", ";", "，", ",", " ")
+    )
+    minimum_boundary = max(10, int(limit * 0.55))
+    if preferred_cutoff >= minimum_boundary:
+        if search_window[preferred_cutoff] == " ":
+            return search_window[:preferred_cutoff].rstrip(" ,.;:，；")
+        return search_window[: preferred_cutoff + 1].rstrip(" ,.;:，；")
+    return normalized[:limit].rstrip(" ,.;:，；")
 
 
 def _score_tone(score: float) -> str:
