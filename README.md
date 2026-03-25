@@ -76,6 +76,28 @@ Then open:
 
 `http://127.0.0.1:8000`
 
+## Install As A Codex Skill
+
+This repo now includes an installable skill at:
+
+`skills/earnings-digest-pdf-reporter`
+
+If you already have Codex's `$skill-installer`, install it from GitHub with:
+
+```bash
+python3 ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
+  --repo coattail/Earnings-Digest-Studio \
+  --path skills/earnings-digest-pdf-reporter
+```
+
+Restart Codex after installation.
+
+The installed skill can auto-detect a local clone of this repo. If detection fails, set:
+
+```bash
+export EARNINGS_DIGEST_STUDIO_ROOT=/absolute/path/to/Earnings-Digest-Studio
+```
+
 ## Run Tests
 
 ```bash
@@ -149,8 +171,11 @@ The app ships with both page routes and JSON endpoints.
 | `/companies/{company_id}/quarters` | `GET` | Return available quarter options |
 | `/uploads` | `POST` | Upload transcript material |
 | `/reports` | `POST` | Generate a report synchronously |
+| `/skill/reports` | `POST` | Skill-friendly sync report generation from natural company + quarter input |
 | `/report-jobs` | `POST` | Start async report generation with progress |
 | `/report-jobs/{job_id}` | `GET` | Poll job progress |
+| `/skill/report-jobs` | `POST` | Skill-friendly async report generation from natural company + quarter input |
+| `/skill/report-jobs/{job_id}` | `GET` | Poll skill job progress and auto-finalize PDF when possible |
 | `/reports/{report_id}` | `GET` | Return report payload |
 | `/reports/{report_id}/preview` | `GET` | Open HTML preview |
 | `/reports/{report_id}/export.pdf` | `POST` | Export report to PDF |

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Earnings Digest PDF Reporter"
+  short_description: "Generate Chinese earnings PDF reports from company + quarter"
+  default_prompt: "Use $earnings-digest-pdf-reporter to generate a complete Chinese earnings PDF from a company name or ticker and quarter."
