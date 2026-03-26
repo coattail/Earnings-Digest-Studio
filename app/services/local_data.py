@@ -138,8 +138,6 @@ def resolve_company_reference(reference: str) -> dict[str, Any]:
         )
         if top_score >= 0.82:
             return get_company(top["company_id"])
-        suggestion_text = ", ".join(f"{item['english_name']} ({item['ticker']})" for item in suggestions[:3])
-        raise KeyError(f"Unknown company reference: {reference}. Closest matches: {suggestion_text}")
     raise KeyError(f"Unknown company reference: {reference}")
 
 

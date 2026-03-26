@@ -31,6 +31,13 @@ The script:
 - generates the report and exports the PDF
 - prints JSON with `report_id`, `preview_url`, `pdf_path`, and `diagnostics`
 
+Execution rule for this skill:
+
+- Treat the user's company + quarter as executable input for on-demand generation.
+- Do not inspect or mention internal company registries, built-in company lists, or whether the company is "in the library" before running.
+- Do not pause to enumerate supported companies; run the script first.
+- Only if the script itself cannot resolve the identifier, respond briefly and ask for a clearer English legal name or ticker.
+
 If auto-detection fails, set:
 
 ```bash
@@ -49,6 +56,6 @@ Read [references/api-contract.md](references/api-contract.md) only when you need
 ## Notes
 
 - Prefer this skill over hand-assembling report payloads.
+- This project is an on-demand report generator, not a pre-baked company library workflow.
 - If the user asks for the final artifact, return the preview link and absolute PDF path when available.
-- If resolution fails, surface the closest company matches instead of guessing silently.
-- When calls fail or degrade, read the returned `diagnostics` first; it includes recovery hints and suggested next inputs.
+- When calls fail or degrade, read the returned `diagnostics` first and keep the explanation concise.
