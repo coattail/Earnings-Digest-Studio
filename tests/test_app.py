@@ -18,10 +18,11 @@ import app.services.reports as reports_service
 import app.services.official_source_resolver as source_resolver
 from scripts import audit_dynamic_reports
 
-from app.config import DATA_DIR
+from app.config import BUNDLED_NVIDIA_SEGMENT_HISTORY_PATH, BUNDLED_TECH_ANALYSIS_DATA_PATH, DATA_DIR
 from app.db import init_db
 from app.main import app
 from app.services.charts import render_income_statement_svg, render_statement_translation_svg, render_structure_transition_svg
+import app.services.local_data as local_data_service
 from app.services.local_data import get_company, get_quarter_fixture
 from app.services.local_data import _build_companyfacts_series
 from app.services.local_data import get_supported_quarters
@@ -345,6 +346,22 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         self.assertEqual(cube[-1]["quarter_label"], "2025Q4")
         self.assertTrue(cube[-1]["segments"])
         self.assertEqual(resolve_structure_dimension("nvidia", cube), "segment")
+
+    def test_bundled_financial_source_data_loads_without_workspace_seed_files(self) -> None:
+        local_data_service.load_financial_source_data.cache_clear()
+        self.addCleanup(local_data_service.load_financial_source_data.cache_clear)
+        with patch.object(local_data_service, "TECH_ANALYSIS_DATA_PATH", BUNDLED_TECH_ANALYSIS_DATA_PATH):
+            payload = local_data_service.load_financial_source_data()
+        self.assertIn("companies", payload)
+        self.assertIn("nvidia", payload["companies"])
+
+    def test_bundled_nvidia_segment_history_loads_without_workspace_seed_files(self) -> None:
+        local_data_service.load_nvidia_segment_history.cache_clear()
+        self.addCleanup(local_data_service.load_nvidia_segment_history.cache_clear)
+        with patch.object(local_data_service, "NVIDIA_SEGMENT_HISTORY_PATH", BUNDLED_NVIDIA_SEGMENT_HISTORY_PATH):
+            history = local_data_service.load_nvidia_segment_history()
+        self.assertTrue(history)
+        self.assertIn("segments", next(iter(history.values())))
 
     def test_earlier_quarter_can_still_build_full_12_quarter_history(self) -> None:
         cube = build_historical_quarter_cube("nvidia", "2023Q4", 12)
@@ -2801,6 +2818,8 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         detail = response.json()["detail"]
         self.assertIn("Unknown company reference", detail["message"])
         self.assertEqual(detail["diagnostics"][0]["code"], "company_not_resolved")
+        self.assertFalse(detail["diagnostics"][0]["suggestions"])
+        self.assertNotIn("Closest matches", detail["message"])
 
     def test_skill_report_api_returns_clear_quarter_format_error(self) -> None:
         response = self.client.post(
