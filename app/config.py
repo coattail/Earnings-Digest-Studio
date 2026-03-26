@@ -14,8 +14,21 @@ DB_PATH = DATA_DIR / "earnings_digest.sqlite3"
 STATIC_DIR = ROOT_DIR / "app" / "static"
 TEMPLATES_DIR = ROOT_DIR / "app" / "templates"
 
-TECH_ANALYSIS_DATA_PATH = WORKSPACE_DIR / "Tech-Analysis" / "data.js"
-NVIDIA_SEGMENT_HISTORY_PATH = WORKSPACE_DIR / "nvidia-revenue-chart" / "data" / "nvidia_quarterly_revenue_by_segment.csv"
+WORKSPACE_TECH_ANALYSIS_DATA_PATH = WORKSPACE_DIR / "Tech-Analysis" / "data.js"
+BUNDLED_TECH_ANALYSIS_DATA_PATH = ROOT_DIR / "app" / "data" / "tech_analysis_data.js"
+TECH_ANALYSIS_DATA_PATH = (
+    WORKSPACE_TECH_ANALYSIS_DATA_PATH
+    if WORKSPACE_TECH_ANALYSIS_DATA_PATH.exists()
+    else BUNDLED_TECH_ANALYSIS_DATA_PATH
+)
+
+WORKSPACE_NVIDIA_SEGMENT_HISTORY_PATH = WORKSPACE_DIR / "nvidia-revenue-chart" / "data" / "nvidia_quarterly_revenue_by_segment.csv"
+BUNDLED_NVIDIA_SEGMENT_HISTORY_PATH = ROOT_DIR / "app" / "data" / "nvidia_quarterly_revenue_by_segment.csv"
+NVIDIA_SEGMENT_HISTORY_PATH = (
+    WORKSPACE_NVIDIA_SEGMENT_HISTORY_PATH
+    if WORKSPACE_NVIDIA_SEGMENT_HISTORY_PATH.exists()
+    else BUNDLED_NVIDIA_SEGMENT_HISTORY_PATH
+)
 
 APP_TITLE = "Earnings Digest Studio"
 DEFAULT_HISTORY_WINDOW = 12
