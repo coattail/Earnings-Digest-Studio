@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
 from difflib import SequenceMatcher
 from functools import lru_cache
@@ -25,6 +26,8 @@ REQUEST_HEADERS = {
 SEC_COMPANYFACTS_DIR = CACHE_DIR / "sec-companyfacts"
 RECENT_COMPANYFACTS_TTL_SECONDS = 12 * 60 * 60
 HISTORICAL_COMPANYFACTS_TTL_SECONDS = 30 * 24 * 60 * 60
+DISABLE_SOURCE_FETCH_ENV = "EARNINGS_DIGEST_DISABLE_SOURCE_FETCH"
+REMOTE_SERIES_FETCH_ATTEMPTS = 3
 
 
 @lru_cache(maxsize=1)
@@ -184,6 +187,10 @@ def _companyfacts_cache_path(company_id: str) -> Path:
     ensure_directories()
     SEC_COMPANYFACTS_DIR.mkdir(parents=True, exist_ok=True)
     return SEC_COMPANYFACTS_DIR / f"{company_id}-companyfacts.json"
+
+
+def _source_fetch_disabled() -> bool:
+    return os.environ.get(DISABLE_SOURCE_FETCH_ENV) == "1"
 
 
 def _parse_period(period: str) -> Tuple[int, int]:
@@ -875,13 +882,22 @@ def _merge_official_series(
 
 def _fetch_remote_company_series(company: dict[str, Any]) -> dict[str, Any]:
     url = f"https://stockanalysis.com/stocks/{company['slug']}/financials/?p=quarterly"
-    with httpx.Client(headers=REQUEST_HEADERS, follow_redirects=True, timeout=40.0) as client:
-        response = client.get(url)
-        response.raise_for_status()
-        payload = _build_remote_series(company, response.text)
-    cache_path = _cache_path(company["id"])
-    cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return payload
+    last_exc: Optional[Exception] = None
+    for _ in range(max(1, int(REMOTE_SERIES_FETCH_ATTEMPTS))):
+        try:
+            with httpx.Client(headers=REQUEST_HEADERS, follow_redirects=True, timeout=40.0) as client:
+                response = client.get(url)
+                response.raise_for_status()
+                payload = _build_remote_series(company, response.text)
+            cache_path = _cache_path(company["id"])
+            cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            return payload
+        except httpx.HTTPError as exc:
+            last_exc = exc
+    company_id = str(company.get("id") or "")
+    raise RuntimeError(
+        f"Unable to fetch quarterly series for {company_id} after {REMOTE_SERIES_FETCH_ATTEMPTS} attempts."
+    ) from last_exc
 
 
 def _load_cached_remote_series(company_id: str) -> Optional[dict[str, Any]]:
@@ -913,17 +929,41 @@ def get_company_series(company_id: str) -> tuple[list[str], dict[str, Any]]:
             available_periods = [period for period in available_periods if _quarter_has_core_metrics(period, series)]
         return available_periods, series
 
-    cached = _load_cached_remote_series(company_id)
-    payload = cached or _fetch_remote_company_series(company)
-    periods = list(payload["periods"])
-    series = dict(payload["series"])
-    series["equity"] = dict(series.get("equity") or {})
     companyfacts_payload = _load_companyfacts(company)
-    if companyfacts_payload:
-        official_series = _build_companyfacts_series(
+    official_series = (
+        _build_companyfacts_series(
             companyfacts_payload,
             preferred_currency_code=str(company.get("currency_code") or "USD"),
         )
+        if companyfacts_payload
+        else None
+    )
+
+    cached = _load_cached_remote_series(company_id)
+    if cached:
+        payload = cached
+    elif _source_fetch_disabled():
+        if official_series and list(official_series.get("periods") or []):
+            payload = official_series
+        else:
+            raise RuntimeError(
+                f"Quarterly series cache missing for {company_id} while {DISABLE_SOURCE_FETCH_ENV}=1. "
+                "Warm the cache first or unset the environment variable."
+            )
+    else:
+        try:
+            payload = _fetch_remote_company_series(company)
+        except RuntimeError:
+            if official_series and list(official_series.get("periods") or []):
+                payload = official_series
+            else:
+                raise
+
+    periods = list(payload["periods"])
+    series = dict(payload["series"])
+    series["equity"] = dict(series.get("equity") or {})
+    series["currency_code"] = str(series.get("currency_code") or company.get("currency_code") or "USD")
+    if official_series and payload is not official_series:
         periods, series = _merge_official_series(periods, series, official_series)
     series["roe"] = _compute_ttm_roe_series(_sort_periods(list(periods)), dict(series.get("earnings") or {}), dict(series.get("equity") or {}))
     if company.get("quarter_label_mode") not in (None, "natural"):

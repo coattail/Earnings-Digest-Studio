@@ -29,6 +29,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .
 
+      - name: Warm quarterly series cache
+        run: |
+          python scripts/warm_quarterly_series_cache.py
+
       - name: Run strict quality audit
         env:
           EARNINGS_DIGEST_DISABLE_SOURCE_FETCH: "1"
@@ -47,6 +51,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: quality-audit
+          if-no-files-found: ignore
           path: |
             tmp/audit-after-strict.json
             tmp/audit-summary.md
