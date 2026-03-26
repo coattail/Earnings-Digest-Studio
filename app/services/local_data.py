@@ -1009,6 +1009,19 @@ def _quarter_has_core_metrics(period: str, series: dict[str, Any]) -> bool:
     return revenue is not None and earnings is not None
 
 
+def _periods_are_consecutive_quarters(periods: list[str]) -> bool:
+    normalized = [str(period) for period in periods if str(period)]
+    if len(normalized) <= 1:
+        return True
+    ordered = _sort_periods(list(normalized))
+    for previous, current in zip(ordered, ordered[1:]):
+        previous_year, previous_quarter = _parse_period(previous)
+        current_year, current_quarter = _parse_period(current)
+        if (current_year * 4 + current_quarter) - (previous_year * 4 + previous_quarter) != 1:
+            return False
+    return True
+
+
 def _quarter_is_report_ready(
     period: str,
     periods: list[str],
@@ -1025,6 +1038,8 @@ def _quarter_is_report_ready(
     start_index = max(0, end_index - history_window + 1)
     window = periods[start_index : end_index + 1]
     if len(window) < history_window:
+        return False
+    if not _periods_are_consecutive_quarters(window):
         return False
     complete_count = sum(1 for item in window if _quarter_has_core_metrics(item, series))
     # For one-click report stability, only expose quarters whose historical

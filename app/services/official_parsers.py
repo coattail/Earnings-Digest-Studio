@@ -209,6 +209,8 @@ def _material_html_tables(material: dict[str, Any]) -> list[list[list[str]]]:
 
 def _html_table_scale(rows: list[list[str]]) -> float:
     header_text = " ".join(" ".join(row[:4]) for row in rows[:6]).lower()
+    if "in trillions" in header_text or "trillions" in header_text or " trillion" in header_text:
+        return 1_000_000_000_000
     if "in billions" in header_text or "billions" in header_text:
         return 1_000_000_000
     if "in millions" in header_text or "millions" in header_text:
@@ -1184,8 +1186,14 @@ def _bn_from_unit(token: Optional[str], unit: Optional[str]) -> Optional[float]:
     if value is None:
         return None
     normalized_unit = str(unit or "").lower()
-    if normalized_unit.startswith("million"):
+    if normalized_unit.startswith("trillion") or normalized_unit in {"tn", "tln"}:
+        return value * 1000
+    if normalized_unit.startswith("billion") or normalized_unit == "bn":
+        return value
+    if normalized_unit.startswith("million") or normalized_unit == "mn":
         return value / 1000
+    if normalized_unit.startswith("thousand") or normalized_unit == "k":
+        return value / 1_000_000
     return value
 
 
@@ -1223,10 +1231,158 @@ def _extract_growth_from_context(text: str) -> Optional[float]:
     return None
 
 
+def _unit_scale_to_bn_from_text(text: str) -> Optional[float]:
+    normalized = _flatten_text(str(text or "")).lower()
+    if not normalized:
+        return None
+    if re.search(r"\b(?:trillion|trillions|tn|tln)\b", normalized):
+        return 1000.0
+    if re.search(r"\b(?:billion|billions|bn)\b", normalized):
+        return 1.0
+    if re.search(r"\b(?:million|millions|mn)\b", normalized):
+        return 0.001
+    if re.search(r"\b(?:thousand|thousands|k)\b", normalized):
+        return 0.000001
+    return None
+
+
+def _line_numeric_values_without_pct(text: str) -> list[float]:
+    values: list[float] = []
+    for match in re.finditer(r"\(?-?[0-9]+(?:\.[0-9]+)?\)?", str(text or "")):
+        suffix = str(text or "")[match.end() : match.end() + 2]
+        if "%" in suffix:
+            continue
+        parsed = _parse_number(match.group(0))
+        if parsed is not None:
+            values.append(parsed)
+    return values
+
+
+def _quarter_header_sort_key(value: str) -> tuple[int, int]:
+    token = str(value or "").strip().upper()
+    if not token:
+        return (0, 0)
+    patterns = (
+        r"(?P<quarter>[1-4])Q(?P<year>\d{2,4})",
+        r"Q(?P<quarter>[1-4])(?:FY)?(?P<year>\d{2,4})",
+        r"(?P<year>\d{4})Q(?P<quarter>[1-4])",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, re.sub(r"[^A-Z0-9]", "", token))
+        if not match:
+            continue
+        year = int(match.group("year"))
+        if year < 100:
+            year += 2000
+        return (year, int(match.group("quarter")))
+    year_match = re.fullmatch(r"(?:FY)?(?P<year>\d{2,4})", re.sub(r"[^A-Z0-9]", "", token))
+    if year_match:
+        year = int(year_match.group("year"))
+        if year < 100:
+            year += 2000
+        return (year, 5)
+    return (0, 0)
+
+
+def _parse_text_metric_headers(line: str) -> list[str]:
+    headers: list[str] = []
+    for token in re.split(r"\s+", _clean_text(str(line or "")).strip()):
+        stripped = token.strip(",:;()[]{}")
+        if not stripped:
+            continue
+        if _quarter_header_sort_key(stripped) != (0, 0):
+            headers.append(stripped)
+    return headers
+
+
+def _pick_text_table_current_prior_indexes(headers: list[str]) -> tuple[Optional[int], Optional[int]]:
+    if len(headers) < 2:
+        return (None, None)
+    quarter_positions: list[tuple[int, tuple[int, int]]] = []
+    annual_positions: list[tuple[int, tuple[int, int]]] = []
+    for index, header in enumerate(headers):
+        year, quarter = _quarter_header_sort_key(header)
+        if not year:
+            continue
+        if quarter == 5:
+            annual_positions.append((index, (year, quarter)))
+        else:
+            quarter_positions.append((index, (year, quarter)))
+    if quarter_positions:
+        current_index, current_key = max(quarter_positions, key=lambda item: item[1])
+        prior_index: Optional[int] = None
+        for candidate_index, candidate_key in quarter_positions:
+            if candidate_key == (current_key[0] - 1, current_key[1]):
+                prior_index = candidate_index
+                break
+        if prior_index is None:
+            earlier = [item for item in quarter_positions if item[1] < current_key]
+            if earlier:
+                prior_index = max(earlier, key=lambda item: item[1])[0]
+        return (current_index, prior_index)
+    if len(annual_positions) >= 2:
+        current_index, _ = max(annual_positions, key=lambda item: item[1])
+        earlier = [item for item in annual_positions if item[0] != current_index]
+        if earlier:
+            return (current_index, max(earlier, key=lambda item: item[1])[0])
+    return (len(headers) - 1, len(headers) - 2)
+
+
+def _extract_labeled_text_table_metric(
+    raw_text: str,
+    labels: list[str],
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    lines = [_flatten_text(line) for line in str(raw_text or "").splitlines() if _flatten_text(line)]
+    if not lines:
+        return (None, None, None)
+    best: tuple[Optional[float], Optional[float], Optional[float]] = (None, None, None)
+    best_score: tuple[int, float] = (-1, -1.0)
+    for index, line in enumerate(lines):
+        matched_label = next(
+            (
+                label
+                for label in labels
+                if re.match(rf"^{_table_label_pattern(label)}(?=\s+\(?-?[0-9])", line, flags=re.IGNORECASE)
+            ),
+            None,
+        )
+        if matched_label is None:
+            continue
+        header_line = next(
+            (
+                lines[candidate]
+                for candidate in range(max(0, index - 3), index)
+                if len(_parse_text_metric_headers(lines[candidate])) >= 2
+            ),
+            "",
+        )
+        headers = _parse_text_metric_headers(header_line)
+        if len(headers) < 2:
+            continue
+        current_index, prior_index = _pick_text_table_current_prior_indexes(headers)
+        if current_index is None:
+            continue
+        suffix = re.sub(rf"^{_table_label_pattern(matched_label)}", "", line, count=1, flags=re.IGNORECASE).strip()
+        values = _line_numeric_values_without_pct(suffix)
+        if len(values) < len(headers):
+            continue
+        scale_to_bn = _unit_scale_to_bn_from_text(" ".join(lines[max(0, index - 3) : index + 1]))
+        if scale_to_bn is None:
+            scale_to_bn = 0.001 if max(abs(value) for value in values[: min(4, len(values))]) >= 1_000 else 1.0
+        current = round(float(values[current_index]) * scale_to_bn, 3)
+        prior = round(float(values[prior_index]) * scale_to_bn, 3) if prior_index is not None and prior_index < len(values) else None
+        yoy = _pct_change(current, prior)
+        score = (int(prior is not None), float(current))
+        if score > best_score:
+            best = (current, prior, yoy)
+            best_score = score
+    return best
+
+
 def _extract_narrative_metric(flat_text: str, label_pattern: str) -> tuple[Optional[float], Optional[float]]:
     patterns = [
-        rf"(?:reported\s+)?{label_pattern}(?:\s+for\s+the\s+quarter)?(?:\s+(?:was|were|of|totaled|reached|came in at|amounted to))?\s+\$?(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>billion|million)",
-        rf"\$?(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>billion|million)\s+(?:of\s+)?{label_pattern}",
+        rf"(?:reported\s+)?{label_pattern}(?:\s+for\s+the\s+quarter)?(?:\s+(?:was|were|of|totaled|reached|came in at|amounted to))?\s+\$?(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>trillion|billion|million|thousand|tn|bn|mn|k)",
+        rf"\$?(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>trillion|billion|million|thousand|tn|bn|mn|k)\s+(?:of\s+)?{label_pattern}",
     ]
     for pattern in patterns:
         match = _search(pattern, flat_text)
@@ -1895,6 +2051,43 @@ def _extract_generic_geographies_from_html_tables(
     if best and _is_annual_material(material):
         return [{**item, "scope": "annual_filing"} for item in best]
     return best
+
+
+def _extract_generic_geographies_from_text_tables(
+    material: dict[str, Any],
+    revenue_bn: Optional[float],
+) -> list[dict[str, Any]]:
+    raw_text = str(material.get("raw_text") or "")
+    if not raw_text or not _material_has_geography_context(raw_text):
+        return []
+    extracted: list[dict[str, Any]] = []
+    for region in GENERIC_GEOGRAPHY_LABELS:
+        current_bn, prior_bn, yoy_pct = _extract_labeled_text_table_metric(raw_text, list(region["labels"]))
+        if current_bn is None:
+            continue
+        item = _geography(
+            str(region["name"]),
+            current_bn,
+            yoy_pct if yoy_pct is not None else _pct_change(current_bn, prior_bn),
+        )
+        if item is not None:
+            extracted.append(item)
+    if len(extracted) < 2:
+        return []
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in extracted:
+        name = str(item.get("name") or "").casefold()
+        if not name or name in seen:
+            continue
+        deduped.append(item)
+        seen.add(name)
+    ranked = sorted(deduped, key=lambda item: float(item.get("value_bn") or 0.0), reverse=True)
+    if not _segments_reasonable_for_revenue(ranked, revenue_bn) and revenue_bn not in (None, 0):
+        return []
+    if ranked and _is_annual_material(material):
+        return [{**item, "scope": "annual_filing"} for item in ranked]
+    return ranked
 
 
 def _calendar_quarter_from_fallback(fallback: dict[str, Any]) -> Optional[str]:
@@ -2911,6 +3104,12 @@ def _extract_company_geographies(
 
     for material in ordered_materials:
         if material.get("kind") != "sec_filing":
+            extracted = _extract_generic_geographies_from_text_tables(material, revenue_bn)
+            if len(extracted) >= 2:
+                if _is_annual_material(material):
+                    generic_table_annual_fallback = _prefer_richer_geographies(generic_table_annual_fallback, extracted, revenue_bn)
+                else:
+                    generic_table_match = _prefer_richer_geographies(generic_table_match, extracted, revenue_bn)
             continue
         extracted = _extract_generic_geographies_from_html_tables(material, revenue_bn)
         if len(extracted) < 2:
@@ -3003,6 +3202,10 @@ def _extract_segment_metric(
         if html_current is not None:
             return (html_current, html_prior, html_yoy)
         if raw_text:
+            current, prior, yoy = _extract_labeled_text_table_metric(raw_text, labels)
+            if current is not None:
+                return (current, prior, yoy)
+        if raw_text:
             current, prior, yoy = _extract_table_metric(raw_text, labels)
             if current is not None:
                 return (current, prior, yoy)
@@ -3026,10 +3229,114 @@ def _extract_segment_metric(
     return (None, None)
 
 
-def _extract_company_segments(company_id: str, materials: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    profiles = _segment_profiles_for_company(company_id)
-    if not profiles:
+SEGMENT_DISCOVERY_CONTEXT_TOKENS = (
+    "segment",
+    "business",
+    "product",
+    "platform",
+    "application",
+    "end-market",
+    "end market",
+    "sales by",
+    "revenue by",
+    "results by",
+)
+
+SEGMENT_DISCOVERY_ROW_BLACKLIST = {
+    "total",
+    "sales",
+    "operating profit",
+    "operating income",
+    "gross profit",
+    "net profit",
+    "net income",
+    "profit before income tax",
+    "income tax",
+}
+
+
+def _generic_segment_name_from_line(line: str) -> Optional[str]:
+    match = re.match(r"^(.*?)(?=\s+\(?-?[0-9])", _flatten_text(line), flags=re.IGNORECASE)
+    if not match:
+        return None
+    name = re.sub(r"\s+", " ", match.group(1)).strip(" :-")
+    normalized = name.casefold()
+    if (
+        not name
+        or len(name) > 80
+        or normalized in SEGMENT_DISCOVERY_ROW_BLACKLIST
+        or name.startswith(("※", "•", "-", "*"))
+        or any(token in normalized for token in ("results", "outlook", "financial data", "growth", "quarterly"))
+    ):
+        return None
+    return name
+
+
+def _extract_generic_segments_from_material(
+    company_id: str,
+    material: dict[str, Any],
+    revenue_bn: Optional[float],
+) -> list[dict[str, Any]]:
+    raw_text = str(material.get("raw_text") or "")
+    lines = [_flatten_text(line) for line in raw_text.splitlines() if _flatten_text(line)]
+    if not lines:
         return []
+    best: list[dict[str, Any]] = []
+    best_score = float("-inf")
+    for header_index, line in enumerate(lines):
+        headers = _parse_text_metric_headers(line)
+        if len(headers) < 2:
+            continue
+        context = " ".join(lines[max(0, header_index - 6) : header_index + 1]).lower()
+        if not any(token in context for token in SEGMENT_DISCOVERY_CONTEXT_TOKENS):
+            continue
+        current_index, prior_index = _pick_text_table_current_prior_indexes(headers)
+        if current_index is None:
+            continue
+        scale_to_bn = _unit_scale_to_bn_from_text(" ".join(lines[max(0, header_index - 3) : header_index + 1]))
+        rows: list[dict[str, Any]] = []
+        for row_line in lines[header_index + 1 : min(len(lines), header_index + 18)]:
+            segment_name = _generic_segment_name_from_line(row_line)
+            if segment_name is None:
+                if rows and re.search(r"\b(?:outlook|results|appendix|financial data)\b", row_line, flags=re.IGNORECASE):
+                    break
+                continue
+            values = _line_numeric_values_without_pct(re.sub(r"^(.*?)(?=\s+\(?-?[0-9])", "", row_line, count=1).strip())
+            if len(values) < len(headers):
+                if rows:
+                    break
+                continue
+            local_scale = scale_to_bn
+            if local_scale is None:
+                local_scale = 0.001 if max(abs(value) for value in values[: min(4, len(values))]) >= 1_000 else 1.0
+            current = float(values[current_index]) * local_scale
+            prior = float(values[prior_index]) * local_scale if prior_index is not None and prior_index < len(values) else None
+            item = _segment(segment_name, current, _pct_change(current, prior))
+            if item is not None:
+                rows.append(item)
+        if len(rows) < 2:
+            continue
+        pruned = _prune_overlapping_segments(company_id, rows, revenue_bn)
+        if len(pruned) < 2:
+            continue
+        total = sum(float(item.get("value_bn") or 0.0) for item in pruned)
+        closeness = 0.0
+        if revenue_bn not in (None, 0):
+            closeness = 1 - abs(float(revenue_bn) - total) / max(float(revenue_bn), 1.0)
+        reasonable_bonus = 1.0 if _segments_reasonable_for_revenue(pruned, revenue_bn) else 0.0
+        score = reasonable_bonus * 10 + len(pruned) + closeness
+        if score > best_score:
+            best = pruned
+            best_score = score
+    return best
+
+
+def _extract_company_segments(
+    company_id: str,
+    materials: list[dict[str, Any]],
+    revenue_bn: Optional[float] = None,
+) -> list[dict[str, Any]]:
+    profiles = _segment_profiles_for_company(company_id)
     narrative_materials = [item for item in materials if item.get("kind") in {"official_release", "presentation"}]
     quarterly_table_materials = [item for item in materials if item.get("kind") == "sec_filing" and not _is_annual_material(item)]
     ordered_materials: list[dict[str, Any]] = []
@@ -3054,7 +3361,18 @@ def _extract_company_segments(company_id: str, materials: list[dict[str, Any]]) 
             break
         if found_segment:
             extracted.append(found_segment)
-    ranked = [item for item in extracted if item]
+    ranked = _prune_overlapping_segments(company_id, [item for item in extracted if item], revenue_bn)
+    generic_segments: list[dict[str, Any]] = []
+    for material in ordered_materials:
+        generic_segments = _extract_generic_segments_from_material(company_id, material, revenue_bn)
+        if generic_segments:
+            break
+    if generic_segments and (
+        not ranked
+        or (len(generic_segments) > len(ranked) and _segments_reasonable_for_revenue(generic_segments, revenue_bn))
+        or not _segments_reasonable_for_revenue(ranked, revenue_bn)
+    ):
+        return generic_segments
     ranked.sort(key=lambda item: float(item.get("value_bn") or 0.0), reverse=True)
     return ranked
 
@@ -3062,10 +3380,10 @@ def _extract_company_segments(company_id: str, materials: list[dict[str, Any]]) 
 def _extract_segment_narrative_metric(flat_text: str, label: str) -> tuple[Optional[float], Optional[float]]:
     escaped = re.escape(label)
     patterns = [
-        rf"{escaped}(?:\s+revenue[s]?)?.{{0,120}}?(?:up|increased|grew|rose)\s+([0-9]+(?:\.[0-9]+)?)\s*%(?:.{{0,120}}?)to\s+\$?([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
-        rf"{escaped}(?:\s+revenue[s]?)?.{{0,120}}?(?:down|decreased|declined|fell)\s+([0-9]+(?:\.[0-9]+)?)\s*%(?:.{{0,120}}?)to\s+\$?([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
-        rf"{escaped}(?:\s+revenue[s]?)?.{{0,80}}?\$?([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)(?:.{{0,120}}?)(?:up|increased|grew|rose)\s+([0-9]+(?:\.[0-9]+)?)\s*%",
-        rf"{escaped}(?:\s+revenue[s]?)?.{{0,80}}?\$?([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)(?:.{{0,120}}?)(?:down|decreased|declined|fell)\s+([0-9]+(?:\.[0-9]+)?)\s*%",
+        rf"{escaped}(?:\s+revenue[s]?)?.{{0,120}}?(?:up|increased|grew|rose)\s+([0-9]+(?:\.[0-9]+)?)\s*%(?:.{{0,120}}?)to\s+\$?([0-9,]+(?:\.[0-9]+)?)\s*(trillion|billion|million|thousand|tn|bn|mn|k)",
+        rf"{escaped}(?:\s+revenue[s]?)?.{{0,120}}?(?:down|decreased|declined|fell)\s+([0-9]+(?:\.[0-9]+)?)\s*%(?:.{{0,120}}?)to\s+\$?([0-9,]+(?:\.[0-9]+)?)\s*(trillion|billion|million|thousand|tn|bn|mn|k)",
+        rf"{escaped}(?:\s+revenue[s]?)?.{{0,80}}?\$?([0-9,]+(?:\.[0-9]+)?)\s*(trillion|billion|million|thousand|tn|bn|mn|k)(?:.{{0,120}}?)(?:up|increased|grew|rose)\s+([0-9]+(?:\.[0-9]+)?)\s*%",
+        rf"{escaped}(?:\s+revenue[s]?)?.{{0,80}}?\$?([0-9,]+(?:\.[0-9]+)?)\s*(trillion|billion|million|thousand|tn|bn|mn|k)(?:.{{0,120}}?)(?:down|decreased|declined|fell)\s+([0-9]+(?:\.[0-9]+)?)\s*%",
     ]
     for index, pattern in enumerate(patterns):
         match = _search(pattern, flat_text)
@@ -3863,7 +4181,7 @@ def _finalize(
     geographies = facts.get("geographies")
     segments = facts.get("segments")
     if not segments and materials is not None:
-        segments = _extract_company_segments(str(company["id"]), materials)
+        segments = _extract_company_segments(str(company["id"]), materials, revenue_bn)
     segments = _prune_overlapping_segments(str(company["id"]), list(segments or []), revenue_bn)
     if geographies is None and materials is not None:
         geographies = _extract_company_geographies(str(company["id"]), materials, revenue_bn)
@@ -4499,7 +4817,7 @@ def _parse_microsoft(
         ),
     )
     if not segments:
-        segments = _extract_company_segments(str(company["id"]), materials)
+        segments = _extract_company_segments(str(company["id"]), materials, revenue_bn)
     segment_margin_matches = {
         "Productivity and Business Processes": _search(
             r"Productivity and Business Processes\s+Revenue\s+\$?\s*([0-9,]+).*?Operating income\s+\$?\s*([0-9,]+)",
@@ -4698,7 +5016,7 @@ def _parse_alphabet_historical(
             segments = legacy_segments
     if not segments:
         segments = legacy_segments
-    segments = segments or list(parsed.get("current_segments") or []) or _extract_company_segments(str(company["id"]), materials)
+    segments = segments or list(parsed.get("current_segments") or []) or _extract_company_segments(str(company["id"]), materials, revenue_bn)
     if not segments:
         return parsed
 
@@ -7563,11 +7881,11 @@ def _parse_generic(
     if ending_equity_bn is None and sec is not None:
         ending_equity_bn = _extract_ending_equity_bn([sec])
 
-    segments = _extract_company_segments(company["id"], materials)
+    segments = _extract_company_segments(company["id"], materials, revenue_bn)
     if not segments:
         annual_materials = _load_nearby_annual_materials(company, fallback, materials)
         if annual_materials:
-            segments = _extract_company_segments(company["id"], annual_materials)
+            segments = _extract_company_segments(company["id"], annual_materials, revenue_bn)
     lower_ratio, upper_ratio = COMPANY_SEGMENT_RATIO_BOUNDS.get(str(company["id"]), (0.55, 1.35))
     if not _segments_reasonable_for_revenue(segments, revenue_bn, lower_ratio=lower_ratio, upper_ratio=upper_ratio):
         segments = []

@@ -35,6 +35,7 @@ from app.services.official_parsers import _extract_company_segments
 from app.services.official_parsers import _extract_generic_guidance
 from app.services.official_parsers import _extract_quote_cards
 from app.services.official_parsers import _extract_table_metric
+from app.services.official_parsers import _flatten_text
 from app.services.official_parsers import _merge_parsed_payload
 from app.services.official_parsers import _prefer_richer_geographies
 from app.services.official_parsers import _sanitize_temporal_narrative_facts
@@ -44,6 +45,7 @@ from app.services.official_source_resolver import _discover_default_sitemap_urls
 from app.services.official_source_resolver import _ir_role_keywords_match, _ir_temporal_alignment
 from app.services.official_source_resolver import _quarter_reference_terms
 from app.services.official_source_resolver import _sec_cik_for_calendar_quarter
+from app.services.pdf_export import _build_raster_pdf_html, _pdf_export_mode
 from app.services.report_quality import evaluate_report_payload
 from app.services.reports import (
     REPORT_PAYLOAD_SCHEMA_VERSION,
@@ -340,6 +342,19 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
     def test_calendar_quarter_mapping_uses_majority_months(self) -> None:
         self.assertEqual(resolve_calendar_quarter_from_months(["2025-11", "2025-12", "2026-01"]), "2025Q4")
 
+    def test_pdf_export_mode_defaults_to_raster(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_pdf_export_mode(), "raster")
+        with patch.dict(os.environ, {"EARNINGS_DIGEST_PDF_EXPORT_MODE": "vector"}, clear=False):
+            self.assertEqual(_pdf_export_mode(), "vector")
+
+    def test_build_raster_pdf_html_embeds_each_page_image(self) -> None:
+        html = _build_raster_pdf_html(["page-01.png", "page-02.png"])
+        self.assertIn("page-01.png", html)
+        self.assertIn("page-02.png", html)
+        self.assertIn("@page", html)
+        self.assertIn("13.333in 7.5in", html)
+
     def test_nvidia_history_cube_has_12_points_and_segments(self) -> None:
         cube = build_historical_quarter_cube("nvidia", "2025Q4", 12)
         self.assertEqual(len(cube), 12)
@@ -629,6 +644,19 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
             },
         )
         supported = get_supported_quarters("nvidia", history_window=4, fetch_missing=True)
+        self.assertEqual(supported, [])
+
+    @patch("app.services.local_data.get_company_series")
+    def test_get_supported_quarters_rejects_sparse_annual_like_windows(self, mock_get_company_series: object) -> None:
+        periods = ["2021Q4", "2022Q4", "2023Q4", "2024Q4", "2025Q4"]
+        mock_get_company_series.return_value = (
+            periods,
+            {
+                "revenue": {period: 100 + index * 10 for index, period in enumerate(periods)},
+                "earnings": {period: 10 + index for index, period in enumerate(periods)},
+            },
+        )
+        supported = get_supported_quarters("nvidia", history_window=5, fetch_missing=True)
         self.assertEqual(supported, [])
 
     def test_company_quarters_ignores_partial_ready_map_until_full_audit_finishes(self) -> None:
@@ -1438,6 +1466,24 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
     def test_history_cube_requires_full_window(self) -> None:
         with self.assertRaises(ValueError):
             build_historical_quarter_cube("nvidia", "1900Q1", 12)
+
+    def test_history_cube_rejects_sparse_non_contiguous_windows_without_official_source(self) -> None:
+        sparse_periods = ["2021Q4", "2022Q4", "2023Q4", "2024Q4", "2025Q4"]
+        sparse_series = {
+            "revenue": {period: 100 + index * 10 for index, period in enumerate(sparse_periods)},
+            "earnings": {period: 10 + index for index, period in enumerate(sparse_periods)},
+            "grossMargin": {},
+            "revenueGrowth": {},
+            "roe": {},
+            "equity": {},
+            "periodMeta": {},
+        }
+        with patch(
+            "app.services.reports.get_company",
+            return_value={**get_company("nvidia"), "official_source": {}},
+        ):
+            with self.assertRaises(ValueError):
+                build_historical_quarter_cube("nvidia", "2025Q4", 5, periods=sparse_periods, series=sparse_series)
 
     def test_apple_history_cube_remaps_to_natural_quarter(self) -> None:
         cube = build_historical_quarter_cube("apple", "2025Q4", 12)
@@ -2595,6 +2641,60 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertIn("Subscription services", names)
         self.assertIn("Third-party seller services", names)
 
+    def test_extract_company_segments_discovers_generic_text_tables_with_trillion_units(self) -> None:
+        text = (
+            "Results by Business Segment\n"
+            "KRW trillion 4Q24 3Q25 4Q25 QoQ YoY 2024 2025 YoY\n"
+            "Total 75.8 86.1 93.8 9%↑ 24%↑ 300.9 333.6 11%↑\n"
+            "MX / NW 25.8 34.1 29.3 14%↓ 13%↑ 117.3 129.5 10%↑\n"
+            "VD / DA 14.4 13.9 14.8 6%↑ 2%↑ 56.5 57.3 1%↑\n"
+            "DS 30.1 33.1 44.0 33%↑ 46%↑ 111.1 130.1 17%↑\n"
+            "Harman 3.9 4.0 4.6 16%↑ 17%↑ 14.3 15.8 11%↑\n"
+        )
+        segments = _extract_company_segments(
+            "generic-co",
+            [
+                {
+                    "label": "Generic issuer presentation",
+                    "kind": "official_release",
+                    "raw_text": text,
+                    "flat_text": _flatten_text(text),
+                }
+            ],
+            revenue_bn=93_800.0,
+        )
+        segment_map = {item["name"]: item["value_bn"] for item in segments}
+        self.assertAlmostEqual(segment_map["DS"], 44_000.0, places=3)
+        self.assertAlmostEqual(segment_map["MX / NW"], 29_300.0, places=3)
+        self.assertAlmostEqual(segment_map["VD / DA"], 14_800.0, places=3)
+        self.assertAlmostEqual(segment_map["Harman"], 4_600.0, places=3)
+        self.assertAlmostEqual(sum(float(item["value_bn"]) for item in segments), 92_700.0, places=1)
+
+    def test_extract_company_geographies_reads_text_tables_with_header_units(self) -> None:
+        text = (
+            "Sales to customers by geographic area\n"
+            "USD billion 1Q24 4Q24 1Q25 QoQ YoY 2024 2025 YoY\n"
+            "North America 9.1 10.4 11.2 8%↑ 23%↑ 35.0 42.0 20%↑\n"
+            "Europe 5.0 5.5 6.2 13%↑ 24%↑ 20.2 23.7 17%↑\n"
+            "Asia Pacific 7.6 8.3 9.8 18%↑ 29%↑ 31.4 37.9 21%↑\n"
+        )
+        geographies = _extract_company_geographies(
+            "generic-co",
+            [
+                {
+                    "label": "Generic issuer supplement",
+                    "kind": "official_release",
+                    "raw_text": text,
+                    "flat_text": _flatten_text(text),
+                }
+            ],
+            27.2,
+        )
+        geography_map = {item["name"]: item["value_bn"] for item in geographies}
+        self.assertAlmostEqual(geography_map["Asia Pacific"], 9.8, places=3)
+        self.assertAlmostEqual(geography_map["North America"], 11.2, places=3)
+        self.assertAlmostEqual(geography_map["Europe"], 6.2, places=3)
+
     @patch.dict(os.environ, {"EARNINGS_DIGEST_DISABLE_SOURCE_FETCH": ""}, clear=False)
     @patch("app.services.official_materials.httpx.Client")
     def test_fetch_material_marks_javascript_shell_as_error(self, mock_http_client: object) -> None:
@@ -2934,6 +3034,19 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertEqual(preview.status_code, 200)
         self.assertIn("近 12 季成长总览", preview.text)
         self.assertIn("财报科目中文直译", preview.text)
+
+    def test_curated_report_preview_uses_dynamic_history_window_title(self) -> None:
+        response = self.client.post(
+            "/reports",
+            json={"company_id": "nvidia", "calendar_quarter": "2025Q4", "history_window": 16},
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+
+        preview = self.client.get(payload["preview_url"])
+        self.assertEqual(preview.status_code, 200)
+        self.assertIn("近 16 季成长总览", preview.text)
+        self.assertNotIn("近 12 季成长总览", preview.text)
 
     def test_report_job_api_round_trip(self) -> None:
         response = self.client.post(

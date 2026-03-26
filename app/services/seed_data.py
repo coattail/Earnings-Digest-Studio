@@ -586,6 +586,25 @@ COMPANY_REGISTRY = {
         },
         segment_order=["Net system sales", "Installed Base Management"],
     ),
+    "samsung": build_company(
+        "samsung",
+        "三星电子",
+        "Samsung Electronics",
+        "SSNLF",
+        "全球消费电子、存储、晶圆代工与移动终端龙头，盈利弹性受半导体景气与终端需求共同驱动。",
+        "#1428A0",
+        "#0F172A",
+        "#DBE5FF",
+        "#F7F9FF",
+        "stockanalysis",
+        "ssnlf",
+        money_symbol="₩",
+        currency_code="KRW",
+        structure_priority=["segment", "management"],
+        card_headline="存储价格周期、HBM/先进封装推进与移动终端盈利修复是主线。",
+        ir_url="https://images.samsung.com/is/content/samsung/assets/global/ir/docs/",
+        display_order=18,
+    ),
     "micron": build_company(
         "micron",
         "美光科技",
@@ -1012,6 +1031,32 @@ for company_id, report_style in REPORT_STYLE_UPDATES.items():
     COMPANY_REGISTRY[company_id]["report_style"] = report_style
 for company_id, report_visual_style in REPORT_STYLE_VISUAL_UPDATES.items():
     COMPANY_REGISTRY[company_id].setdefault("report_style", {}).update(report_visual_style)
+
+COMPANY_REGISTRY["samsung"]["manual_sources_by_quarter"] = {
+    "2025Q4": [
+        {
+            "label": "Samsung Electronics 4Q 2025 earnings materials",
+            "url": "https://images.samsung.com/is/content/samsung/assets/global/ir/docs/2025_4Q_conference_eng.pdf",
+            "kind": "official_release",
+            "role": "earnings_release",
+            "date": "2026-01-29",
+        },
+        {
+            "label": "Samsung Electronics 4Q 2025 investor presentation",
+            "url": "https://images.samsung.com/is/content/samsung/assets/global/ir/docs/2025_4Q_conference_eng.pdf",
+            "kind": "presentation",
+            "role": "earnings_presentation",
+            "date": "2026-01-29",
+        },
+        {
+            "label": "Samsung Electronics 4Q 2025 conference materials",
+            "url": "https://images.samsung.com/is/content/samsung/assets/global/ir/docs/2025_4Q_conference_eng.pdf",
+            "kind": "call_summary",
+            "role": "earnings_call",
+            "date": "2026-01-29",
+        },
+    ]
+}
 
 
 QUARTER_FIXTURES = {

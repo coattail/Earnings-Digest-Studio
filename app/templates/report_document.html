@@ -369,7 +369,7 @@
 
       <section class="page section-historical page-growth-overview">
         <div class="page-no">11 / {{ report.page_count }}</div>
-        {{ render_page_head("growth", "近 12 季成长总览", report.report_style.historical_label, "historical") }}
+        {{ render_page_head("growth", report.historical_growth_title, report.report_style.historical_label, "historical") }}
         <div class="chart-card wide-card">{{ report.visuals.growth_overview | safe }}</div>
         <div class="mini-card-grid three-col">
           {% for item in report.historical_summary_cards %}

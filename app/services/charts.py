@@ -2709,7 +2709,13 @@ def _growth_stack_plan(entries: list[dict[str, object]]) -> tuple[list[str], lis
     return (segment_names, plan, inferred_any)
 
 
-def render_growth_overview_svg(entries: list[dict[str, object]], colors: dict[str, str], primary: str, money_symbol: str = "$") -> str:
+def render_growth_overview_svg(
+    entries: list[dict[str, object]],
+    colors: dict[str, str],
+    primary: str,
+    money_symbol: str = "$",
+    title: str = "近 12 季成长总览",
+) -> str:
     width, height = 1180, 428
     chart_left = 74
     chart_top = 74
@@ -2724,9 +2730,10 @@ def render_growth_overview_svg(entries: list[dict[str, object]], colors: dict[st
     structure_label = "业务结构" if structure_basis != "geography" else "地区结构"
     legend_label = "业务类型" if structure_basis != "geography" else "地区类型"
     palette = _segment_palette(segment_names, colors, primary)
+    empty_title = title.replace("成长总览", "收入序列")
     body = [
         f'<rect x="0" y="0" width="{width}" height="{height}" rx="28" fill="#FFFFFF"/>',
-        '<text x="32" y="36" font-size="18" font-weight="700" fill="#0F172A">近 12 季成长总览</text>',
+        f'<text x="32" y="36" font-size="18" font-weight="700" fill="#0F172A">{_escape(title)}</text>',
         (
             f'<text x="32" y="56" font-size="12" fill="#64748B">每个季度柱体按{structure_label}分段上色；带 * 的季度按邻近官方结构占比补足显示，并保持全报告颜色映射一致。</text>'
             if inferred_segments
@@ -2739,7 +2746,7 @@ def render_growth_overview_svg(entries: list[dict[str, object]], colors: dict[st
         body.extend(
             [
                 '<rect x="74" y="92" width="1032" height="286" rx="24" fill="#F8FAFC" stroke="#E2E8F0" stroke-dasharray="7 7"/>',
-                f'<text x="108" y="154" font-size="20" font-weight="700" fill="{primary}">近 12 季收入序列暂未接入完整数值</text>',
+                f'<text x="108" y="154" font-size="20" font-weight="700" fill="{primary}">{_escape(empty_title)} 暂未接入完整数值</text>',
                 '<text x="108" y="190" font-size="14" fill="#334155">系统会继续展示当季页、电话会页与指引页；历史成长图在无可靠收入序列时不再强行绘制伪数据。</text>',
                 '<text x="108" y="222" font-size="13" fill="#64748B">可用季度：</text>',
                 "".join(

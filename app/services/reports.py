@@ -35,6 +35,7 @@ from .local_data import (
     get_company,
     get_company_series,
     get_company_periods,
+    _periods_are_consecutive_quarters,
     get_quarter_fixture,
     get_segment_history,
     get_supported_quarters,
@@ -1529,9 +1530,18 @@ def build_historical_quarter_cube(
                 - (_quarter_parts(selected_periods[0])[0] * 4 + _quarter_parts(selected_periods[0])[1])
             )
             sparse_window = actual_span > (len(selected_periods) - 1)
+            if not _periods_are_consecutive_quarters(selected_periods):
+                sparse_window = True
     else:
         selected_periods = []
         sparse_window = True
+
+    if sparse_window and not company.get("official_source"):
+        earliest = periods[0] if periods else calendar_quarter
+        raise ValueError(
+            f"Quarter {calendar_quarter} does not have a contiguous full {window}-quarter history window. "
+            f"Earliest available quarter is {earliest}."
+        )
 
     if company.get("official_source") and (calendar_quarter not in periods or sparse_window):
         selected_periods = _quarter_window(calendar_quarter, window)
@@ -3973,7 +3983,24 @@ def _generic_evidence_cards(history: list[dict[str, Any]], money_symbol: str) ->
     ]
 
 
-def _generic_sources(company: dict[str, Any], period_end: str) -> list[dict[str, Any]]:
+def _generic_sources(company: dict[str, Any], calendar_quarter: str, period_end: str) -> list[dict[str, Any]]:
+    manual_sources = (
+        dict(company.get("manual_sources_by_quarter") or {}).get(str(calendar_quarter))
+        if isinstance(company.get("manual_sources_by_quarter"), dict)
+        else None
+    )
+    if isinstance(manual_sources, list) and manual_sources:
+        sources = [dict(item) for item in manual_sources if isinstance(item, dict)]
+        if not any(str(item.get("kind") or "") == "structured_financials" for item in sources):
+            sources.append(
+                {
+                    "label": f"{company['english_name']} quarterly financials",
+                    "url": f"https://stockanalysis.com/stocks/{company['slug']}/financials/?p=quarterly",
+                    "kind": "structured_financials",
+                    "date": period_end,
+                }
+            )
+        return sources
     structured_url = f"https://stockanalysis.com/stocks/{company['slug']}/financials/?p=quarterly"
     sources = [
         {
@@ -4084,7 +4111,7 @@ def _build_generic_fixture(
         "catalysts": _generic_catalysts(history),
         "evidence_cards": _generic_evidence_cards(history, company["money_symbol"]),
         "coverage_notes": coverage_notes,
-        "sources": _generic_sources(company, period_end),
+        "sources": _generic_sources(company, calendar_quarter, period_end),
     }
 
 
@@ -4407,9 +4434,10 @@ def build_report_payload(
     _emit_progress(progress_callback, 0.03, "prepare", "正在校验参数并加载公司基础数据...")
     company = get_company(company_id)
     report_style = _build_report_style(company)
+    historical_growth_title = f"近 {int(history_window)} 季成长总览"
     periods, series = get_company_series(company_id)
     _emit_progress(progress_callback, 0.06, "prepare", "公司基础数据已加载，正在读取历史时间轴...")
-    _emit_progress(progress_callback, 0.10, "history", "正在构建近 12 季历史数据与增长结构...")
+    _emit_progress(progress_callback, 0.10, "history", f"正在构建近 {int(history_window)} 季历史数据与增长结构...")
     history = build_historical_quarter_cube(company_id, calendar_quarter, history_window, periods=periods, series=series)
     fixture = get_quarter_fixture(company_id, calendar_quarter) or _build_generic_fixture(company, calendar_quarter, history, series)
     fixture = dict(fixture)
@@ -4461,7 +4489,7 @@ def build_report_payload(
     fixture = _quarterize_fixture_geographies(fixture)
     fixture = _promote_geographies_as_segments(fixture)
     history = _refresh_latest_history_entry(company, history, fixture)
-    _emit_progress(progress_callback, 0.81, "history", "正在用官方结构补齐近 12 季口径...")
+    _emit_progress(progress_callback, 0.81, "history", f"正在用官方结构补齐近 {int(history_window)} 季口径...")
     history = _enrich_history_with_official_structures(
         company,
         history,
@@ -4700,7 +4728,13 @@ def build_report_payload(
             left_subtitle="按影响程度排序",
             right_subtitle="按边际改善弹性排序",
         ),
-        "growth_overview": render_growth_overview_svg(history, brand["segment_colors"], brand["primary"], money_symbol=money_symbol),
+        "growth_overview": render_growth_overview_svg(
+            history,
+            brand["segment_colors"],
+            brand["primary"],
+            money_symbol=money_symbol,
+            title=historical_growth_title,
+        ),
         "structure_transition": render_structure_transition_svg(
             history,
             brand["segment_colors"],
@@ -4759,6 +4793,7 @@ def build_report_payload(
         "guidance": fixture["guidance"],
         "guidance_title": guidance_title,
         "guidance_note": guidance_note,
+        "historical_growth_title": historical_growth_title,
         "guidance_panel": guidance_panel,
         "guidance_change_panel": guidance_change_panel,
         "expectation_panel": expectation_panel,
