@@ -21,7 +21,7 @@ from .schemas import (
     UploadResponse,
 )
 from .services.pdf_export import export_html_to_pdf
-from .services.local_data import normalize_calendar_quarter_input, resolve_company_reference, suggest_company_matches
+from .services.local_data import normalize_calendar_quarter_input, resolve_company_reference
 from .services.reports import (
     company_cards,
     company_quarters,
@@ -118,10 +118,6 @@ def _resolve_skill_inputs(company_value: str, quarter_value: str) -> tuple[dict[
             ),
         ) from exc
     except KeyError as exc:
-        suggestions = [
-            f"{item['english_name']} ({item['ticker']})"
-            for item in suggest_company_matches(company_value, limit=5)
-        ]
         raise HTTPException(
             status_code=404,
             detail=_skill_error_detail(
@@ -131,9 +127,8 @@ def _resolve_skill_inputs(company_value: str, quarter_value: str) -> tuple[dict[
                         "company_not_resolved",
                         "resolve_company",
                         "error",
-                        f"无法识别公司输入“{company_value}”。",
-                        recovery_hint="请改用更标准的英文名、中文名或股票代码。",
-                        suggestions=suggestions,
+                        f"当前未能解析公司输入“{company_value}”。",
+                        recovery_hint="请改用更完整的公司英文名或股票代码（ticker）重试。",
                     )
                 ],
             ),

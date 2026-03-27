@@ -227,6 +227,8 @@ COMPANY_REGISTRY = {
             "filing_forms": ["10-Q", "10-K"],
         },
         segment_order=[
+            "Media",
+            "Electronics and other general merchandise",
             "North America",
             "International",
             "AWS",
@@ -389,6 +391,58 @@ COMPANY_REGISTRY = {
             "fiscal_year_end_month": 1,
         },
         segment_order=["Walmart U.S.", "Walmart International", "Sam's Club U.S."],
+    ),
+    "mcdonalds": build_company(
+        "mcdonalds",
+        "麦当劳",
+        "McDonald's",
+        "MCD",
+        "全球快餐连锁龙头，以直营与加盟并行模式驱动高利润率和稳定现金流。",
+        "#DA291C",
+        "#FFC72C",
+        "#FDE7E3",
+        "#FFF9F2",
+        "stockanalysis",
+        "mcd",
+        card_headline="同店销售、加盟租金与餐厅利润率共同决定业绩韧性。",
+        ir_url="https://investor.mcdonalds.com/",
+        display_order=12,
+        official_source={
+            "sec_cik": "0000063908",
+            "release_forms": ["8-K"],
+            "filing_forms": ["10-Q", "10-K"],
+            "discovery_sitemaps": ["https://corporate.mcdonalds.com/content/dam/sites/corp/nfl/json/sitemap.json"],
+            "fiscal_year_end_month": 12,
+        },
+        segment_order=[
+            "U.S.",
+            "International Operated Markets",
+            "International Developmental Licensed Markets & Corporate",
+        ],
+    ),
+    "starbucks": build_company(
+        "starbucks",
+        "星巴克",
+        "Starbucks",
+        "SBUX",
+        "全球咖啡连锁龙头，以门店效率、会员运营和国际扩张驱动长期增长。",
+        "#006241",
+        "#1F2937",
+        "#DCFCE7",
+        "#F6FFF9",
+        "stockanalysis",
+        "sbux",
+        card_headline="同店销售、客单价与中国及北美门店效率是核心观察点。",
+        ir_url="https://investor.starbucks.com/",
+        display_order=13,
+        quarter_label_mode="by_period_end_majority",
+        official_source={
+            "sec_cik": "0000829224",
+            "release_forms": ["8-K"],
+            "filing_forms": ["10-Q", "10-K"],
+            "fiscal_year_end_month": 9,
+        },
+        segment_order=["North America", "International", "Channel Development", "Corporate and Other"],
     ),
     "lly": build_company(
         "lly",
@@ -586,6 +640,25 @@ COMPANY_REGISTRY = {
         },
         segment_order=["Net system sales", "Installed Base Management"],
     ),
+    "samsung": build_company(
+        "samsung",
+        "三星电子",
+        "Samsung Electronics",
+        "SSNLF",
+        "全球消费电子、存储、晶圆代工与移动终端龙头，盈利弹性受半导体景气与终端需求共同驱动。",
+        "#1428A0",
+        "#0F172A",
+        "#DBE5FF",
+        "#F7F9FF",
+        "stockanalysis",
+        "ssnlf",
+        money_symbol="₩",
+        currency_code="KRW",
+        structure_priority=["segment", "management"],
+        card_headline="存储价格周期、HBM/先进封装推进与移动终端盈利修复是主线。",
+        ir_url="https://images.samsung.com/is/content/samsung/assets/global/ir/docs/",
+        display_order=18,
+    ),
     "micron": build_company(
         "micron",
         "美光科技",
@@ -638,6 +711,29 @@ COMPANY_REGISTRY = {
             "fiscal_year_end_month": 5,
         },
         segment_order=["Cloud", "Software", "Hardware", "Services"],
+    ),
+    "ibm": build_company(
+        "ibm",
+        "IBM",
+        "IBM",
+        "IBM",
+        "企业软件、咨询与基础设施并行推进的全球 IT 平台型公司。",
+        "#0F62FE",
+        "#161616",
+        "#D0E2FF",
+        "#F4F9FF",
+        "stockanalysis",
+        "ibm",
+        card_headline="软件增长、咨询恢复与大型主机周期共同决定利润弹性。",
+        ir_url="https://www.ibm.com/investor/",
+        display_order=21,
+        official_source={
+            "sec_cik": "0000051143",
+            "release_forms": ["8-K"],
+            "filing_forms": ["10-Q", "10-K"],
+            "fiscal_year_end_month": 12,
+        },
+        segment_order=["Software", "Consulting", "Infrastructure", "Financing"],
     ),
     "costco": build_company(
         "costco",
@@ -697,6 +793,7 @@ BRAND_THEME_PATTERN_UPDATES = {
     "asml": "precision",
     "micron": "circuit",
     "oracle": "circuit",
+    "ibm": "grid",
     "costco": "retail",
 }
 SEGMENT_ALIAS_UPDATES = {
@@ -756,6 +853,7 @@ SEGMENT_ALIAS_UPDATES = {
         "Aws": "AWS",
         "Amazon Web Services": "AWS",
         "Amazon web services": "AWS",
+        "Other (1)": "Other",
         "Online stores revenue": "Online stores",
         "Third-party seller services revenue": "Third-party seller services",
         "Advertising services revenue": "Advertising services",
@@ -1012,6 +1110,32 @@ for company_id, report_style in REPORT_STYLE_UPDATES.items():
     COMPANY_REGISTRY[company_id]["report_style"] = report_style
 for company_id, report_visual_style in REPORT_STYLE_VISUAL_UPDATES.items():
     COMPANY_REGISTRY[company_id].setdefault("report_style", {}).update(report_visual_style)
+
+COMPANY_REGISTRY["samsung"]["manual_sources_by_quarter"] = {
+    "2025Q4": [
+        {
+            "label": "Samsung Electronics 4Q 2025 earnings materials",
+            "url": "https://images.samsung.com/is/content/samsung/assets/global/ir/docs/2025_4Q_conference_eng.pdf",
+            "kind": "official_release",
+            "role": "earnings_release",
+            "date": "2026-01-29",
+        },
+        {
+            "label": "Samsung Electronics 4Q 2025 investor presentation",
+            "url": "https://images.samsung.com/is/content/samsung/assets/global/ir/docs/2025_4Q_conference_eng.pdf",
+            "kind": "presentation",
+            "role": "earnings_presentation",
+            "date": "2026-01-29",
+        },
+        {
+            "label": "Samsung Electronics 4Q 2025 conference materials",
+            "url": "https://images.samsung.com/is/content/samsung/assets/global/ir/docs/2025_4Q_conference_eng.pdf",
+            "kind": "call_summary",
+            "role": "earnings_call",
+            "date": "2026-01-29",
+        },
+    ]
+}
 
 
 QUARTER_FIXTURES = {

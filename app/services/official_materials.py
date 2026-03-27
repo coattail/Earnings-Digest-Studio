@@ -141,6 +141,28 @@ def _sec_submission_preferred_types(source: dict[str, Any]) -> list[str]:
     return ["10-Q", "10-K", "6-K", "20-F", "8-K", "EX-13", "EX-99"]
 
 
+def _sec_submission_document_bonus(source: dict[str, Any], filename: str, description: str, document_type: str) -> int:
+    role = str(source.get("role") or "")
+    kind = str(source.get("kind") or "")
+    tokens = _normalize_whitespace(f"{filename} {description} {document_type}").lower()
+    if role == "earnings_call" or kind == "call_summary":
+        if any(token in tokens for token in ("prepared remarks", "transcript", "conference call", "earnings call", "webcast", "script", "replay")):
+            return 4
+        if "99.2" in tokens or "ex-99.2" in tokens or "exhibit992" in tokens:
+            return 2
+    if role == "earnings_commentary":
+        if any(token in tokens for token in ("commentary", "supplement", "cfo")):
+            return 3
+        if "99.2" in tokens or "ex-99.2" in tokens or "exhibit992" in tokens:
+            return 1
+    if role == "earnings_release" or kind == "official_release":
+        if any(token in tokens for token in ("press release", "financial results", "quarterly results", "earnings release")):
+            return 3
+        if any(token in tokens for token in ("prepared remarks", "transcript", "conference call", "presentation")):
+            return -2
+    return 0
+
+
 def _extract_sec_submission_text(raw_bytes: bytes, source: dict[str, Any]) -> tuple[str, str]:
     payload = raw_bytes.decode("utf-8", errors="ignore")
     documents = _sec_submission_document_blocks(payload)
@@ -171,6 +193,7 @@ def _extract_sec_submission_text(raw_bytes: bytes, source: dict[str, Any]) -> tu
                 priority = 0
         quality = 1 if ("htm" in filename or "<html" in document.get("text", "").lower()) else 0
         metadata_bonus = 1 if "earn" in filename or "result" in filename or "financial" in description else 0
+        metadata_bonus += _sec_submission_document_bonus(source, filename, description, document_type)
         candidate_key = (priority, quality, metadata_bonus - index)
         if candidate_key > best_key:
             best_key = candidate_key

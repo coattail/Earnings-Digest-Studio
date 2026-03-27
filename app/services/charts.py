@@ -555,32 +555,69 @@ def render_segment_mix_svg(
     accent: str,
     money_symbol: str = "$",
 ) -> str:
+    segment_regional_mode = bool(segments) and all(
+        str(item.get("scope") or "").casefold() == "regional_segment" for item in segments
+    )
     business_names = [str(item.get("name") or "Business") for item in segments]
     business_palette = _segment_palette(business_names, colors, accent)
     annual_geography_mode = bool(geographies) and all(str(item.get("scope") or "") == "annual_filing" for item in geographies)
-    regional_segment_mode = bool(geographies) and all(str(item.get("scope") or "") == "regional_segment" for item in geographies)
+    geography_regional_mode = bool(geographies) and all(
+        str(item.get("scope") or "").casefold() == "regional_segment" for item in geographies
+    )
+    duplicate_regional_panels = (
+        geography_regional_mode
+        and bool(segments)
+        and {
+            (
+                str(item.get("name") or "").casefold(),
+                round(float(item.get("value_bn") or 0.0), 3),
+            )
+            for item in segments
+        }
+        == {
+            (
+                str(item.get("name") or "").casefold(),
+                round(float(item.get("value_bn") or 0.0), 3),
+            )
+            for item in geographies
+        }
+    )
     business_svg = _donut_panel_svg(
-        "业务营收结构",
-        "优先采用财报分部口径，保持品牌映射一致。",
+        "区域经营分部结构" if segment_regional_mode else "业务营收结构",
+        "公司按区域经营分部披露，这里直接保留官方分部口径，不把它误写成营收类型。"
+        if segment_regional_mode
+        else "优先采用财报分部口径，保持品牌映射一致。"
+        if not duplicate_regional_panels
+        else "公司按区域经营分部披露时，这里直接保留官方分部口径。",
         segments,
         business_palette,
         accent,
         money_symbol,
         "当前缺少稳定分部披露，系统已改为总量成长、利润质量与管理层结构摘要。",
+        center_label="经营分部" if segment_regional_mode else "当季营收",
     )
     geography_svg = _donut_panel_svg(
         "地区营收结构",
+        "公司未单列终端地理收入，因此这一栏不重复展示与分部完全相同的区域口径。"
+        if duplicate_regional_panels
+        else
         "若财报披露地理口径，则自动补入第二张圆环结构图。"
-        if not annual_geography_mode and not regional_segment_mode
+        if not annual_geography_mode and not geography_regional_mode
         else "若公司按区域经营分部披露，则采用区域经营分部口径，并显式区分于业务分部。"
-        if regional_segment_mode
+        if geography_regional_mode
         else "若当季未单独披露，则回退到最近年报地理口径，并显式标注为年度视角。",
-        geographies,
+        [] if duplicate_regional_panels else geographies,
         _geography_palette([str(item.get("name") or "Geography") for item in geographies], accent),
         accent,
         money_symbol,
-        "当前季度未在已接入官方材料中发现稳定地区收入拆分，因此本页保留业务结构主图。",
-        center_label="当季营收" if not annual_geography_mode and not regional_segment_mode else "区域经营分部" if regional_segment_mode else "年度地区口径",
+        "当前季度未在已接入官方材料中发现稳定地区收入拆分，因此本页保留业务结构主图。"
+        if not duplicate_regional_panels
+        else "当前官方材料只披露了区域经营分部，没有单独给出终端地理收入拆分。",
+        center_label="当季营收"
+        if not annual_geography_mode and not geography_regional_mode
+        else "区域经营分部"
+        if geography_regional_mode
+        else "年度地区口径",
     )
     return _svg(
         1140,
@@ -2709,7 +2746,13 @@ def _growth_stack_plan(entries: list[dict[str, object]]) -> tuple[list[str], lis
     return (segment_names, plan, inferred_any)
 
 
-def render_growth_overview_svg(entries: list[dict[str, object]], colors: dict[str, str], primary: str, money_symbol: str = "$") -> str:
+def render_growth_overview_svg(
+    entries: list[dict[str, object]],
+    colors: dict[str, str],
+    primary: str,
+    money_symbol: str = "$",
+    title: str = "近 12 季成长总览",
+) -> str:
     width, height = 1180, 428
     chart_left = 74
     chart_top = 74
@@ -2724,9 +2767,10 @@ def render_growth_overview_svg(entries: list[dict[str, object]], colors: dict[st
     structure_label = "业务结构" if structure_basis != "geography" else "地区结构"
     legend_label = "业务类型" if structure_basis != "geography" else "地区类型"
     palette = _segment_palette(segment_names, colors, primary)
+    empty_title = title.replace("成长总览", "收入序列")
     body = [
         f'<rect x="0" y="0" width="{width}" height="{height}" rx="28" fill="#FFFFFF"/>',
-        '<text x="32" y="36" font-size="18" font-weight="700" fill="#0F172A">近 12 季成长总览</text>',
+        f'<text x="32" y="36" font-size="18" font-weight="700" fill="#0F172A">{_escape(title)}</text>',
         (
             f'<text x="32" y="56" font-size="12" fill="#64748B">每个季度柱体按{structure_label}分段上色；带 * 的季度按邻近官方结构占比补足显示，并保持全报告颜色映射一致。</text>'
             if inferred_segments
@@ -2739,7 +2783,7 @@ def render_growth_overview_svg(entries: list[dict[str, object]], colors: dict[st
         body.extend(
             [
                 '<rect x="74" y="92" width="1032" height="286" rx="24" fill="#F8FAFC" stroke="#E2E8F0" stroke-dasharray="7 7"/>',
-                f'<text x="108" y="154" font-size="20" font-weight="700" fill="{primary}">近 12 季收入序列暂未接入完整数值</text>',
+                f'<text x="108" y="154" font-size="20" font-weight="700" fill="{primary}">{_escape(empty_title)} 暂未接入完整数值</text>',
                 '<text x="108" y="190" font-size="14" fill="#334155">系统会继续展示当季页、电话会页与指引页；历史成长图在无可靠收入序列时不再强行绘制伪数据。</text>',
                 '<text x="108" y="222" font-size="13" fill="#64748B">可用季度：</text>',
                 "".join(

@@ -29,6 +29,8 @@ BRAND_SEGMENT_COLOR_UPDATES = {
         "Other Bets": "#64748B",
     },
     "amazon": {
+        "Media": "#111827",
+        "Electronics and other general merchandise": "#F59E0B",
         "North America": "#111827",
         "International": "#F59E0B",
         "AWS": "#2563EB",
