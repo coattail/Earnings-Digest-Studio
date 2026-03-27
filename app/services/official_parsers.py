@@ -1713,6 +1713,76 @@ def _extract_scaled_label_value(
     return None
 
 
+_BALANCE_SHEET_UNIT_PATTERNS: list[tuple[str, float]] = [
+    (r"\(?(?:dollars?\s+in|in)\s+billions\)?", 1.0),
+    (r"\(?(?:dollars?\s+in|in)\s+millions(?:\s+except\s+per\s+share\s+amounts?)?\)?", 0.001),
+    (r"\(?(?:dollars?\s+in|in)\s+thousands\)?", 0.000001),
+]
+
+
+def _nearest_balance_sheet_scale_before(text: str, position: int, *, max_distance: int = 8000) -> Optional[float]:
+    prefix = text[: max(0, int(position))]
+    best_position: Optional[int] = None
+    best_scale: Optional[float] = None
+    for pattern, scale in _BALANCE_SHEET_UNIT_PATTERNS:
+        for match in re.finditer(pattern, prefix, flags=re.IGNORECASE):
+            if best_position is None or match.start() > best_position:
+                best_position = match.start()
+                best_scale = scale
+    if best_position is None or best_scale is None:
+        return None
+    if int(position) - best_position > max_distance:
+        return None
+    return best_scale
+
+
+def _extract_contextual_balance_sheet_value_bn(text: str, labels: list[str]) -> Optional[float]:
+    for label in labels:
+        for match in re.finditer(
+            rf"{_table_label_pattern(label)}"
+            r"\s+\$?\s*([0-9,]+(?:\.[0-9]+)?)",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            parsed = _parse_number(match.group(1))
+            if parsed is None:
+                continue
+            scale = _nearest_balance_sheet_scale_before(text, match.start())
+            if scale is None:
+                local_context = text[max(0, match.start() - 600) : match.start() + 160]
+                for pattern, candidate_scale in _BALANCE_SHEET_UNIT_PATTERNS:
+                    if re.search(pattern, local_context, flags=re.IGNORECASE):
+                        scale = candidate_scale
+                        break
+            if scale is None:
+                continue
+            return float(parsed) * float(scale)
+    return None
+
+
+def _normalize_ending_equity_bn(
+    value: Optional[float],
+    *,
+    revenue_bn: Optional[float] = None,
+    fallback_equity_bn: Optional[float] = None,
+) -> Optional[float]:
+    if value is None:
+        return None
+    normalized = float(value)
+    if normalized <= 0:
+        return None
+    fallback_value = float(fallback_equity_bn) if fallback_equity_bn not in (None, 0) else None
+    revenue_value = float(revenue_bn) if revenue_bn not in (None, 0) else None
+    if normalized > 1000:
+        if fallback_value not in (None, 0):
+            shrunk = normalized / 1000.0
+            if abs(shrunk - fallback_value) / max(abs(fallback_value), 1.0) <= 0.4:
+                return shrunk
+        if revenue_value not in (None, 0) and normalized / revenue_value > 60:
+            return normalized / 1000.0
+    return normalized
+
+
 def _extract_ending_equity_bn(materials: list[dict[str, Any]]) -> Optional[float]:
     labels = [
         "Total stockholders' equity",
@@ -1745,18 +1815,9 @@ def _extract_ending_equity_bn(materials: list[dict[str, Any]]) -> Optional[float
         for text in (raw_text, flat_text):
             if not text:
                 continue
-            if _search(r"in\s+(?:nt\$|us\$)?\s*billions", text) or _search(r"\(in\s+billions\)", text):
-                equity_bn = _extract_scaled_label_value(text, labels, scale=1.0)
-                if equity_bn is not None:
-                    return equity_bn
-            if _search(r"in\s+millions", text) or _search(r"\(millions\)", text):
-                equity_bn = _extract_scaled_label_value(text, labels, scale=0.001)
-                if equity_bn is not None:
-                    return equity_bn
-            if _search(r"in\s+thousands", text):
-                equity_bn = _extract_scaled_label_value(text, labels, scale=0.000001)
-                if equity_bn is not None:
-                    return equity_bn
+            equity_bn = _extract_contextual_balance_sheet_value_bn(text, labels)
+            if equity_bn is not None:
+                return equity_bn
     return None
 
 
@@ -4348,6 +4409,16 @@ def _finalize(
     revenue_yoy_pct = facts.get("revenue_yoy_pct")
     net_income_bn = facts.get("net_income_bn")
     net_income_yoy_pct = facts.get("net_income_yoy_pct")
+    fallback_latest_kpis = dict(fallback.get("latest_kpis") or {})
+    normalized_ending_equity_bn = _normalize_ending_equity_bn(
+        facts.get("ending_equity_bn"),
+        revenue_bn=revenue_bn,
+        fallback_equity_bn=(
+            fallback_latest_kpis.get("ending_equity_bn")
+            if fallback_latest_kpis.get("ending_equity_bn") is not None
+            else fallback.get("equity_bn")
+        ),
+    )
 
     latest_kpis = _clean_mapping(
         {
@@ -4363,7 +4434,7 @@ def _finalize(
             "free_cash_flow_bn": facts.get("free_cash_flow_bn"),
             "gaap_eps": facts.get("gaap_eps"),
             "non_gaap_eps": facts.get("non_gaap_eps", facts.get("gaap_eps")),
-            "ending_equity_bn": facts.get("ending_equity_bn"),
+            "ending_equity_bn": normalized_ending_equity_bn,
         }
     )
 

@@ -710,6 +710,29 @@ COMPANY_REGISTRY = {
         },
         segment_order=["Cloud", "Software", "Hardware", "Services"],
     ),
+    "ibm": build_company(
+        "ibm",
+        "IBM",
+        "IBM",
+        "IBM",
+        "企业软件、咨询与基础设施并行推进的全球 IT 平台型公司。",
+        "#0F62FE",
+        "#161616",
+        "#D0E2FF",
+        "#F4F9FF",
+        "stockanalysis",
+        "ibm",
+        card_headline="软件增长、咨询恢复与大型主机周期共同决定利润弹性。",
+        ir_url="https://www.ibm.com/investor/",
+        display_order=21,
+        official_source={
+            "sec_cik": "0000051143",
+            "release_forms": ["8-K"],
+            "filing_forms": ["10-Q", "10-K"],
+            "fiscal_year_end_month": 12,
+        },
+        segment_order=["Software", "Consulting", "Infrastructure", "Financing"],
+    ),
     "costco": build_company(
         "costco",
         "好市多",
@@ -768,6 +791,7 @@ BRAND_THEME_PATTERN_UPDATES = {
     "asml": "precision",
     "micron": "circuit",
     "oracle": "circuit",
+    "ibm": "grid",
     "costco": "retail",
 }
 SEGMENT_ALIAS_UPDATES = {

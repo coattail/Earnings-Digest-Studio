@@ -241,7 +241,7 @@
         {{ render_page_head("management_qna", "电话会与问答主题", report.report_style.quarterly_label, "quarterly") }}
         <div class="chart-card wide-card">{{ report.visuals.management_qna | safe }}</div>
         <div class="page-split two-col compact-panels signal-followup-panels balanced-panels">
-          <article class="text-panel">
+          <article class="text-panel" data-autofit-block="signal-panel">
             <h3>{{ report.call_panel.title }}</h3>
             {% if report.call_panel.meta_lines %}
             <ul class="summary-list">
@@ -256,12 +256,12 @@
               {% endfor %}
             </ul>
           </article>
-          <article class="text-panel">
+          <article class="text-panel" data-autofit-block="signal-panel">
             {% if report.call_quote_cards %}
             <h3>{{ report.narrative_provenance.quote_panel_title }}</h3>
             <div class="quote-card-stack">
               {% set featured_quote = report.call_quote_cards[0] %}
-              <article class="quote-card{% if featured_quote.quote|length > 280 or featured_quote.analysis|length > 150 or featured_quote.source_label|length > 88 %} quote-card-dense{% endif %}{% if featured_quote.quote|length > 420 or featured_quote.analysis|length > 210 %} quote-card-ultra-dense{% endif %}">
+              <article class="quote-card{% if featured_quote.quote|length > 280 or featured_quote.analysis|length > 150 or featured_quote.source_label|length > 88 %} quote-card-dense{% endif %}{% if featured_quote.quote|length > 420 or featured_quote.analysis|length > 210 %} quote-card-ultra-dense{% endif %}" data-autofit-block="quote-card">
                 <span>{{ featured_quote.speaker }}</span>
                 <strong>{{ featured_quote.quote }}</strong>
                 <p>{{ featured_quote.analysis }}</p>
@@ -285,7 +285,7 @@
         {{ render_page_head("risks", "风险与催化剂", report.report_style.quarterly_label, "quarterly") }}
         <div class="chart-card wide-card">{{ report.visuals.risks_catalysts | safe }}</div>
         <div class="page-split two-col compact-panels signal-followup-panels balanced-panels">
-          <article class="text-panel">
+          <article class="text-panel" data-autofit-block="signal-panel">
             <h3>本季风险视角</h3>
             <p><strong>来源：</strong>{{ report.narrative_provenance.risks.label }}。{{ report.narrative_provenance.risks.detail }}</p>
             <div class="scenario-stack">
@@ -300,7 +300,7 @@
               {% endfor %}
             </div>
           </article>
-          <article class="text-panel">
+          <article class="text-panel" data-autofit-block="signal-panel">
             <h3>本季催化剂视角</h3>
             <p><strong>来源：</strong>{{ report.narrative_provenance.catalysts.label }}。{{ report.narrative_provenance.catalysts.detail }}</p>
             <div class="scenario-stack">
@@ -493,6 +493,28 @@
     </main>
     <script>
       (function () {
+        function resetAutofit(page) {
+          page.querySelectorAll("[data-autofit-block]").forEach((node) => {
+            node.dataset.textFit = "";
+          });
+        }
+
+        function blockOverflow(node) {
+          return Math.max(node.scrollHeight - node.clientHeight, node.scrollWidth - node.clientWidth);
+        }
+
+        function fitAutofitBlocks(page) {
+          const blocks = Array.from(page.querySelectorAll("[data-autofit-block]"));
+          if (!blocks.length) return;
+          const levels = ["compact", "dense", "ultra"];
+          blocks.forEach((node) => {
+            for (const level of levels) {
+              if (blockOverflow(node) <= 1) break;
+              node.dataset.textFit = level;
+            }
+          });
+        }
+
         function pageOverflow(page) {
           const pageRect = page.getBoundingClientRect();
           let overflow = 0;
@@ -509,13 +531,22 @@
         function fitPages() {
           document.querySelectorAll(".page").forEach((page) => {
             page.dataset.fit = "";
+            resetAutofit(page);
             let overflow = pageOverflow(page);
+            if (overflow > 2) {
+              fitAutofitBlocks(page);
+              overflow = pageOverflow(page);
+            }
             if (overflow > 2) {
               page.dataset.fit = overflow > 20 ? "dense" : "tight";
               overflow = pageOverflow(page);
             }
             if (overflow > 2 && page.dataset.fit !== "dense") {
               page.dataset.fit = "dense";
+              overflow = pageOverflow(page);
+            }
+            if (overflow > 2) {
+              fitAutofitBlocks(page);
             }
           });
         }

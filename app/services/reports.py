@@ -256,6 +256,29 @@ def _ttm_roe_pct(entries: list[dict[str, Any]], end_index: int) -> Optional[floa
     return None
 
 
+def _normalize_equity_bn_value(
+    value: Optional[float],
+    *,
+    reference_equity_bn: Optional[float] = None,
+    revenue_bn: Optional[float] = None,
+) -> Optional[float]:
+    if value is None:
+        return None
+    normalized = float(value)
+    if normalized <= 0:
+        return None
+    reference_value = float(reference_equity_bn) if reference_equity_bn not in (None, 0) else None
+    revenue_value = float(revenue_bn) if revenue_bn not in (None, 0) else None
+    if normalized > 1000:
+        if reference_value not in (None, 0):
+            shrunk = normalized / 1000.0
+            if abs(shrunk - reference_value) / max(abs(reference_value), 1.0) <= 0.4:
+                return shrunk
+        if revenue_value not in (None, 0) and normalized / revenue_value > 60:
+            return normalized / 1000.0
+    return normalized
+
+
 def _quarter_parts(calendar_quarter: str) -> tuple[int, int]:
     return int(calendar_quarter[:4]), int(calendar_quarter[-1])
 
@@ -2389,7 +2412,15 @@ def _enrich_history_with_official_structures(
         gross_margin_pct = latest_kpis.get("gaap_gross_margin_pct")
         revenue_yoy_pct = latest_kpis.get("revenue_yoy_pct")
         net_income_yoy_pct = latest_kpis.get("net_income_yoy_pct")
-        ending_equity_bn = latest_kpis.get("ending_equity_bn")
+        ending_equity_bn = _normalize_equity_bn_value(
+            latest_kpis.get("ending_equity_bn"),
+            reference_equity_bn=entry.get("equity_bn"),
+            revenue_bn=revenue_bn if revenue_bn is not None else entry.get("revenue_bn"),
+        )
+        if ending_equity_bn is not None and latest_kpis.get("ending_equity_bn") != ending_equity_bn:
+            latest_kpis["ending_equity_bn"] = ending_equity_bn
+            cached_parsed["latest_kpis"] = dict(latest_kpis)
+            _store_historical_official_quarter_cache(str(company["id"]), period, cached_parsed)
         if revenue_bn is not None:
             entry["revenue_bn"] = float(revenue_bn)
         if net_income_bn is not None:
@@ -2737,6 +2768,51 @@ def _transcript_chunks(text: str) -> list[str]:
     return merged
 
 
+def _highlight_candidate_is_readable(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(normalized) < 24:
+        return False
+    lowered = normalized.lower()
+    url_matches = re.findall(r"https?://\S+", normalized)
+    taxonomy_tokens = re.findall(r"\b[a-z0-9._-]+:[A-Za-z0-9._-]+\b", normalized, flags=re.IGNORECASE)
+    date_tokens = re.findall(r"\b20\d{2}-\d{2}-\d{2}\b", normalized)
+    slash_hash_tokens = [
+        token
+        for token in normalized.split()
+        if token.startswith(("http://", "https://")) or token.count("/") >= 2 or "#" in token
+    ]
+    code_like_tokens = re.findall(r"\b[A-Z0-9._-]{6,}\b", normalized)
+    readable_terms = re.findall(r"[A-Za-z\u4e00-\u9fff]{2,}", normalized)
+    if len(url_matches) >= 2:
+        return False
+    if "fasb.org/us-gaap" in lowered or "ifrs-full" in lowered:
+        return False
+    if len(taxonomy_tokens) >= 2:
+        return False
+    if len(date_tokens) >= 3 and len(readable_terms) < 10:
+        return False
+    if len(slash_hash_tokens) >= 3 and len(slash_hash_tokens) >= max(2, len(normalized.split()) // 4):
+        return False
+    if len(code_like_tokens) >= 5 and len(readable_terms) < 8:
+        return False
+    return True
+
+
+def _normalize_highlight_candidate(text: str, *, max_length: int = 220) -> str:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not normalized or not _highlight_candidate_is_readable(normalized):
+        return ""
+    return _excerpt_text(normalized, max_length)
+
+
+def _append_unique_highlight(highlights: list[str], candidate: str, *, limit: int = 3) -> bool:
+    normalized = _normalize_highlight_candidate(candidate)
+    if not normalized or normalized in highlights:
+        return len(highlights) >= limit
+    highlights.append(normalized)
+    return len(highlights) >= limit
+
+
 def _looks_like_transcript_text(text: str, label: str = "") -> bool:
     normalized = re.sub(r"\s+", " ", str(text or "")).strip()
     lowered = normalized.lower()
@@ -2915,9 +2991,7 @@ def _official_material_proxy_summary(
     if preferred_text:
         if _looks_like_transcript_text(preferred_text, str(preferred_material.get("label") or "")):
             for item in _transcript_highlights(preferred_text):
-                if item and item not in highlights:
-                    highlights.append(item)
-                if len(highlights) >= 2:
+                if _append_unique_highlight(highlights, item, limit=2):
                     break
         if len(highlights) < 2:
             for chunk in _transcript_chunks(preferred_text):
@@ -2925,29 +2999,30 @@ def _official_material_proxy_summary(
                 if len(chunk) < 90:
                     continue
                 if any(token in lowered_chunk for token in ("revenue", "margin", "guidance", "demand", "traffic", "comparable", "cash flow", "operating income")):
-                    excerpt = _excerpt_text(chunk, 280)
-                    if excerpt and excerpt not in highlights:
-                        highlights.append(excerpt)
+                    if _append_unique_highlight(highlights, chunk, limit=2):
+                        break
                 if len(highlights) >= 2:
                     break
     for quote in list(fixture.get("call_quote_cards") or []):
         text = re.sub(r"\s+", " ", str(quote.get("quote") or "")).strip()
-        if text and text not in highlights:
-            highlights.append(text)
-        if len(highlights) >= 2:
+        if _append_unique_highlight(highlights, text, limit=2):
             break
     for topic in list(qna_topics or []):
         note = re.sub(r"\s+", " ", str(topic.get("note") or "")).strip()
-        if note and note not in highlights:
-            highlights.append(note)
-        if len(highlights) >= 3:
+        if _append_unique_highlight(highlights, note, limit=3):
             break
     if not highlights:
         for card in list(fixture.get("evidence_cards") or []):
             note = re.sub(r"\s+", " ", str(card.get("detail") or card.get("note") or "")).strip()
-            if note and note not in highlights:
-                highlights.append(note)
-            if len(highlights) >= 3:
+            if _append_unique_highlight(highlights, note, limit=3):
+                break
+    if not highlights:
+        material_label = str(preferred_material.get("label") or "官方材料").strip()
+        for fallback in (
+            f"当前未抓到完整电话会 transcript，本页问答主题改由 {material_label} 提炼的经营主线补位。",
+            "软件、基础设施与利润质量是当前代理电话会摘要里最需要追踪的三条主线。",
+        ):
+            if _append_unique_highlight(highlights, fallback, limit=2):
                 break
 
     topics: list[dict[str, Any]] = []
@@ -3630,8 +3705,13 @@ def _refresh_latest_history_entry(
         latest["revenue_yoy_pct"] = float(revenue_yoy_pct)
     if latest_kpis.get("net_income_yoy_pct") is not None:
         latest["net_income_yoy_pct"] = float(latest_kpis["net_income_yoy_pct"])
-    if latest_kpis.get("ending_equity_bn") is not None and float(latest_kpis["ending_equity_bn"]) > 0:
-        latest["equity_bn"] = float(latest_kpis["ending_equity_bn"])
+    normalized_latest_equity_bn = _normalize_equity_bn_value(
+        latest_kpis.get("ending_equity_bn"),
+        reference_equity_bn=latest.get("equity_bn"),
+        revenue_bn=latest.get("revenue_bn"),
+    )
+    if normalized_latest_equity_bn is not None:
+        latest["equity_bn"] = normalized_latest_equity_bn
 
     if latest.get("revenue_bn") is not None and latest.get("net_income_bn") is not None:
         latest["net_margin_pct"] = _safe_ratio(float(latest["net_income_bn"]), float(latest["revenue_bn"]))
