@@ -42,6 +42,7 @@ from app.services.official_parsers import _sanitize_temporal_narrative_facts
 from app.services.official_source_resolver import resolve_official_sources
 from app.services.official_source_resolver import _discover_attachment_url
 from app.services.official_source_resolver import _discover_default_sitemap_urls, _discover_sitemap_sources
+from app.services.official_source_resolver import _expand_related_ir_sources
 from app.services.official_source_resolver import _ir_role_keywords_match, _ir_temporal_alignment
 from app.services.official_source_resolver import _quarter_reference_terms
 from app.services.official_source_resolver import _sec_cik_for_calendar_quarter
@@ -50,6 +51,8 @@ from app.services.report_quality import evaluate_report_payload
 from app.services.reports import (
     REPORT_PAYLOAD_SCHEMA_VERSION,
     _automatic_transcript_summary,
+    _official_material_proxy_summary,
+    _source_material_warnings,
     _backfill_historical_core_metrics,
     _backfill_historical_segment_history,
     _build_income_statement_snapshot,
@@ -2027,6 +2030,32 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         self.assertIn("earnings_call", roles)
 
     @patch("app.services.official_source_resolver._fetch_text")
+    def test_discover_sitemap_sources_supports_json_link_inventory(self, mock_fetch_text: object) -> None:
+        mock_fetch_text.return_value = json.dumps(
+            {
+                "urls": [
+                    {"url": "https://example.com/news/q4-2025-financial-results.html"},
+                    {"url": "https://example.com/events/q4-2025-earnings-call-replay/default.aspx"},
+                    {"url": "https://example.com/files/q4-2025-earnings-presentation.pdf"},
+                ]
+            }
+        )
+
+        company = {
+            "id": "example-json-sitemap",
+            "ticker": "EXM",
+            "english_name": "Example Co.",
+            "official_source": {"fiscal_year_end_month": 12},
+        }
+
+        discovered = _discover_sitemap_sources(company, "2025Q4", "2025-12-31", "https://example.com/sitemap.json", refresh=True)
+        roles = {str(item.get("role") or ""): str(item.get("url") or "") for item in discovered}
+
+        self.assertEqual(roles["earnings_release"], "https://example.com/news/q4-2025-financial-results.html")
+        self.assertEqual(roles["earnings_call"], "https://example.com/events/q4-2025-earnings-call-replay/default.aspx")
+        self.assertEqual(roles["earnings_presentation"], "https://example.com/files/q4-2025-earnings-presentation.pdf")
+
+    @patch("app.services.official_source_resolver._fetch_text")
     def test_discover_sitemap_sources_reuses_cached_link_inventory(self, mock_fetch_text: object) -> None:
         source_resolver.SITEMAP_LINKS_MEMORY_CACHE.clear()
         self.addCleanup(source_resolver.SITEMAP_LINKS_MEMORY_CACHE.clear)
@@ -2563,6 +2592,115 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
             "text": "Broadcom Inc. Will Host First Quarter Fiscal Year 2026 Conference Call",
         }
         self.assertFalse(_ir_role_keywords_match(upcoming_call_link, "earnings_call"))
+
+    @patch("app.services.official_source_resolver._fetch_text")
+    def test_expand_related_ir_sources_recurses_into_event_page_script_links(self, mock_fetch_text: object) -> None:
+        def fake_fetch(url: str) -> str:
+            if url == "https://example.com/news/q4-2025-results.html":
+                return '<html><body><a href="/events/q4-2025-earnings-call/default.aspx">Conference Call Webcast</a></body></html>'
+            if url == "https://example.com/events/q4-2025-earnings-call/default.aspx":
+                return '<html><body><script>{"transcriptUrl":"/files/q4-2025-prepared-remarks.pdf"}</script></body></html>'
+            if url == "https://example.com/files/q4-2025-prepared-remarks.pdf":
+                raise RuntimeError("should not fetch binary transcript")
+            raise RuntimeError(f"unexpected fetch: {url}")
+
+        mock_fetch_text.side_effect = fake_fetch
+        company = {
+            "id": "example-related-links",
+            "ticker": "EXM",
+            "english_name": "Example Co.",
+            "official_source": {"fiscal_year_end_month": 12},
+        }
+
+        related = _expand_related_ir_sources(
+            [
+                {
+                    "label": "Example Co. Q4 2025 results",
+                    "url": "https://example.com/news/q4-2025-results.html",
+                    "kind": "official_release",
+                    "role": "earnings_release",
+                    "date": "2026-02-04",
+                }
+            ],
+            company=company,
+            calendar_terms={"q4", "2025"},
+            fiscal_terms={"q4 fy2025"},
+            target_years={"2025"},
+            allowed_quarters={4},
+        )
+
+        call_urls = [str(item.get("url") or "") for item in related if str(item.get("role") or "") == "earnings_call"]
+        self.assertIn("https://example.com/events/q4-2025-earnings-call/default.aspx", call_urls)
+        self.assertIn("https://example.com/files/q4-2025-prepared-remarks.pdf", call_urls)
+        prepared_remarks_item = next(item for item in related if str(item.get("url") or "").endswith("q4-2025-prepared-remarks.pdf"))
+        self.assertNotIn("{", str(prepared_remarks_item.get("label") or ""))
+
+    @patch("app.services.official_source_resolver._fetch_json_response")
+    @patch("app.services.official_source_resolver._fetch_text")
+    def test_expand_related_ir_sources_uses_q4_event_feed_from_events_presentations_page(
+        self,
+        mock_fetch_text: object,
+        mock_fetch_json_response: object,
+    ) -> None:
+        mock_fetch_text.return_value = (
+            '<html><head><script src="https://widgets.q4app.com/widgets/q4.api.1.13.5.min.js"></script></head>'
+            '<body><div class="module module-event module-event-latest"></div>'
+            '<script>$(".module-event-latest").events({showPast:true});</script></body></html>'
+        )
+        mock_fetch_json_response.return_value = {
+            "GetEventListResult": [
+                {
+                    "Title": "Example Q4 2025 Earnings Conference Call",
+                    "LinkToDetailPage": "/events-presentations/event-details/2025/example-q4-2025/default.aspx",
+                    "WebCastLink": "",
+                    "Attachments": [
+                        {
+                            "Title": "Transcript",
+                            "Url": "https://cdn.example.com/files/q4-2025-transcript.pdf",
+                        }
+                    ],
+                    "EventPresentation": [
+                        {
+                            "Title": "Example Q4 2025 Presentation",
+                            "DocumentPath": "https://cdn.example.com/files/q4-2025-presentation.pdf",
+                        }
+                    ],
+                    "EventPressRelease": [],
+                }
+            ]
+        }
+
+        company = {
+            "id": "example-q4-widget",
+            "ticker": "EXM",
+            "english_name": "Example Co.",
+            "official_source": {"fiscal_year_end_month": 12},
+        }
+        related = _expand_related_ir_sources(
+            [
+                {
+                    "label": "Example events and presentations",
+                    "url": "https://example.com/events-presentations/default.aspx",
+                    "kind": "presentation",
+                    "role": "earnings_presentation",
+                    "date": "",
+                }
+            ],
+            company=company,
+            calendar_terms={"q4", "2025"},
+            fiscal_terms={"q4 fy2025"},
+            target_years={"2025"},
+            allowed_quarters={4},
+            max_depth=1,
+        )
+
+        role_to_urls = {}
+        for item in related:
+            role_to_urls.setdefault(str(item.get("role") or ""), []).append(str(item.get("url") or ""))
+
+        self.assertIn("https://cdn.example.com/files/q4-2025-transcript.pdf", role_to_urls["earnings_call"])
+        transcript_item = next(item for item in related if str(item.get("url") or "").endswith("q4-2025-transcript.pdf"))
+        self.assertNotIn("events page", str(transcript_item.get("label") or "").lower())
 
     def test_material_text_quality_issue_accepts_short_real_release_excerpt(self) -> None:
         issue = official_materials._material_text_quality_issue(
@@ -3196,6 +3334,59 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertIn("transcript", summary["filename"].lower())
         self.assertTrue(summary["highlights"])
         self.assertTrue(summary["topics"])
+
+    def test_automatic_transcript_summary_accepts_prepared_remarks_commentary_material(self) -> None:
+        prepared_remarks_path = self._write_temp_text(
+            "prepared-remarks.txt",
+            (
+                "Operator Good afternoon and welcome to the earnings conference call. "
+                "Prepared Remarks CEO Thanks for joining us today. Revenue growth accelerated and margins improved sequentially. "
+                "CFO We continue to see resilient demand and expect operating margin expansion through the back half of the year. "
+                "Question-and-Answer Session Analyst Can you talk about transaction trends and pricing? "
+                "CEO We are seeing healthy traffic recovery and continued pricing discipline across key markets."
+            ),
+        )
+
+        summary = _automatic_transcript_summary(
+            [
+                {
+                    "label": "Example prepared remarks",
+                    "kind": "presentation",
+                    "role": "earnings_commentary",
+                    "status": "cached",
+                    "text_path": prepared_remarks_path,
+                }
+            ]
+        )
+
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary["source_type"], "official_call_material")
+        self.assertIn("prepared remarks", summary["filename"].lower())
+        self.assertTrue(summary["highlights"])
+        self.assertTrue(summary["topics"])
+
+    def test_automatic_transcript_summary_rejects_webcast_registration_shell(self) -> None:
+        webcast_shell_path = self._write_temp_text(
+            "webcast-shell.txt",
+            (
+                "Already Registered? Log In Now Not Registered? Email: Complete this form to enter the webcast. "
+                "Complete this form to enter the webcast. First Name Last Name Company Email FAQs and System Test."
+            ),
+        )
+
+        summary = _automatic_transcript_summary(
+            [
+                {
+                    "label": "Example webcast registration",
+                    "kind": "call_summary",
+                    "role": "earnings_call",
+                    "status": "cached",
+                    "text_path": webcast_shell_path,
+                }
+            ]
+        )
+
+        self.assertIsNone(summary)
 
     def test_transcript_qna_topics_backfill_to_full_coverage_minimum(self) -> None:
         enriched = _ensure_minimum_qna_topics(
@@ -4660,6 +4851,99 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertAlmostEqual(segment_map["Advertising services"], 15.318, places=3)
         self.assertAlmostEqual(segment_map["Subscription services"], 12.345, places=3)
 
+    def test_extract_company_segments_prefers_quarterly_profiled_html_table_over_annual_match(self) -> None:
+        raw_html_path = self._write_temp_text(
+            "mcdonalds-segments-quarter-vs-year.html",
+            (
+                "<html><body>"
+                "<table>"
+                "<tr><th>Years Ended December 31,</th><th>2025</th><th>2024</th></tr>"
+                "<tr><td>U.S.</td><td>10,487</td><td>10,407</td></tr>"
+                "<tr><td>International Operated Markets</td><td>13,410</td><td>12,458</td></tr>"
+                "<tr><td>International Developmental Licensed Markets &amp; Corporate</td><td>2,342</td><td>2,630</td></tr>"
+                "<tr><td>Total Revenues</td><td>26,885</td><td>25,920</td></tr>"
+                "</table>"
+                "<table>"
+                "<tr><th>Quarters Ended December 31,</th><th>2025</th><th>2024</th></tr>"
+                "<tr><td>Total Franchised revenues and Company-owned and operated sales</td><td></td><td></td></tr>"
+                "<tr><td>U.S.</td><td>2,696</td><td>2,574</td></tr>"
+                "<tr><td>International Operated Markets</td><td>3,538</td><td>3,141</td></tr>"
+                "<tr><td>International Developmental Licensed Markets &amp; Corporate</td><td>613</td><td>553</td></tr>"
+                "<tr><td>Total Revenues</td><td>7,009</td><td>6,388</td></tr>"
+                "</table>"
+                "</body></html>"
+            ),
+        )
+
+        segments = _extract_company_segments(
+            "mcdonalds",
+            [
+                {
+                    "label": "McDonald's Exhibit 99.2",
+                    "kind": "presentation",
+                    "status": "cached",
+                    "raw_text": "Quarterly and annual segment tables.",
+                    "flat_text": "Quarterly and annual segment tables.",
+                    "raw_path": raw_html_path,
+                }
+            ],
+            revenue_bn=7.009,
+            target_calendar_quarter="2025Q4",
+        )
+
+        segment_map = {item["name"]: item["value_bn"] for item in segments}
+        self.assertAlmostEqual(segment_map["U.S."], 2.696, places=3)
+        self.assertAlmostEqual(segment_map["International Operated Markets"], 3.538, places=3)
+        self.assertAlmostEqual(segment_map["International Developmental Licensed Markets & Corporate"], 0.613, places=3)
+
+    def test_extract_company_segments_collects_single_segment_html_tables_from_headers(self) -> None:
+        raw_html_path = self._write_temp_text(
+            "starbucks-segment-header-tables.html",
+            (
+                "<html><body>"
+                "<table>"
+                "<tr><th>Q1 North America Segment Results</th></tr>"
+                "<tr><th>Quarter Ended</th><th>Dec 28, 2025</th><th>Dec 29, 2024</th></tr>"
+                "<tr><td>Net revenues</td><td>7,280.5</td><td>7,071.9</td></tr>"
+                "<tr><td>Operating Income</td><td>867.0</td><td>1,181.3</td></tr>"
+                "</table>"
+                "<table>"
+                "<tr><th>Q1 International Segment Results</th></tr>"
+                "<tr><th>Quarter Ended</th><th>Dec 28, 2025</th><th>Dec 29, 2024</th></tr>"
+                "<tr><td>Net revenues</td><td>2,064.9</td><td>1,871.3</td></tr>"
+                "<tr><td>Operating Income</td><td>282.7</td><td>237.1</td></tr>"
+                "</table>"
+                "<table>"
+                "<tr><th>Q1 Channel Development Segment Results</th></tr>"
+                "<tr><th>Quarter Ended</th><th>Dec 28, 2025</th><th>Dec 29, 2024</th></tr>"
+                "<tr><td>Net revenues</td><td>522.7</td><td>436.3</td></tr>"
+                "<tr><td>Operating Income</td><td>215.8</td><td>208.0</td></tr>"
+                "</table>"
+                "</body></html>"
+            ),
+        )
+
+        segments = _extract_company_segments(
+            "starbucks",
+            [
+                {
+                    "label": "Starbucks quarterly segment release",
+                    "kind": "official_release",
+                    "status": "cached",
+                    "raw_text": "Segment result tables.",
+                    "flat_text": "Segment result tables.",
+                    "raw_path": raw_html_path,
+                }
+            ],
+            revenue_bn=9.868,
+            target_calendar_quarter="2025Q4",
+        )
+
+        segment_map = {item["name"]: item["value_bn"] for item in segments}
+        self.assertAlmostEqual(segment_map["North America"], 7.280, places=3)
+        self.assertAlmostEqual(segment_map["International"], 2.065, places=3)
+        self.assertAlmostEqual(segment_map["Channel Development"], 0.523, places=3)
+
     def test_generic_parser_extracts_statement_metrics_from_raw_html_sec_table(self) -> None:
         sec_text_path = self._write_temp_text(
             "oracle-sec-placeholder.txt",
@@ -4699,10 +4983,161 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
 
         self.assertAlmostEqual(parsed["latest_kpis"]["revenue_bn"], 14.1, places=3)
         self.assertAlmostEqual(parsed["latest_kpis"]["net_income_bn"], 3.4, places=3)
+
+    def test_generic_parser_prefers_consolidated_statement_over_segment_table(self) -> None:
+        sec_text_path = self._write_temp_text(
+            "starbucks-sec-placeholder.txt",
+            "Condensed consolidated statements of earnings.",
+        )
+        sec_raw_html_path = self._write_temp_text(
+            "starbucks-sec-statement-vs-segment.html",
+            (
+                "<html><body>"
+                "<table>"
+                "<tr><th>Q1 Channel Development Segment Results</th></tr>"
+                "<tr><th>Quarter Ended</th><th>Dec 28, 2025</th><th>Dec 29, 2024</th></tr>"
+                "<tr><td>Net revenues</td><td>522.7</td><td>436.3</td></tr>"
+                "<tr><td>Operating Income</td><td>215.8</td><td>208.0</td></tr>"
+                "</table>"
+                "<table>"
+                "<tr><th>Condensed Consolidated Statements of Earnings</th></tr>"
+                "<tr><th>Quarter Ended</th><th>Dec 28, 2025</th><th>Dec 29, 2024</th></tr>"
+                "<tr><td>Total net revenues</td><td>9,915.1</td><td>9,397.8</td></tr>"
+                "<tr><td>Total cost of revenues</td><td>3,470.3</td><td>3,288.9</td></tr>"
+                "<tr><td>Gross profit</td><td>6,444.8</td><td>6,108.9</td></tr>"
+                "<tr><td>Research and development</td><td>210.0</td><td>198.0</td></tr>"
+                "<tr><td>Selling, general and administrative</td><td>640.1</td><td>623.5</td></tr>"
+                "<tr><td>Total operating expenses</td><td>9,084.9</td><td>8,322.6</td></tr>"
+                "<tr><td>Operating income</td><td>890.8</td><td>1,121.7</td></tr>"
+                "<tr><td>Earnings before income taxes</td><td>764.8</td><td>1,022.3</td></tr>"
+                "<tr><td>Net earnings attributable to Starbucks</td><td>293.3</td><td>780.8</td></tr>"
+                "</table>"
+                "</body></html>"
+            ),
+        )
+
+        parsed = parse_official_materials(
+            get_company("starbucks"),
+            {"calendar_quarter": "2025Q4", "fiscal_label": "2025Q4", "coverage_notes": []},
+            [
+                {
+                    "label": "Starbucks Form 10-Q",
+                    "kind": "sec_filing",
+                    "status": "cached",
+                    "text_path": sec_text_path,
+                    "raw_path": sec_raw_html_path,
+                }
+            ],
+        )
+
+        self.assertAlmostEqual(parsed["latest_kpis"]["revenue_bn"], 9.915, places=3)
+        self.assertAlmostEqual(parsed["latest_kpis"]["net_income_bn"], 0.293, places=3)
         self.assertAlmostEqual(parsed["latest_kpis"]["gaap_gross_margin_pct"], 65.0, places=1)
         opex_names = [item["name"] for item in parsed["income_statement"]["opex_breakdown"]]
         self.assertIn("Research and development", opex_names)
         self.assertIn("Selling, general and administrative", opex_names)
+
+    def test_official_material_proxy_summary_builds_call_proxy_without_transcript(self) -> None:
+        proxy = _official_material_proxy_summary(
+            {
+                "call_quote_cards": [
+                    {"quote": "Management expects margin recovery to remain paced by labor and mix."}
+                ],
+                "management_themes": [
+                    {"label": "门店效率", "score": 82, "note": "管理层会继续围绕门店效率与交易量修复展开。"}
+                ],
+                "evidence_cards": [
+                    {"detail": "官方 release 强调交易量修复与会员活跃度改善。"}
+                ],
+            },
+            [
+                {
+                    "label": "Example earnings release",
+                    "kind": "official_release",
+                    "status": "cached",
+                    "text_length": 1200,
+                }
+            ],
+            [
+                {"label": "交易量修复", "score": 78, "note": "市场会继续追问交易量修复是否可持续。"}
+            ],
+        )
+
+        self.assertIsNotNone(proxy)
+        self.assertEqual(proxy["source_type"], "official_material_proxy")
+        self.assertEqual(proxy["filename"], "Example earnings release")
+        self.assertTrue(proxy["highlights"])
+        self.assertEqual(proxy["topics"][0]["label"], "交易量修复")
+
+    def test_official_material_proxy_summary_prefers_call_like_supplement_material(self) -> None:
+        supplement_path = self._write_temp_text(
+            "mcd-supplement.txt",
+            (
+                "Supplemental Information Revenue grew 7% year over year while operating income expanded as restaurant margins improved. "
+                "Management expects comparable sales momentum and disciplined expense control to remain key themes next quarter. "
+                "Cash flow remained strong and guidance continues to emphasize franchise health and consumer demand."
+            ),
+        )
+
+        proxy = _official_material_proxy_summary(
+            {
+                "call_quote_cards": [],
+                "management_themes": [{"label": "利润率修复", "score": 80, "note": "补充材料继续强调利润率改善。"}],
+                "evidence_cards": [],
+            },
+            [
+                {
+                    "label": "Example earnings release",
+                    "kind": "official_release",
+                    "role": "earnings_release",
+                    "status": "cached",
+                    "text_length": 1200,
+                },
+                {
+                    "label": "Example exhibit99.2 supplement",
+                    "kind": "call_summary",
+                    "role": "earnings_call",
+                    "status": "cached",
+                    "text_length": 2000,
+                    "text_path": supplement_path,
+                },
+                {
+                    "label": "Example Q4 2025 Webcast",
+                    "title": "Registration | Example Q4 2025 Earnings Conference Call",
+                    "kind": "call_summary",
+                    "role": "earnings_call",
+                    "status": "cached",
+                    "text_length": 420,
+                },
+            ],
+            [{"label": "同店销售", "score": 76, "note": "市场会继续追问同店销售和利润率。"}],
+        )
+
+        self.assertIsNotNone(proxy)
+        self.assertEqual(proxy["filename"], "Example exhibit99.2 supplement")
+        self.assertTrue(proxy["highlights"])
+        self.assertTrue(proxy["topics"])
+
+    def test_source_material_warnings_ignores_failed_duplicate_role_when_covered(self) -> None:
+        warnings = _source_material_warnings(
+            [
+                {
+                    "kind": "official_release",
+                    "role": "earnings_release",
+                    "status": "cached",
+                    "text_length": 3200,
+                },
+                {
+                    "kind": "official_release",
+                    "role": "earnings_release",
+                    "status": "error",
+                    "text_length": 0,
+                },
+            ]
+        )
+
+        self.assertTrue(any("复用" in item or "抓取" in item for item in warnings))
+        self.assertFalse(any("关键源材料" in item for item in warnings))
 
     def test_generic_parser_prefers_three_month_statement_columns_over_ytd_columns(self) -> None:
         sec_text_path = self._write_temp_text(

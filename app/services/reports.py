@@ -2741,6 +2741,16 @@ def _looks_like_transcript_text(text: str, label: str = "") -> bool:
     normalized = re.sub(r"\s+", " ", str(text or "")).strip()
     lowered = normalized.lower()
     label_lower = str(label or "").lower()
+    registration_tokens = (
+        "already registered",
+        "log in now",
+        "complete this form to enter the webcast",
+        "enter the webcast",
+        "register now",
+        "system test",
+        "not registered",
+        "email:",
+    )
     transcript_tokens = (
         "question-and-answer",
         "question and answer",
@@ -2760,6 +2770,9 @@ def _looks_like_transcript_text(text: str, label: str = "") -> bool:
             flags=re.IGNORECASE,
         )
     )
+    registration_signal_count = sum(1 for token in registration_tokens if token in lowered)
+    if registration_signal_count >= 2 and speaker_count < 4:
+        return False
     return signal_count >= 2 or speaker_count >= 4
 
 
@@ -2812,7 +2825,19 @@ def _automatic_transcript_summary(source_materials: list[dict[str, Any]]) -> Opt
     for item in source_materials:
         if item.get("status") not in {"fetched", "cached"}:
             continue
-        if item.get("kind") != "call_summary" and item.get("role") != "earnings_call":
+        label = str(item.get("label") or "")
+        label_lower = label.lower()
+        role = str(item.get("role") or "")
+        kind = str(item.get("kind") or "")
+        call_like_material = item.get("kind") == "call_summary" or item.get("role") == "earnings_call"
+        if not call_like_material and any(
+            token in label_lower
+            for token in ("transcript", "prepared remarks", "conference call", "earnings call", "webcast replay", "call replay", "script")
+        ):
+            call_like_material = True
+        if not call_like_material and role in {"earnings_commentary", "earnings_presentation"} and kind in {"presentation", "sec_filing"}:
+            call_like_material = True
+        if not call_like_material:
             continue
         text_path = str(item.get("text_path") or "").strip()
         if not text_path or not Path(text_path).exists():
@@ -2820,7 +2845,6 @@ def _automatic_transcript_summary(source_materials: list[dict[str, Any]]) -> Opt
         text = Path(text_path).read_text(encoding="utf-8", errors="ignore").strip()
         if len(text) < 400:
             continue
-        label = str(item.get("label") or "")
         if not _looks_like_transcript_text(text, label):
             continue
         label_score = 3 if "transcript" in label.lower() else 2 if "prepared remarks" in label.lower() else 1
@@ -2840,6 +2864,134 @@ def _automatic_transcript_summary(source_materials: list[dict[str, Any]]) -> Opt
     }
 
 
+def _official_material_proxy_summary(
+    fixture: dict[str, Any],
+    source_materials: list[dict[str, Any]],
+    qna_topics: list[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    extracted = [
+        item
+        for item in list(source_materials or [])
+        if item.get("status") in {"fetched", "cached"} and int(item.get("text_length") or 0) > 0
+    ]
+    if not extracted:
+        return None
+    def _proxy_material_score(item: dict[str, Any]) -> tuple[int, int]:
+        kind = str(item.get("kind") or "")
+        role = str(item.get("role") or "")
+        label = str(item.get("label") or "").lower()
+        title = str(item.get("title") or "").lower()
+        combined = f"{label} {title}"
+        text_length = int(item.get("text_length") or 0)
+        score = 0
+        if role == "earnings_call" or kind == "call_summary":
+            score += 7
+        if any(token in combined for token in ("prepared remarks", "transcript", "conference call", "earnings call", "commentary", "supplement")):
+            score += 5
+        if any(token in combined for token in ("99.2", "ex-99.2", "exhibit992", "supplement", "supplemental information")):
+            score += 6
+        if kind == "presentation" and role == "earnings_commentary":
+            score += 4
+        if kind in {"official_release", "presentation", "sec_filing"}:
+            score += 2
+        if any(
+            token in combined
+            for token in ("registration", "log in", "already registered", "complete this form to enter the webcast", "not registered")
+        ):
+            score -= 12
+        if text_length >= 5000:
+            score += 4
+        elif text_length < 1200:
+            score -= 4
+        return (score, text_length)
+
+    preferred_material = max(extracted, key=_proxy_material_score)
+    preferred_text = ""
+    preferred_text_path = str(preferred_material.get("text_path") or "").strip()
+    if preferred_text_path and Path(preferred_text_path).exists():
+        preferred_text = Path(preferred_text_path).read_text(encoding="utf-8", errors="ignore").strip()
+
+    highlights: list[str] = []
+    if preferred_text:
+        if _looks_like_transcript_text(preferred_text, str(preferred_material.get("label") or "")):
+            for item in _transcript_highlights(preferred_text):
+                if item and item not in highlights:
+                    highlights.append(item)
+                if len(highlights) >= 2:
+                    break
+        if len(highlights) < 2:
+            for chunk in _transcript_chunks(preferred_text):
+                lowered_chunk = chunk.lower()
+                if len(chunk) < 90:
+                    continue
+                if any(token in lowered_chunk for token in ("revenue", "margin", "guidance", "demand", "traffic", "comparable", "cash flow", "operating income")):
+                    excerpt = _excerpt_text(chunk, 280)
+                    if excerpt and excerpt not in highlights:
+                        highlights.append(excerpt)
+                if len(highlights) >= 2:
+                    break
+    for quote in list(fixture.get("call_quote_cards") or []):
+        text = re.sub(r"\s+", " ", str(quote.get("quote") or "")).strip()
+        if text and text not in highlights:
+            highlights.append(text)
+        if len(highlights) >= 2:
+            break
+    for topic in list(qna_topics or []):
+        note = re.sub(r"\s+", " ", str(topic.get("note") or "")).strip()
+        if note and note not in highlights:
+            highlights.append(note)
+        if len(highlights) >= 3:
+            break
+    if not highlights:
+        for card in list(fixture.get("evidence_cards") or []):
+            note = re.sub(r"\s+", " ", str(card.get("detail") or card.get("note") or "")).strip()
+            if note and note not in highlights:
+                highlights.append(note)
+            if len(highlights) >= 3:
+                break
+
+    topics: list[dict[str, Any]] = []
+    if preferred_text:
+        for item in _keyword_topics(preferred_text, note="来自官方补充材料的关键词聚类。"):
+            label = str(item.get("label") or "").strip()
+            if not label:
+                continue
+            topics.append(
+                {
+                    "label": label,
+                    "score": float(item.get("score") or 72),
+                    "note": str(item.get("note") or "来自官方补充材料的关键词聚类。").strip(),
+                }
+            )
+            if len(topics) >= 2:
+                break
+    seen_labels: set[str] = set()
+    seen_labels.update(str(item.get("label") or "").strip() for item in topics if str(item.get("label") or "").strip())
+    for item in list(qna_topics or []) + list(fixture.get("management_themes") or []):
+        label = str(item.get("label") or "").strip()
+        note = str(item.get("note") or "").strip()
+        if not label or label in seen_labels:
+            continue
+        topics.append(
+            {
+                "label": label,
+                "score": float(item.get("score") or 68),
+                "note": note or "基于官方 release / deck / filing 构建的电话会代理主题。",
+            }
+        )
+        seen_labels.add(label)
+        if len(topics) >= 4:
+            break
+    if not highlights and not topics:
+        return None
+    return {
+        "source_type": "official_material_proxy",
+        "filename": str(preferred_material.get("label") or "Official earnings materials"),
+        "highlights": highlights[:3],
+        "topics": topics[:4],
+    }
+
+
 def _material_scores(
     fixture: dict[str, Any],
     structure_dimension: str,
@@ -2854,7 +3006,13 @@ def _material_scores(
     crawl_score = 26
     if extracted:
         crawl_score = 100 if len(extracted) == len(source_materials) else 74
-    call_material_score = 100 if transcript_summary else (42 if "call_summary" in materials else 18)
+    transcript_source_type = str((transcript_summary or {}).get("source_type") or "")
+    if transcript_source_type in {"manual_transcript", "official_call_material"}:
+        call_material_score = 100
+    elif transcript_source_type == "official_material_proxy":
+        call_material_score = 74
+    else:
+        call_material_score = 42 if "call_summary" in materials else 18
     return [
         {"label": "官方财报新闻稿", "score": 100 if has_release or "earnings_release" in materials else 32},
         {"label": "演示材料", "score": 92 if has_presentation or "presentation" in materials else 36},
@@ -3165,6 +3323,15 @@ def _source_material_warnings(source_materials: list[dict[str, Any]]) -> list[st
     cached = [item for item in source_materials if item.get("status") == "cached"]
     failed = [item for item in source_materials if item.get("status") == "error"]
     disabled = [item for item in source_materials if item.get("status") == "disabled"]
+    covered_role_keys = {
+        (str(item.get("role") or ""), str(item.get("kind") or ""))
+        for item in extracted
+    }
+    uncovered_failed = [
+        item
+        for item in failed
+        if (str(item.get("role") or ""), str(item.get("kind") or "")) not in covered_role_keys
+    ]
     warnings: list[str] = []
     if extracted:
         if fetched and cached:
@@ -3173,7 +3340,9 @@ def _source_material_warnings(source_materials: list[dict[str, Any]]) -> list[st
             warnings.append(f"本次已自动抓取 {len(fetched)} 份官方材料并完成文本提取，可直接生成深度版报告。")
         else:
             warnings.append(f"本次已复用 {len(cached)} 份官方材料缓存，可继续沿缓存原文做自动化解析。")
-    if failed:
+    if uncovered_failed:
+        warnings.append(f"{len(uncovered_failed)} 份关键源材料本次暂未抓取成功，报告仍以现有结构化口径与已接入材料生成。")
+    elif failed and not extracted:
         warnings.append(f"{len(failed)} 份源材料本次暂未抓取成功，报告仍以现有结构化口径与已接入材料生成。")
     if disabled and not extracted:
         warnings.append("当前环境关闭了官方源材料自动抓取，仅使用内置口径与已有缓存生成报告。")
@@ -3221,6 +3390,11 @@ def _narrative_entry(status: str) -> dict[str, Any]:
             "detail": "主题优先依据官方 transcript / call summary / commentary 提炼，不是静态模板。",
             "is_inferred": False,
         },
+        "official_material_proxy": {
+            "label": "官方材料代理摘要",
+            "detail": "未拿到完整 transcript 时，系统会基于官方 release / deck / filing 生成电话会式摘要与问答主题。",
+            "is_inferred": True,
+        },
         "official_material_inferred": {
             "label": "官方财报材料推断",
             "detail": "当前未拿到完整问答时，系统根据官方 release / deck / filing 动态归纳。",
@@ -3265,7 +3439,7 @@ def _build_narrative_provenance(
         and (int(item.get("text_length") or 0) > 0 or bool(str(item.get("text_path") or "").strip()))
     ]
     transcript_source_type = str((transcript_summary or {}).get("source_type") or "")
-    has_call_material = transcript_source_type == "official_call_material"
+    has_call_material = transcript_source_type in {"official_call_material", "official_material_proxy"}
     has_official_material = bool(
         any(
             item.get("kind") in {"official_release", "presentation", "sec_filing"}
@@ -3278,14 +3452,21 @@ def _build_narrative_provenance(
 
     if transcript_source_type == "manual_transcript":
         qna = _narrative_entry("manual_transcript")
-    elif has_call_material:
+    elif transcript_source_type == "official_call_material":
         qna = _narrative_entry("official_call_material")
+    elif transcript_source_type == "official_material_proxy":
+        qna = _narrative_entry("official_material_proxy")
     elif has_official_material:
         qna = _narrative_entry("official_material_inferred")
     else:
         qna = _narrative_entry("structured_fallback")
 
-    narrative_status = "official_call_material" if has_call_material else "official_material_inferred" if has_official_material else "structured_fallback"
+    if transcript_source_type == "official_call_material":
+        narrative_status = "official_call_material"
+    elif transcript_source_type == "official_material_proxy":
+        narrative_status = "official_material_proxy"
+    else:
+        narrative_status = "official_material_inferred" if has_official_material else "structured_fallback"
     management = _narrative_entry(narrative_status)
     risks = _narrative_entry(narrative_status)
     catalysts = _narrative_entry(narrative_status)
@@ -3301,11 +3482,15 @@ def _build_narrative_provenance(
     qna_chart_subtitle = (
         "按 transcript / 电话会原文整理"
         if qna["status"] in {"manual_transcript", "official_call_material"}
+        else "按官方财报材料构建代理电话会摘要"
+        if qna["status"] == "official_material_proxy"
         else "当前缺少完整电话会问答，按官方材料动态提炼"
     )
     management_chart_subtitle = (
         "优先依据电话会与管理层原文提炼"
         if management["status"] == "official_call_material"
+        else "按官方 release / deck / filing 生成代理电话会锚点"
+        if management["status"] == "official_material_proxy"
         else "按官方材料与经营数据动态提炼"
         if management["status"] == "official_material_inferred"
         else "当前仍带有通用研究 fallback"
@@ -4538,6 +4723,8 @@ def build_report_payload(
         list(fixture.get("risks") or []),
         list(fixture.get("catalysts") or []),
     )
+    if transcript_summary is None:
+        transcript_summary = _official_material_proxy_summary(fixture, source_materials, qna_topics)
     narrative_provenance = _build_narrative_provenance(fixture, source_materials, transcript_summary, qna_topics)
     merged_sources = _merge_sources_with_materials(list(fixture.get("sources") or []), source_materials)
     coverage_warnings = _source_material_warnings(source_materials) + list(fixture["coverage_notes"])
@@ -4571,8 +4758,12 @@ def build_report_payload(
         coverage_warnings.insert(0, f"已应用手动上传 transcript：{transcript_summary['filename']}")
     elif transcript_summary and transcript_summary.get("source_type") == "official_call_material":
         coverage_warnings.insert(0, f"已自动提取官方电话会材料：{transcript_summary['filename']}")
+    elif transcript_summary and transcript_summary.get("source_type") == "official_material_proxy":
+        coverage_warnings.insert(0, f"已基于官方财报材料构建电话会代理摘要：{transcript_summary['filename']}")
     if narrative_provenance["qna"]["status"] == "official_call_material":
         coverage_warnings.insert(0, "当前问答主题优先依据官方电话会材料整理，并非静态模板。")
+    elif narrative_provenance["qna"]["status"] == "official_material_proxy":
+        coverage_warnings.insert(0, "当前未抓到完整 transcript 时，系统已基于官方 release / deck / filing 生成电话会代理摘要与问答主题。")
     elif narrative_provenance["qna"]["status"] == "official_material_inferred":
         coverage_warnings.insert(0, "当前未获取到当季完整电话会 transcript / Q&A，问答主题基于官方财报材料动态推断。")
     elif narrative_provenance["qna"]["status"] == "structured_fallback":
