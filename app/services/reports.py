@@ -41,10 +41,21 @@ from .local_data import (
     get_supported_quarters,
     list_companies,
 )
+from .narrative_writer import (
+    build_call_panel as _writer_build_call_panel,
+    build_expectation_panel as _writer_build_expectation_panel,
+    build_institutional_digest as _writer_build_institutional_digest,
+    build_narrative_provenance as _writer_build_narrative_provenance,
+    compose_layered_takeaways as _writer_compose_layered_takeaways,
+    compose_summary_headline as _writer_compose_summary_headline,
+    humanize_support_lines as _writer_humanize_support_lines,
+    normalize_takeaways as _writer_normalize_takeaways,
+    polish_generated_text as _writer_polish_generated_text,
+)
 from .official_materials import hydrate_source_materials
 from .official_parsers import COMPANY_SEGMENT_PROFILES, parse_official_materials
 from .official_source_resolver import resolve_official_sources
-from .report_quality import evaluate_report_payload, quality_warnings_for_payload
+from .report_quality import evaluate_report_payload
 from .uploads import get_upload
 
 
@@ -56,6 +67,7 @@ REPORT_CACHE_DEPENDENCIES = [
     APP_DIR / "services" / "official_fixtures.py",
     APP_DIR / "services" / "official_parsers.py",
     APP_DIR / "services" / "institutional_views.py",
+    APP_DIR / "services" / "narrative_writer.py",
     APP_DIR / "services" / "reports.py",
     APP_DIR / "services" / "seed_data.py",
 ]
@@ -69,7 +81,7 @@ REPORT_PAYLOAD_SCHEMA_VERSION = 19
 FULL_COVERAGE_ENV = "EARNINGS_DIGEST_REQUIRE_FULL_COVERAGE"
 FULL_COVERAGE_READY_MAP_PATH = APP_DIR.parent / "data" / "cache" / "full-coverage-ready-quarters.json"
 HISTORICAL_OFFICIAL_QUARTER_CACHE_DIR = CACHE_DIR / "historical-official-quarter-cache"
-HISTORICAL_OFFICIAL_QUARTER_CACHE_VERSION = 4
+HISTORICAL_OFFICIAL_QUARTER_CACHE_VERSION = 6
 HISTORICAL_OFFICIAL_QUARTER_MEMORY_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 HISTORICAL_OFFICIAL_QUARTER_MEMORY_LOCK = threading.Lock()
 
@@ -479,7 +491,7 @@ def _normalize_segment_items(company: dict[str, Any], segments: list[dict[str, A
         for numeric_key in ("value_bn", "share_pct", "operating_income_bn"):
             if payload.get(numeric_key) is not None:
                 existing[numeric_key] = float(existing.get(numeric_key) or 0.0) + float(payload[numeric_key])
-        for passthrough_key in ("yoy_pct", "margin_pct", "note", "logo_key", "display_name", "chip_labels", "color", "fill"):
+        for passthrough_key in ("yoy_pct", "margin_pct", "note", "logo_key", "display_name", "chip_labels", "color", "fill", "scope"):
             if existing.get(passthrough_key) is None and payload.get(passthrough_key) is not None:
                 existing[passthrough_key] = payload[passthrough_key]
     if order_index:
@@ -543,7 +555,7 @@ def _build_section_meta(company: dict[str, Any]) -> dict[str, dict[str, str]]:
         },
         "mix": {
             "eyebrow": style["quarterly_label"],
-            "note": _note("同页并读业务结构与地区结构，让“增长来自哪里”不只停留在一句话上。", style["quarterly_lens"]),
+            "note": _note("同页并读分部结构与地区结构，让“增长来自哪里”不只停留在一句话上。", style["quarterly_lens"]),
         },
         "income_statement": {
             "eyebrow": style["quarterly_label"],
@@ -677,6 +689,26 @@ def _build_dynamic_section_meta(
     gross_margin_pct = _metric_or_fallback(latest_kpis.get("gaap_gross_margin_pct"), latest.get("gross_margin_pct"))
     top_segment = _section_label(_section_item_name(list(fixture.get("current_segments") or [])))
     top_geo = _section_label(_section_item_name(list(fixture.get("current_geographies") or [])))
+    duplicate_regional_structure = (
+        bool(fixture.get("current_segments"))
+        and bool(fixture.get("current_geographies"))
+        and all(str(item.get("scope") or "").casefold() == "regional_segment" for item in list(fixture.get("current_geographies") or []))
+        and {
+            (
+                str(item.get("name") or "").casefold(),
+                round(float(item.get("value_bn") or 0.0), 3),
+            )
+            for item in list(fixture.get("current_segments") or [])
+        }
+        == {
+            (
+                str(item.get("name") or "").casefold(),
+                round(float(item.get("value_bn") or 0.0), 3),
+            )
+            for item in list(fixture.get("current_geographies") or [])
+        }
+    )
+    segment_copy = _segment_copy_profile(list(fixture.get("current_segments") or []))
     top_risk = _section_label(str(((fixture.get("risks") or [{}])[0]).get("label") or "").strip())
     top_catalyst = _section_label(str(((fixture.get("catalysts") or [{}])[0]).get("label") or "").strip())
     top_qna = _section_label(str(((qna_topics or [{}])[0]).get("label") or "").strip())
@@ -709,7 +741,9 @@ def _build_dynamic_section_meta(
         transition_focus = "结构历史不连续，重点看趋势而不是强行读占比。"
 
     meta["summary"]["note"] = _short_section_text(
-        "先看收入与净利润，再看头部业务和头部地区是否共同支撑本季结果。"
+        f"先看收入与净利润，再看{segment_copy['top_label']}和头部地区是否共同支撑本季结果。"
+        if not duplicate_regional_structure
+        else "先看收入与净利润，再看官方经营分部如何支撑本季结果。"
         if top_segment and top_geo
         else "先看收入、利润与结构模式，再决定后面几页该优先追哪条主线。"
     )
@@ -732,14 +766,17 @@ def _build_dynamic_section_meta(
     )
     meta["mix"]["note"] = _short_section_text(
         (
-            f"业务侧先看 {top_segment}，地区侧再看 {top_geo}；两边是否共振，比单看占比更重要。"
+            "这一页先看官方经营分部；公司没有单独披露终端地理收入时，地区视角不再重复展示同一口径。"
+            if duplicate_regional_structure
+            else
+            f"{segment_copy['side_label']}先看 {top_segment}，地区侧再看 {top_geo}；两边是否共振，比单看占比更重要。"
             if top_segment and top_geo
             else f"先抓头部结构 {top_segment or top_geo or '主线'}，再判断增长到底来自结构改善还是总量回升。"
         )
     )
     meta["income_statement"]["note"] = _short_section_text(
         (
-            f"{top_segment or '头部业务'}把收入盘子撑到 {format_money_bn(revenue_bn, money_symbol)}，"
+            f"{top_segment or segment_copy['top_label']}把收入盘子撑到 {format_money_bn(revenue_bn, money_symbol)}，"
             f"最后留在净利润端的是 {format_money_bn(net_income_bn, money_symbol)}；成本率和税项是主线。"
         )
         if revenue_bn is not None and net_income_bn is not None
@@ -752,7 +789,7 @@ def _build_dynamic_section_meta(
         (
             f"电话会先抓管理层反复强调的 {top_qna}，再看问答是否追问 {second_qna or top_risk or '增长持续性'}。"
             if transcript_summary
-            else f"当前没有完整 transcript 时，先围绕 {top_qna or top_segment or '经营主线'} 读研究关注点。"
+            else f"电话会原文不完整时，先围绕 {top_qna or top_segment or '经营主线'} 看研究问题清单。"
         )
     )
     meta["risks"]["note"] = _short_section_text(
@@ -934,6 +971,8 @@ def _segments_look_incomplete_for_company(
     normalized = _normalize_segment_items(company, list(segments or []))
     if not normalized:
         return False
+    if len(normalized) >= 2 and all(str(item.get("scope") or "").casefold() == "regional_segment" for item in normalized):
+        return False
     required_count = _minimum_required_segment_count(company)
     if len(normalized) < required_count:
         return True
@@ -972,10 +1011,48 @@ def _segments_are_geography_like(
     normalized = _normalize_segment_items(company, list(segments or []))
     if not normalized:
         return False
+    if len(normalized) >= 2 and all(str(item.get("scope") or "").casefold() == "regional_segment" for item in normalized):
+        return False
     return _structure_names_are_geography_like(
         company,
         [str(item.get("name") or "") for item in normalized],
     )
+
+
+def _items_match_scope(items: list[dict[str, Any]], scope: str) -> bool:
+    normalized = [item for item in list(items or []) if isinstance(item, dict)]
+    return bool(normalized) and all(str(item.get("scope") or "").casefold() == scope.casefold() for item in normalized)
+
+
+def _segment_copy_profile(segments: list[dict[str, Any]]) -> dict[str, Any]:
+    regional_mode = _items_match_scope(segments, "regional_segment")
+    return {
+        "regional_mode": regional_mode,
+        "top_label": "头部分部" if regional_mode else "头部业务",
+        "fast_label": "高增分部" if regional_mode else "高增业务",
+        "focus_label": "重点分部" if regional_mode else "重点业务",
+        "side_label": "分部侧" if regional_mode else "业务侧",
+    }
+
+
+def _mix_page_title(
+    current_segments: list[dict[str, Any]],
+    current_geographies: list[dict[str, Any]],
+) -> str:
+    segment_copy = _segment_copy_profile(current_segments)
+    has_segments = bool(current_segments)
+    has_geographies = bool(current_geographies)
+    if segment_copy["regional_mode"] and has_geographies:
+        return "当季经营分部与地区结构"
+    if segment_copy["regional_mode"]:
+        return "当季经营分部结构"
+    if has_segments and has_geographies:
+        return "当季业务与地区结构"
+    if has_segments:
+        return "当季业务结构与集中度"
+    if has_geographies:
+        return "当季地区结构与集中度"
+    return "当季结构与集中度"
 
 
 def _excerpt_text(text: Optional[str], limit: int) -> str:
@@ -1191,37 +1268,7 @@ def _compose_summary_headline(
     latest_history: Optional[dict[str, Any]],
     fixture: Optional[dict[str, Any]],
 ) -> str:
-    money_symbol = company["money_symbol"]
-    revenue_bn = _value_or_history(latest_kpis.get("revenue_bn"), latest_history.get("revenue_bn") if latest_history else None)
-    net_income_bn = _value_or_history(latest_kpis.get("net_income_bn"), latest_history.get("net_income_bn") if latest_history else None)
-    revenue_yoy_pct = _value_or_history(latest_kpis.get("revenue_yoy_pct"), latest_history.get("revenue_yoy_pct") if latest_history else None)
-    net_income_yoy_pct = _value_or_history(latest_kpis.get("net_income_yoy_pct"), latest_history.get("net_income_yoy_pct") if latest_history else None)
-    fallback_headline = _clean_summary_fragment((fixture or {}).get("headline")) or str(company.get("card_headline") or company["description"])
-    if revenue_bn is None:
-        return fallback_headline
-    headline_parts = [f"{company['english_name']} {fiscal_label} 收入 {format_money_bn(revenue_bn, money_symbol)}"]
-    if net_income_bn is not None:
-        headline_parts.append(f"净利润 {format_money_bn(net_income_bn, money_symbol)}")
-    headline = "，".join(headline_parts)
-    growth_parts: list[str] = []
-    if revenue_yoy_pct is not None:
-        growth_parts.append(f"收入同比 {format_pct(revenue_yoy_pct, signed=True)}")
-    if net_income_yoy_pct is not None:
-        growth_parts.append(f"净利润同比 {format_pct(net_income_yoy_pct, signed=True)}")
-    if growth_parts:
-        headline += f"；{'，'.join(growth_parts)}"
-    driver = _summary_driver_from_fixture(company, fiscal_label, fixture)
-    if driver:
-        headline += f"；{driver}"
-    guidance = (fixture or {}).get("guidance") or {}
-    guidance_revenue = guidance.get("revenue_bn")
-    if guidance_revenue is not None and revenue_bn not in (None, 0):
-        guidance_delta = (float(guidance_revenue) / float(revenue_bn) - 1) * 100
-        guidance_label = "下一季指引中枢" if guidance.get("mode") == "official" else "下一阶段收入参考"
-        headline += f"；{guidance_label} {format_money_bn(guidance_revenue, money_symbol)}，较本季 {format_pct(guidance_delta, signed=True)}"
-    elif guidance.get("mode") == "official_context" and guidance.get("commentary"):
-        headline += "；管理层给出了下一阶段官方经营展望，详见指引页"
-    return f"{headline}。"
+    return _writer_compose_summary_headline(company, fiscal_label, latest_kpis, latest_history, fixture)
 
 
 def _build_layered_takeaways(
@@ -1231,66 +1278,12 @@ def _build_layered_takeaways(
     money_symbol: str,
     merged_sources: list[dict[str, Any]],
 ) -> list[dict[str, str]]:
-    latest = history[-1]
-    latest_kpis = fixture["latest_kpis"]
-    guidance = fixture["guidance"]
-    revenue_bn = _value_or_history(latest_kpis.get("revenue_bn"), latest.get("revenue_bn"))
-    revenue_yoy_pct = _value_or_history(latest_kpis.get("revenue_yoy_pct"), latest.get("revenue_yoy_pct"))
-    revenue_qoq_pct = _value_or_history(latest_kpis.get("revenue_qoq_pct"), latest.get("revenue_qoq_pct"))
-    net_income_bn = _value_or_history(latest_kpis.get("net_income_bn"), latest.get("net_income_bn"))
-    top_segment = max(fixture.get("current_segments") or [], key=lambda item: float(item.get("value_bn") or 0.0), default=None)
-    top_geo = max(fixture.get("current_geographies") or [], key=lambda item: float(item.get("value_bn") or 0.0), default=None)
-    baseline = _build_generic_guidance(history)
-    current_margin = _metric_or_fallback(latest_kpis.get("gaap_gross_margin_pct"), latest.get("gross_margin_pct")) or latest.get("net_margin_pct")
-    baseline_margin = baseline.get("gaap_gross_margin_pct")
-    current_margin_label = "毛利率" if latest.get("gross_margin_pct") is not None or latest_kpis.get("gaap_gross_margin_pct") is not None else company.get("historical_profit_margin_label", "净利率")
-
-    happened = [
-        f"收入 {format_money_bn(revenue_bn, money_symbol)}",
-        f"净利润 {format_money_bn(net_income_bn, money_symbol)}" if net_income_bn is not None else None,
-        (
-            f"同比 {format_pct(revenue_yoy_pct, signed=True)} / 环比 {format_pct(revenue_qoq_pct, signed=True)}"
-            if revenue_yoy_pct is not None or revenue_qoq_pct is not None
-            else None
-        ),
-    ]
-    why_body = f"{current_margin_label} {format_pct(current_margin)}"
-    if baseline_margin is not None and current_margin is not None:
-        why_body += f"，相对近四季中枢 {_format_delta(baseline_margin, current_margin)}"
-    if top_segment and revenue_bn not in (None, 0):
-        why_body += f"；{top_segment['name']} 占当季收入 {format_pct(float(top_segment.get('value_bn') or 0.0) / float(revenue_bn) * 100)}"
-    elif top_geo:
-        why_body += f"；地区侧以 {top_geo['name']} 为最大暴露"
-    if not why_body.endswith("。"):
-        why_body += "。"
-
-    next_parts: list[str] = []
-    if revenue_bn not in (None, 0) and baseline.get("revenue_bn") not in (None, 0):
-        delta_to_baseline = (float(revenue_bn) / float(baseline.get("revenue_bn")) - 1) * 100
-        next_parts.append(f"本季相对近四季收入中枢 {format_pct(delta_to_baseline, signed=True)}")
-    if guidance.get("revenue_bn") is not None and revenue_bn not in (None, 0):
-        next_delta = (float(guidance.get("revenue_bn")) / float(revenue_bn) - 1) * 100
-        next_parts.append(
-            f"{guidance.get('comparison_label') or ('下一季收入指引' if guidance.get('mode') == 'official' else '下一阶段收入参考')}较本季 {format_pct(next_delta, signed=True)}"
-        )
-    elif guidance.get("commentary"):
-        next_parts.append(_excerpt_text(str(guidance.get("commentary") or ""), 84))
-    next_body = "；".join(part for part in next_parts if part)
-    if next_body and not next_body.endswith("。"):
-        next_body += "。"
-    if not next_body:
-        next_body = "继续跟踪下一阶段收入基线、利润率方向与管理层语气是否同步改善。"
-
-    takeaways = [
-        {"title": "发生了什么", "body": "，".join(part for part in happened if part) + "。"},
-        {"title": "为什么重要", "body": why_body},
-        {"title": "接下来怎么看", "body": next_body},
-    ]
+    takeaways = _writer_compose_layered_takeaways(company, fixture, history, money_symbol)
     for item in takeaways:
         source_anchor, verification = _layered_takeaway_anchor(
             str(item.get("title") or ""),
             merged_sources=merged_sources,
-            guidance=guidance,
+            guidance=fixture["guidance"],
         )
         item["source_anchor"] = source_anchor
         item["verification"] = verification
@@ -1302,113 +1295,11 @@ def _build_expectation_panel(
     history: list[dict[str, Any]],
     money_symbol: str,
 ) -> dict[str, Any]:
-    latest = history[-1]
-    latest_kpis = fixture["latest_kpis"]
-    guidance = fixture["guidance"]
-    baseline = _build_generic_guidance(history)
-    current_revenue = _value_or_history(latest_kpis.get("revenue_bn"), latest.get("revenue_bn"))
-    current_margin = _metric_or_fallback(latest_kpis.get("gaap_gross_margin_pct"), latest.get("gross_margin_pct")) or latest.get("net_margin_pct")
-    baseline_revenue = baseline.get("revenue_bn")
-    baseline_margin = baseline.get("gaap_gross_margin_pct")
-    bullets: list[str] = []
-    chips: list[dict[str, str]] = []
-    if current_revenue is not None and baseline_revenue not in (None, 0):
-        revenue_gap = (float(current_revenue) / float(baseline_revenue) - 1) * 100
-        bullets.append(f"本季收入相对近四季收入中枢 {format_pct(revenue_gap, signed=True)}，衡量本季是否超出经营常态。")
-        chips.append(
-            {
-                "label": "常态偏离",
-                "value": format_pct(revenue_gap, signed=True),
-                "note": "相对近四季收入中枢",
-            }
-        )
-    if current_margin is not None and baseline_margin is not None:
-        bullets.append(f"本季利润率相对近四季中枢 {_format_delta(baseline_margin, current_margin)}，用于判断经营杠杆是否继续兑现。")
-        chips.append(
-            {
-                "label": "利润兑现",
-                "value": _format_delta(baseline_margin, current_margin),
-                "note": "相对近四季利润率中枢",
-            }
-        )
-    next_revenue = guidance.get("revenue_bn")
-    if next_revenue is not None and current_revenue not in (None, 0):
-        next_delta = (float(next_revenue) / float(current_revenue) - 1) * 100
-        bullets.append(
-            f"{guidance.get('comparison_label') or ('下一季收入指引' if guidance.get('mode') == 'official' else '下一阶段收入参考')} "
-            f"{format_money_bn(next_revenue, money_symbol)}，较本季 {format_pct(next_delta, signed=True)}。"
-        )
-        chips.append(
-            {
-                "label": "展望方向",
-                "value": format_pct(next_delta, signed=True),
-                "note": guidance.get("comparison_label") or "下一阶段收入参考",
-            }
-        )
-    commentary = _clean_summary_fragment(str(guidance.get("commentary") or ""))
-    if commentary:
-        bullets.append(commentary + ("。" if not commentary.endswith("。") else ""))
-    if len(chips) < 3 and commentary:
-        chips.append(
-            {
-                "label": "官方语境",
-                "value": "管理层表述",
-                "note": "详见本页原文整理",
-            }
-        )
-    if not bullets:
-        bullets.append("当前未接入明确市场一致预期，因此本页先用近四季经营中枢与官方语境替代预期差框架。")
-    return {"title": "预期差与指引拆解", "bullets": bullets[:4], "chips": chips[:3]}
+    return _writer_build_expectation_panel(fixture, history, money_symbol)
 
 
 def _build_institutional_digest(institutional_views: list[dict[str, Any]]) -> dict[str, Any]:
-    if not institutional_views:
-        return {
-            "title": "街头共识速览",
-            "bullets": [
-                "当前季度尚未稳定抓到足够可追溯的 sell-side 条目，因此本页保留机构观点卡片的说明框架。",
-                "系统只展示带机构名、发布时间和原始链接的公开转述，不会伪造一致预期。",
-            ],
-        }
-
-    stance_counts = Counter(str(item.get("stance_label") or "参考") for item in institutional_views)
-    positive_count = stance_counts.get("偏积极", 0)
-    cautious_count = stance_counts.get("偏谨慎", 0)
-    neutral_count = stance_counts.get("中性", 0)
-    reference_count = stance_counts.get("参考", 0)
-
-    theme_map = {
-        "AI / 云兑现": ("ai", "cloud", "azure", "aws", "copilot", "hpc", "inference"),
-        "指引与经营边界": ("guidance", "outlook", "forecast", "expectation", "boundary"),
-        "利润率与现金流": ("margin", "profit", "earnings", "cash flow", "fcf"),
-        "估值与目标价": ("price target", "target", "valuation", "multiple"),
-        "资本开支 / 供给": ("capex", "capacity", "supply", "shipment", "yield"),
-    }
-    theme_counts: Counter[str] = Counter()
-    for item in institutional_views:
-        combined = " ".join(
-            str(item.get(key) or "")
-            for key in ("headline", "summary", "description")
-        ).lower()
-        for label, keywords in theme_map.items():
-            if any(keyword in combined for keyword in keywords):
-                theme_counts[label] += 1
-    common_themes = [label for label, _count in theme_counts.most_common(2)]
-
-    bullets = [
-        "已收集 "
-        f"{len(institutional_views)} 家机构转述观点，其中 {positive_count} 家偏积极、"
-        f"{cautious_count} 家偏谨慎、{neutral_count} 家中性，另有 {reference_count} 家以事件跟踪为主。"
-    ]
-    if common_themes:
-        bullets.append("机构反复讨论的焦点集中在 " + "、".join(common_themes) + "。")
-    if positive_count >= max(2, len(institutional_views) - 1):
-        bullets.append("整体卖方口径偏正面，说明这季财报更多是在强化原有多头逻辑，而不是只靠估值弹性。")
-    elif cautious_count >= 2:
-        bullets.append("卖方反馈偏谨慎，意味着财报兑现之后，市场仍在重新校准后续增速与盈利可持续性。")
-    else:
-        bullets.append("机构态度仍有分化，更适合把卖方条目当作问题清单，而不是直接当成结论。")
-    return {"title": "街头共识速览", "bullets": bullets[:3]}
+    return _writer_build_institutional_digest(institutional_views)
 
 
 def _normalize_takeaways(
@@ -1417,16 +1308,10 @@ def _normalize_takeaways(
     latest_history: dict[str, Any],
     money_symbol: str,
 ) -> list[str]:
-    normalized: list[str] = []
-    if takeaways:
-        normalized.append(takeaways[0])
-    profit_line = _build_profit_growth_takeaway(latest_kpis, latest_history, money_symbol)
-    if profit_line:
-        normalized.append(profit_line)
-    for item in takeaways[1:]:
-        if profit_line and "净利润" in item:
-            continue
-        normalized.append(item)
+    normalized = _writer_normalize_takeaways(takeaways, latest_kpis, latest_history, money_symbol)
+    profit_line = _writer_polish_generated_text(_build_profit_growth_takeaway(latest_kpis, latest_history, money_symbol))
+    if profit_line and not any("净利润" in item or "利润" in item for item in normalized[:2]):
+        normalized.insert(1 if normalized else 0, profit_line)
     return normalized[:4]
 
 
@@ -1688,6 +1573,8 @@ def _normalize_historical_segments(
         }
         if item.get("yoy_pct") is not None:
             payload["yoy_pct"] = float(item["yoy_pct"])
+        if item.get("scope") is not None:
+            payload["scope"] = item["scope"]
         normalized.append(payload)
     return normalized
 
@@ -1774,17 +1661,39 @@ def _historical_segment_reference_profile(
         if str(item.get("name") or "")
     ]
     observed_lists: list[list[str]] = []
+    regional_observed_lists: list[list[str]] = []
     frequency: Counter[str] = Counter()
+    regional_frequency: Counter[str] = Counter()
     for entry in history:
         normalized = _normalize_historical_segments(company, list(entry.get("segments") or []), entry.get("revenue_bn"))
         names = [str(item.get("name") or "") for item in normalized if str(item.get("name") or "")]
         if not names:
             continue
         lowered = {name.casefold() for name in names}
+        if len(normalized) >= 2 and all(str(item.get("scope") or "").casefold() == "regional_segment" for item in normalized):
+            regional_observed_lists.append(names)
+            regional_frequency.update(dict.fromkeys(names, 1))
+            continue
         if lowered and lowered.issubset(REGIONAL_STRUCTURE_NAMES):
             continue
         observed_lists.append(names)
         frequency.update(dict.fromkeys(names, 1))
+
+    if regional_observed_lists:
+        reference_names: list[str] = []
+        observed_ranked = sorted(regional_frequency.items(), key=lambda item: (-item[1], item[0]))
+        for name, _count in observed_ranked:
+            if name not in reference_names:
+                reference_names.append(name)
+        observed_counts = sorted(len(names) for names in regional_observed_lists if names)
+        median_count = observed_counts[len(observed_counts) // 2] if observed_counts else len(reference_names)
+        target_count = max(2, min(len(reference_names) or median_count or 2, median_count or 2))
+        core_names = reference_names[: min(2, len(reference_names))]
+        return {
+            "reference_names": reference_names,
+            "target_count": target_count,
+            "core_names": core_names,
+        }
 
     reference_names = list(expected_names)
     observed_ranked = sorted(
@@ -1827,10 +1736,7 @@ def _valid_segment_history_entry(
     normalized = _normalize_historical_segments(company, list(entry.get("segments") or []), entry.get("revenue_bn"))
     if not normalized:
         return False
-    if _structure_names_are_geography_like(
-        company,
-        [str(item.get("name") or "") for item in normalized],
-    ):
+    if _segments_are_geography_like(company, normalized):
         return False
     reference_profile = reference_profile or _historical_segment_reference_profile(company, [entry])
     target_count = int(reference_profile.get("target_count") or _minimum_required_segment_count(company))
@@ -1892,10 +1798,7 @@ def _historical_segment_share_map(
     if not segments:
         return {}
     normalized = _normalize_historical_segments(company, segments, entry.get("revenue_bn"))
-    if _structure_names_are_geography_like(
-        company,
-        [str(item.get("name") or "") for item in normalized],
-    ):
+    if _segments_are_geography_like(company, normalized):
         return {}
     share_map = {
         str(item.get("name") or "Business"): float(item.get("share_pct") or 0.0) / 100
@@ -2622,7 +2525,7 @@ def generate_historical_insights(
         insights.append(
             {
                 "title": "结构页按管理层口径降级",
-                "body": "由于缺少连续 12 季业务分部披露，结构迁移与增量贡献页采用总量成长与结构限制说明。",
+                "body": "由于缺少连续 12 季业务分部披露，结构迁移与增量贡献页改看总量成长与结构边界说明。",
                 "evidence": "报告已在结构页和附录页明确标注当前披露限制。",
             }
         )
@@ -3019,8 +2922,8 @@ def _official_material_proxy_summary(
     if not highlights:
         material_label = str(preferred_material.get("label") or "官方材料").strip()
         for fallback in (
-            f"当前未抓到完整电话会 transcript，本页问答主题改由 {material_label} 提炼的经营主线补位。",
-            "软件、基础设施与利润质量是当前代理电话会摘要里最需要追踪的三条主线。",
+            f"这季没有完整电话会实录，所以这页改从 {material_label} 里抓管理层最在意的经营线索。",
+            "先盯收入方向、利润率和管理层反复强调的业务主线，不要被杂音带跑。",
         ):
             if _append_unique_highlight(highlights, fallback, limit=2):
                 break
@@ -3062,7 +2965,7 @@ def _official_material_proxy_summary(
     return {
         "source_type": "official_material_proxy",
         "filename": str(preferred_material.get("label") or "Official earnings materials"),
-        "highlights": highlights[:3],
+        "highlights": [_writer_polish_generated_text(item) for item in highlights[:3]],
         "topics": topics[:4],
     }
 
@@ -3525,71 +3428,12 @@ def _build_narrative_provenance(
     quote_cards = list(fixture.get("call_quote_cards") or [])
     synthesized_quotes = _quote_cards_are_synthesized(quote_cards)
 
-    if transcript_source_type == "manual_transcript":
-        qna = _narrative_entry("manual_transcript")
-    elif transcript_source_type == "official_call_material":
-        qna = _narrative_entry("official_call_material")
-    elif transcript_source_type == "official_material_proxy":
-        qna = _narrative_entry("official_material_proxy")
-    elif has_official_material:
-        qna = _narrative_entry("official_material_inferred")
-    else:
-        qna = _narrative_entry("structured_fallback")
-
-    if transcript_source_type == "official_call_material":
-        narrative_status = "official_call_material"
-    elif transcript_source_type == "official_material_proxy":
-        narrative_status = "official_material_proxy"
-    else:
-        narrative_status = "official_material_inferred" if has_official_material else "structured_fallback"
-    management = _narrative_entry(narrative_status)
-    risks = _narrative_entry(narrative_status)
-    catalysts = _narrative_entry(narrative_status)
-
-    if quote_cards and not synthesized_quotes:
-        quotes = _narrative_entry("official_quote_excerpt")
-    elif quote_cards:
-        quotes = _narrative_entry("synthesized_quote")
-    else:
-        quotes = _narrative_entry("no_quote_excerpt")
-
-    qna_chart_title = "真实问答主题" if not qna["is_inferred"] else "推断问答主题"
-    qna_chart_subtitle = (
-        "按 transcript / 电话会原文整理"
-        if qna["status"] in {"manual_transcript", "official_call_material"}
-        else "按官方财报材料构建代理电话会摘要"
-        if qna["status"] == "official_material_proxy"
-        else "当前缺少完整电话会问答，按官方材料动态提炼"
+    return _writer_build_narrative_provenance(
+        transcript_source_type=transcript_source_type,
+        has_official_material=has_official_material,
+        has_quote_cards=bool(quote_cards),
+        synthesized_quotes=synthesized_quotes,
     )
-    management_chart_subtitle = (
-        "优先依据电话会与管理层原文提炼"
-        if management["status"] == "official_call_material"
-        else "按官方 release / deck / filing 生成代理电话会锚点"
-        if management["status"] == "official_material_proxy"
-        else "按官方材料与经营数据动态提炼"
-        if management["status"] == "official_material_inferred"
-        else "当前仍带有通用研究 fallback"
-    )
-
-    return {
-        "qna": qna,
-        "management": management,
-        "risks": risks,
-        "catalysts": catalysts,
-        "quotes": quotes,
-        "call_panel_meta_lines": [
-            f"问答主题来源：{qna['label']}。{qna['detail']}",
-            f"管理层锚点来源：{quotes['label']}。{quotes['detail']}",
-        ],
-        "risk_meta_lines": [
-            f"风险视角来源：{risks['label']}。{risks['detail']}",
-            f"催化剂视角来源：{catalysts['label']}。{catalysts['detail']}",
-        ],
-        "quote_panel_title": "官方管理层锚点" if quotes["status"] == "official_quote_excerpt" else "管理层语境锚点",
-        "qna_chart_title": qna_chart_title,
-        "qna_chart_subtitle": qna_chart_subtitle,
-        "management_chart_subtitle": management_chart_subtitle,
-    }
 
 
 def _reconcile_coverage_warnings(
@@ -4352,9 +4196,9 @@ def _build_generic_fixture(
         f"当前报告基于结构化季度财务序列生成深度版研究摘要。"
     )
     coverage_notes = [
-        "当前报告会优先使用自动发现的官方源；若部分字段仍未披露，再回退到结构化季度财务序列与统一研究模板。",
-        "当前未接入完整电话会 transcript，因此电话会页展示研究关注主题与证据卡片，而不是逐段原文摘录。",
-        "由于缺少连续 12 季分部披露，结构迁移与增量贡献页将自动降级为总量成长、盈利质量与结构限制说明。",
+        "这份报告会先看当季官方材料；未披露字段再回到历史财务序列补齐。",
+        "电话会原文暂不完整时，这一页先展示研究问题与证据卡片，不硬做逐段摘录。",
+        "由于缺少连续 12 季分部披露，结构迁移与增量贡献页改看总量成长、盈利质量与结构边界说明。",
     ]
     if company.get("currency_code") != "USD":
         coverage_notes.append(f"金额按 {company['currency_code']} 报告币种展示，未做外汇折算。")
@@ -4390,6 +4234,26 @@ def _build_current_detail_cards(
     latest = history[-1]
     current_segments = fixture.get("current_segments") or []
     current_geographies = fixture.get("current_geographies") or []
+    segment_copy = _segment_copy_profile(current_segments)
+    regional_segment_duplicate_mode = (
+        bool(current_segments)
+        and bool(current_geographies)
+        and _items_match_scope(current_geographies, "regional_segment")
+        and {
+            (
+                str(item.get("name") or "").casefold(),
+                round(float(item.get("value_bn") or 0.0), 3),
+            )
+            for item in current_segments
+        }
+        == {
+            (
+                str(item.get("name") or "").casefold(),
+                round(float(item.get("value_bn") or 0.0), 3),
+            )
+            for item in current_geographies
+        }
+    )
     total = latest.get("revenue_bn") or 1
     cards: list[dict[str, str]] = []
     if current_segments:
@@ -4397,7 +4261,7 @@ def _build_current_detail_cards(
         top_segment = ranked_segments[0]
         cards.append(
             {
-                "title": f"头部业务 | {top_segment['name']}",
+                "title": f"{segment_copy['top_label']} | {top_segment['name']}",
                 "value": format_money_bn(float(top_segment["value_bn"]), money_symbol),
                 "note": (
                     f"占当季收入 {format_pct(float(top_segment['value_bn']) / float(total) * 100)}"
@@ -4420,12 +4284,12 @@ def _build_current_detail_cards(
         if fastest_segment:
             cards.append(
                 {
-                    "title": f"高增业务 | {fastest_segment['name']}",
+                    "title": f"{segment_copy['fast_label']} | {fastest_segment['name']}",
                     "value": format_pct(fastest_segment.get("yoy_pct"), signed=True),
                     "note": f"当季收入 {format_money_bn(float(fastest_segment['value_bn']), money_symbol)}",
                 }
             )
-    if current_geographies:
+    if current_geographies and not regional_segment_duplicate_mode:
         top_geo = max(current_geographies, key=lambda item: float(item.get("value_bn") or 0.0))
         annual_geo_mode = bool(current_geographies) and all(str(item.get("scope") or "") == "annual_filing" for item in current_geographies)
         regional_segment_mode = bool(current_geographies) and all(str(item.get("scope") or "") == "regional_segment" for item in current_geographies)
@@ -4448,7 +4312,7 @@ def _build_current_detail_cards(
     if current_segments and len(cards) < 3:
         ranked_segments = sorted(current_segments, key=lambda item: float(item["value_bn"]), reverse=True)
         for segment in ranked_segments:
-            title = f"重点业务 | {segment['name']}"
+            title = f"{segment_copy['focus_label']} | {segment['name']}"
             if any(card["title"] == title or segment["name"] in card["title"] for card in cards):
                 continue
             cards.append(
@@ -4590,24 +4454,8 @@ def _build_call_panel(
     qna_topics: list[dict[str, Any]],
     narrative_provenance: dict[str, Any],
 ) -> dict[str, Any]:
-    qna_status = str(((narrative_provenance or {}).get("qna") or {}).get("status") or "")
-    if transcript_summary:
-        return {
-            "title": "手动 transcript 摘要" if transcript_summary.get("source_type") == "manual_transcript" else "自动电话会摘要",
-            "meta_lines": narrative_provenance.get("call_panel_meta_lines") or [],
-            "bullets": [re.sub(r"\s+", " ", str(item or "")).strip() for item in transcript_summary["highlights"][:2]],
-        }
-    if qna_status in {"manual_transcript", "official_call_material"}:
-        return {
-            "title": "当前电话会摘要",
-            "meta_lines": narrative_provenance.get("call_panel_meta_lines") or [],
-            "bullets": [re.sub(r"\s+", " ", str(item.get("note") or "")).strip() for item in qna_topics[:2]],
-        }
-    return {
-        "title": "当前无完整电话会实录，展示推断问答主题",
-        "meta_lines": narrative_provenance.get("call_panel_meta_lines") or [],
-        "bullets": [re.sub(r"\s+", " ", str(item.get("note") or "")).strip() for item in qna_topics[:2]],
-    }
+    del fixture
+    return _writer_build_call_panel(transcript_summary, qna_topics, narrative_provenance)
 
 
 def _build_history_summary_cards(history: list[dict[str, Any]], money_symbol: str) -> list[dict[str, str]]:
@@ -4641,6 +4489,7 @@ def _build_scoreboard(
 ) -> list[dict[str, str]]:
     latest = fixture["latest_kpis"]
     top_segment = max(fixture["current_segments"], key=lambda item: float(item["value_bn"])) if fixture.get("current_segments") else None
+    segment_copy = _segment_copy_profile(list(fixture.get("current_segments") or []))
     if latest.get("free_cash_flow_bn") is None:
         profitability_card = {
             "title": "净利润",
@@ -4654,7 +4503,7 @@ def _build_scoreboard(
             "subvalue": f"FCF margin {format_pct(latest['free_cash_flow_bn'] / latest['revenue_bn'] * 100)}",
         }
     structure_card = {
-        "title": "头部分部",
+        "title": segment_copy["top_label"],
         "value": top_segment["name"] if top_segment else company["currency_code"],
         "subvalue": format_pct(top_segment["value_bn"] / latest["revenue_bn"] * 100) if top_segment else "金额按报告币种展示",
     }
@@ -4843,11 +4692,11 @@ def build_report_payload(
     if narrative_provenance["qna"]["status"] == "official_call_material":
         coverage_warnings.insert(0, "当前问答主题优先依据官方电话会材料整理，并非静态模板。")
     elif narrative_provenance["qna"]["status"] == "official_material_proxy":
-        coverage_warnings.insert(0, "当前未抓到完整 transcript 时，系统已基于官方 release / deck / filing 生成电话会代理摘要与问答主题。")
+        coverage_warnings.insert(0, "电话会页重点来自财报稿、演示材料和 filing 的交叉整理。")
     elif narrative_provenance["qna"]["status"] == "official_material_inferred":
-        coverage_warnings.insert(0, "当前未获取到当季完整电话会 transcript / Q&A，问答主题基于官方财报材料动态推断。")
+        coverage_warnings.insert(0, "这页的问题清单主要根据财报稿和 filing 整理。")
     elif narrative_provenance["qna"]["status"] == "structured_fallback":
-        coverage_warnings.insert(0, "当前缺少可解析的官方电话会与财报原文材料，问答主题仍带有统一研究 fallback 性质。")
+        coverage_warnings.insert(0, "原始材料还不够完整，这页只保留最核心的问题。")
     _emit_progress(progress_callback, 0.92, "views", "正在整理机构观点与研究辅助视角...")
     institutional_views = get_institutional_views(
         company,
@@ -4872,6 +4721,7 @@ def build_report_payload(
         structure_dimension=structure_dimension,
         institutional_views=institutional_views,
     )
+    coverage_warnings = _writer_humanize_support_lines(coverage_warnings)
 
     brand = company["brand"]
     money_symbol = company.get("money_symbol", "$")
@@ -4887,6 +4737,10 @@ def build_report_payload(
     layered_takeaways = _build_layered_takeaways(company, fixture, history, money_symbol, merged_sources)
     institutional_digest = _build_institutional_digest(institutional_views)
     income_statement = _build_income_statement_snapshot(company, fixture, history)
+    mix_page_title = _mix_page_title(
+        list(fixture.get("current_segments") or []),
+        list(fixture.get("current_geographies") or []),
+    )
     risk_source = _pick_best_source(
         merged_sources,
         preferred_kinds=("official_release", "presentation", "sec_filing", "structured_financials"),
@@ -4917,18 +4771,18 @@ def build_report_payload(
     )
     uses_official_context = _guidance_uses_official_context(fixture["guidance"])
     if fixture["guidance"]["mode"] == "official":
-        guidance_title = "业绩指引页 · 下一季指引"
-        guidance_note = "将本季已兑现结果与公司正式给出的下一季数值指引放到一页内对照阅读。"
+        guidance_title = "业绩指引页 · 下一季怎么看"
+        guidance_note = "把这季已经兑现的结果和管理层正式给出的下一季口径放在一起看。"
         guidance_chart_title = "当前业绩与下一季指引"
     elif fixture["guidance"]["mode"] == "official_context":
-        guidance_title = "业绩指引页 · 官方展望语境"
-        guidance_note = "公司未给出明确数值指引时，本页保留官方展望语境，并用经营基线补足对照面。"
-        guidance_chart_title = "当前季度与官方展望语境"
+        guidance_title = "业绩指引页 · 管理层怎么描绘下一步"
+        guidance_note = "公司没有给出明确数字时，这一页保留管理层原本的展望语气，再拿近几季常态做参照。"
+        guidance_chart_title = "当前季度与管理层展望"
     else:
-        guidance_title = "业绩指引页 · 经营基线"
-        guidance_note = "当官方下一季指引尚未接入时，使用最近四季经营基线来模拟下一阶段经营参照。"
-        guidance_chart_title = "当前业绩与经营基线对照"
-    guidance_note = f"{guidance_note} 重点看指引与本季兑现是否同向。"
+        guidance_title = "业绩指引页 · 后续经营参照"
+        guidance_note = "还没有明确指引时，这一页先拿近几季常态做参照，看看管理层后面的经营方向有没有偏离。"
+        guidance_chart_title = "当前业绩与后续经营参照"
+    guidance_note = _writer_polish_generated_text(f"{guidance_note} 重点看管理层口径和本季兑现是不是站在同一边。")
     section_meta = _build_dynamic_section_meta(
         company,
         fixture,
@@ -4983,11 +4837,11 @@ def build_report_payload(
             "管理层重点" if uses_official_context else "研究关注重点",
             fixture["management_themes"],
             brand["primary"],
-            narrative_provenance["qna_chart_title"] if uses_official_context else "研究问题与追踪点",
+            narrative_provenance["qna_chart_title"] if uses_official_context else "市场下一步会追问什么",
             qna_topics,
             brand["secondary"],
-            left_subtitle=narrative_provenance["management_chart_subtitle"] if uses_official_context else "按结构化财务数据自动提炼",
-            right_subtitle=narrative_provenance["qna_chart_subtitle"] if uses_official_context else "按研究关注度与潜在拐点排序",
+            left_subtitle=narrative_provenance["management_chart_subtitle"] if uses_official_context else "结合当季披露和历史表现整理",
+            right_subtitle=narrative_provenance["qna_chart_subtitle"] if uses_official_context else "更像下一步该继续追的问题清单",
         ),
         "risks_catalysts": render_dual_ranked_svg(
             "主要风险",
@@ -5010,7 +4864,7 @@ def build_report_payload(
             history,
             brand["segment_colors"],
             brand["primary"],
-            "由于缺少连续 12 季分部披露，本页改为结构限制说明与管理层结构判断。",
+            "连续 12 季可比的分部披露还不够完整，所以这一页改从结构线索和管理层判断去看变化。",
         ),
         "profitability": render_profitability_svg(
             history,
@@ -5022,7 +4876,7 @@ def build_report_payload(
             history,
             brand["segment_colors"],
             brand["primary"],
-            "当前公司缺少连续季度分部明细，因此增量拆解降级为总量与利润质量分析。",
+            "连续季度分部明细还不够完整，所以这一页先回答增长是靠总量扩张，还是靠利润质量改善。",
             money_symbol=money_symbol,
         ),
     }
@@ -5042,6 +4896,7 @@ def build_report_payload(
         structure_dimension=structure_dimension,
         institutional_views=institutional_views,
     )
+    coverage_warnings = _writer_humanize_support_lines(coverage_warnings)
     payload = {
         "payload_schema_version": REPORT_PAYLOAD_SCHEMA_VERSION,
         "full_coverage_required": full_coverage_mode,
@@ -5065,6 +4920,7 @@ def build_report_payload(
         "guidance_title": guidance_title,
         "guidance_note": guidance_note,
         "historical_growth_title": historical_growth_title,
+        "mix_page_title": mix_page_title,
         "guidance_panel": guidance_panel,
         "guidance_change_panel": guidance_change_panel,
         "expectation_panel": expectation_panel,
@@ -5111,15 +4967,6 @@ def build_report_payload(
         require_full_coverage=full_coverage_mode,
     )
     payload["quality_report"] = quality_report
-    quality_warnings = quality_warnings_for_payload(quality_report)
-    if quality_warnings:
-        payload["coverage_warnings"] = _reconcile_coverage_warnings(
-            list(payload["coverage_warnings"]) + quality_warnings,
-            fixture=fixture,
-            source_materials=source_materials,
-            structure_dimension=structure_dimension,
-            institutional_views=institutional_views,
-        )
     return payload
 
 
@@ -5311,6 +5158,11 @@ def ensure_report_payload_defaults(payload: dict[str, Any]) -> dict[str, Any]:
                 str(((company.get("brand") or {}).get("primary")) or "#0F172A"),
             )
             normalized["visuals"] = visuals
+    if "mix_page_title" not in normalized:
+        normalized["mix_page_title"] = _mix_page_title(
+            list(normalized.get("current_segments") or []),
+            list(normalized.get("current_geographies") or []),
+        )
     if not isinstance(normalized.get("quality_report"), dict):
         normalized["quality_report"] = evaluate_report_payload(normalized)
     normalized.setdefault("guidance_change_panel", {"title": "相对上一季口径变化", "bullets": [], "source_anchor": ""})

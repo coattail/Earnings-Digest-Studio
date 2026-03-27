@@ -555,32 +555,69 @@ def render_segment_mix_svg(
     accent: str,
     money_symbol: str = "$",
 ) -> str:
+    segment_regional_mode = bool(segments) and all(
+        str(item.get("scope") or "").casefold() == "regional_segment" for item in segments
+    )
     business_names = [str(item.get("name") or "Business") for item in segments]
     business_palette = _segment_palette(business_names, colors, accent)
     annual_geography_mode = bool(geographies) and all(str(item.get("scope") or "") == "annual_filing" for item in geographies)
-    regional_segment_mode = bool(geographies) and all(str(item.get("scope") or "") == "regional_segment" for item in geographies)
+    geography_regional_mode = bool(geographies) and all(
+        str(item.get("scope") or "").casefold() == "regional_segment" for item in geographies
+    )
+    duplicate_regional_panels = (
+        geography_regional_mode
+        and bool(segments)
+        and {
+            (
+                str(item.get("name") or "").casefold(),
+                round(float(item.get("value_bn") or 0.0), 3),
+            )
+            for item in segments
+        }
+        == {
+            (
+                str(item.get("name") or "").casefold(),
+                round(float(item.get("value_bn") or 0.0), 3),
+            )
+            for item in geographies
+        }
+    )
     business_svg = _donut_panel_svg(
-        "业务营收结构",
-        "优先采用财报分部口径，保持品牌映射一致。",
+        "区域经营分部结构" if segment_regional_mode else "业务营收结构",
+        "公司按区域经营分部披露，这里直接保留官方分部口径，不把它误写成营收类型。"
+        if segment_regional_mode
+        else "优先采用财报分部口径，保持品牌映射一致。"
+        if not duplicate_regional_panels
+        else "公司按区域经营分部披露时，这里直接保留官方分部口径。",
         segments,
         business_palette,
         accent,
         money_symbol,
         "当前缺少稳定分部披露，系统已改为总量成长、利润质量与管理层结构摘要。",
+        center_label="经营分部" if segment_regional_mode else "当季营收",
     )
     geography_svg = _donut_panel_svg(
         "地区营收结构",
+        "公司未单列终端地理收入，因此这一栏不重复展示与分部完全相同的区域口径。"
+        if duplicate_regional_panels
+        else
         "若财报披露地理口径，则自动补入第二张圆环结构图。"
-        if not annual_geography_mode and not regional_segment_mode
+        if not annual_geography_mode and not geography_regional_mode
         else "若公司按区域经营分部披露，则采用区域经营分部口径，并显式区分于业务分部。"
-        if regional_segment_mode
+        if geography_regional_mode
         else "若当季未单独披露，则回退到最近年报地理口径，并显式标注为年度视角。",
-        geographies,
+        [] if duplicate_regional_panels else geographies,
         _geography_palette([str(item.get("name") or "Geography") for item in geographies], accent),
         accent,
         money_symbol,
-        "当前季度未在已接入官方材料中发现稳定地区收入拆分，因此本页保留业务结构主图。",
-        center_label="当季营收" if not annual_geography_mode and not regional_segment_mode else "区域经营分部" if regional_segment_mode else "年度地区口径",
+        "当前季度未在已接入官方材料中发现稳定地区收入拆分，因此本页保留业务结构主图。"
+        if not duplicate_regional_panels
+        else "当前官方材料只披露了区域经营分部，没有单独给出终端地理收入拆分。",
+        center_label="当季营收"
+        if not annual_geography_mode and not geography_regional_mode
+        else "区域经营分部"
+        if geography_regional_mode
+        else "年度地区口径",
     )
     return _svg(
         1140,

@@ -248,6 +248,17 @@ def _find_html_table_row(
     return None
 
 
+def _html_cell_matches_labels(cell_text: str, labels: list[str]) -> bool:
+    normalized_cell = _normalize_html_table_key(cell_text)
+    if not normalized_cell:
+        return False
+    normalized_labels = [_normalize_html_table_key(label) for label in labels if str(label or "").strip()]
+    for normalized_label in normalized_labels:
+        if normalized_cell == normalized_label or normalized_cell.startswith(normalized_label):
+            return True
+    return False
+
+
 def _html_row_numeric_series(row: list[str] | None) -> list[float]:
     if row is None:
         return []
@@ -296,6 +307,17 @@ def _extract_html_table_metric_from_material(
             best = (current, prior, yoy)
             best_score = score
     return best
+
+
+PROFILED_SEGMENT_VALUE_LABELS = [
+    "Total net revenues",
+    "Net revenues",
+    "Net sales",
+    "Total revenues",
+    "Revenue",
+    "Revenues",
+    "Sales",
+]
 
 
 def _statement_span_from_html_header(cell_text: str) -> Optional[int]:
@@ -462,6 +484,50 @@ def _extract_html_statement_metric_from_rows(
                 prior = round(float(prior_raw) * scale / 1_000_000_000, 3)
                 return (current, prior, _pct_change(current, prior))
     return _extract_html_table_metric_from_rows(rows, labels)
+
+
+def _extract_sectioned_html_statement_metric_from_rows(
+    rows: list[list[str]],
+    section_labels: list[str],
+    metric_labels: list[str],
+    target_calendar_quarter: Optional[str],
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    if not rows:
+        return (None, None, None)
+    all_section_indexes: list[int] = []
+    section_indexes: list[int] = []
+    for index, row in enumerate(rows):
+        if not row:
+            continue
+        trailing_cells = [str(cell or "").strip() for cell in row[1:]]
+        if any(cell for cell in trailing_cells):
+            continue
+        all_section_indexes.append(index)
+        if _html_cell_matches_labels(str(row[0] or ""), section_labels):
+            section_indexes.append(index)
+    if not section_indexes:
+        return (None, None, None)
+
+    header_rows = rows[: section_indexes[0]]
+    best: tuple[Optional[float], Optional[float], Optional[float]] = (None, None, None)
+    best_score: tuple[int, float] = (-1, -1.0)
+    for start_index in section_indexes:
+        end_index = next((index for index in all_section_indexes if index > start_index), len(rows))
+        metric_rows = rows[start_index + 1 : end_index]
+        if not metric_rows:
+            continue
+        current, prior, yoy = _extract_html_statement_metric_from_rows(
+            header_rows + metric_rows,
+            metric_labels,
+            target_calendar_quarter,
+        )
+        if current is None:
+            continue
+        score = (int(prior is not None), float(current))
+        if score > best_score:
+            best = (current, prior, yoy)
+            best_score = score
+    return best
 
 
 GENERIC_STATEMENT_ROW_ALIASES: dict[str, tuple[str, ...]] = {
@@ -944,7 +1010,7 @@ def _theme(label: str, score: float, note: str) -> dict[str, Any]:
 
 
 def _segment(name: str, value_bn: Optional[float], yoy_pct: Optional[float]) -> Optional[dict[str, Any]]:
-    if value_bn is None:
+    if value_bn is None or float(value_bn) <= 0:
         return None
     return {
         "name": name,
@@ -1959,6 +2025,41 @@ COMPANY_SEGMENT_PROFILES: dict[str, list[dict[str, Any]]] = {
     ],
 }
 
+REGIONAL_SEGMENT_NAMES = {
+    "north america",
+    "international",
+    "united states",
+    "united states and canada",
+    "americas",
+    "europe",
+    "asia-pacific",
+    "apac",
+    "apj",
+    "greater china",
+    "japan",
+    "rest of world",
+}
+
+
+def _regional_segment_scope_candidates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    scoped = [
+        dict(item)
+        for item in list(items or [])
+        if str(item.get("name") or "").strip()
+        and str(item.get("name") or "").casefold() in REGIONAL_SEGMENT_NAMES
+    ]
+    return scoped
+
+
+def _tag_regional_segments(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    tagged = [dict(item) for item in list(items or []) if isinstance(item, dict)]
+    regional_candidates = _regional_segment_scope_candidates(tagged)
+    if len(tagged) < 2 or len(regional_candidates) != len(tagged):
+        return tagged
+    for item in tagged:
+        item["scope"] = "regional_segment"
+    return tagged
+
 
 def _segment_label_variants(label: str) -> list[str]:
     normalized = " ".join(str(label or "").split()).strip()
@@ -2131,7 +2232,7 @@ GENERIC_GEOGRAPHY_LABELS: list[dict[str, Any]] = [
 
 
 def _geography(name: str, value_bn: Optional[float], yoy_pct: Optional[float]) -> Optional[dict[str, Any]]:
-    if value_bn is None:
+    if value_bn is None or float(value_bn) <= 0:
         return None
     return {
         "name": name,
@@ -3382,6 +3483,21 @@ SEGMENT_DISCOVERY_ROW_BLACKLIST = {
     "income tax",
 }
 
+_SUSPICIOUS_GENERIC_SEGMENT_NAME_PATTERNS = (
+    r"^in\s+(?:january|february|march|april|may|june|july|august|september|october|november|december)\b",
+    r"\bpatent(?:s)?\b",
+    r"\bnos?\.\b",
+    r"\bcopyright\b",
+    r"\btrademark\b",
+)
+
+
+def _segment_name_looks_suspicious(name: str) -> bool:
+    normalized = _flatten_text(name).casefold()
+    if not normalized:
+        return True
+    return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in _SUSPICIOUS_GENERIC_SEGMENT_NAME_PATTERNS)
+
 
 def _generic_segment_name_from_line(line: str) -> Optional[str]:
     match = re.match(r"^(.*?)(?=\s+\(?-?[0-9])", _flatten_text(line), flags=re.IGNORECASE)
@@ -3393,6 +3509,7 @@ def _generic_segment_name_from_line(line: str) -> Optional[str]:
         not name
         or len(name) > 80
         or normalized in SEGMENT_DISCOVERY_ROW_BLACKLIST
+        or _segment_name_looks_suspicious(name)
         or name.startswith(("※", "•", "-", "*"))
         or any(token in normalized for token in ("results", "outlook", "financial data", "growth", "quarterly"))
     ):
@@ -3490,6 +3607,34 @@ def _score_segment_candidate(
         score += 2
     if any(token in context for token in ("million shares", "stockholders", "shareholders", "equity", "goodwill balance", "stores open as of")):
         score -= 20
+    suspicious_name_count = sum(1 for item in segments if _segment_name_looks_suspicious(str(item.get("name") or "")))
+    if suspicious_name_count:
+        score -= suspicious_name_count * 18
+    if source_kind == "generic_material":
+        profiled_labels = {
+            _normalize_html_table_key(variant)
+            for profile in _segment_profiles_for_company(company_id)
+            for label in [str(profile.get("name") or "")] + [str(item) for item in list(profile.get("labels") or [])]
+            for variant in _segment_label_variants(label)
+            if str(variant).strip()
+        }
+        if profiled_labels:
+            overlap = 0
+            for item in segments:
+                segment_key = _normalize_html_table_key(str(item.get("name") or ""))
+                if not segment_key:
+                    continue
+                if any(
+                    segment_key == profiled_key
+                    or segment_key.startswith(profiled_key)
+                    or profiled_key.startswith(segment_key)
+                    for profiled_key in profiled_labels
+                ):
+                    overlap += 1
+            if overlap == 0:
+                score -= 55
+            else:
+                score += overlap * 4
     if source_kind == "profiled_html":
         score += 5
     elif source_kind == "profiled_material":
@@ -3515,19 +3660,44 @@ def _extract_profiled_segments_from_html_tables(
         header_text = " ".join(" ".join(str(cell or "") for cell in row[:6]) for row in rows[:8])
 
         multi_row_segments: list[dict[str, Any]] = []
+        sectioned_segments: list[dict[str, Any]] = []
         for profile in profiles:
+            profile_labels = [str(profile.get("name") or "")] + [str(label) for label in list(profile.get("labels") or [])]
             current_bn, prior_bn, yoy_pct = _extract_html_statement_metric_from_rows(
                 rows,
                 list(profile.get("labels") or []),
                 target_calendar_quarter,
             )
             if current_bn is None:
-                continue
-            item = _segment(str(profile.get("name") or ""), current_bn, yoy_pct if yoy_pct is not None else _pct_change(current_bn, prior_bn))
-            if item is not None:
-                multi_row_segments.append(item)
+                current_bn, prior_bn, yoy_pct = _extract_sectioned_html_statement_metric_from_rows(
+                    rows,
+                    profile_labels,
+                    PROFILED_SEGMENT_VALUE_LABELS,
+                    target_calendar_quarter,
+                )
+                if current_bn is None:
+                    continue
+                item = _segment(str(profile.get("name") or ""), current_bn, yoy_pct if yoy_pct is not None else _pct_change(current_bn, prior_bn))
+                if item is not None:
+                    sectioned_segments.append(item)
+            else:
+                item = _segment(str(profile.get("name") or ""), current_bn, yoy_pct if yoy_pct is not None else _pct_change(current_bn, prior_bn))
+                if item is not None:
+                    multi_row_segments.append(item)
         if len(multi_row_segments) >= 2:
             candidate = list(multi_row_segments)
+            candidate_score = _score_segment_candidate(
+                company_id,
+                candidate,
+                revenue_bn,
+                context_text=header_text,
+                source_kind="profiled_html",
+            )
+            if candidate_score > best_score:
+                best = candidate
+                best_score = candidate_score
+        if len(sectioned_segments) >= 2:
+            candidate = list(sectioned_segments)
             candidate_score = _score_segment_candidate(
                 company_id,
                 candidate,
@@ -3552,7 +3722,7 @@ def _extract_profiled_segments_from_html_tables(
             continue
         current_bn, prior_bn, yoy_pct = _extract_html_statement_metric_from_rows(
             rows,
-            ["Total net revenues", "Net revenues", "Total revenues", "Revenue", "Revenues", "Sales"],
+            PROFILED_SEGMENT_VALUE_LABELS,
             target_calendar_quarter,
         )
         if current_bn is None:
@@ -4282,7 +4452,7 @@ def _ensure_minimum_management_themes(
         note = str(item.get("note") or "").strip()
         if not label or not note:
             continue
-        candidate_label = f"经营跟踪：{label}"
+        candidate_label = label
         if candidate_label in seen:
             continue
         enriched.append(_theme(candidate_label, float(item.get("score") or 68), note))
@@ -4301,9 +4471,9 @@ def _ensure_minimum_qna_themes(
     enriched = [dict(item) for item in list(qna_themes or []) if isinstance(item, dict)]
     seen = {str(item.get("label") or "") for item in enriched if str(item.get("label") or "")}
     for pool, prefix in (
-        (management_themes, "延伸关注"),
-        (risks, "风险追问"),
-        (catalysts, "催化验证"),
+        (management_themes, ""),
+        (risks, ""),
+        (catalysts, ""),
     ):
         for item in list(pool or []):
             if len(enriched) >= minimum:
@@ -4312,7 +4482,7 @@ def _ensure_minimum_qna_themes(
             note = str(item.get("note") or "").strip()
             if not label or not note:
                 continue
-            candidate_label = f"{prefix}：{label}"
+            candidate_label = label
             if candidate_label in seen:
                 continue
             enriched.append(_theme(candidate_label, float(item.get("score") or 70), note))
@@ -4476,6 +4646,7 @@ def _finalize(
     if not segments and materials is not None:
         segments = _extract_company_segments(str(company["id"]), materials, revenue_bn)
     segments = _prune_overlapping_segments(str(company["id"]), list(segments or []), revenue_bn)
+    segments = _tag_regional_segments(segments)
     if geographies is None and materials is not None:
         geographies = _extract_company_geographies(str(company["id"]), materials, revenue_bn)
     geographies = _quarterize_annual_geographies(list(geographies or []), revenue_bn)
@@ -4496,25 +4667,8 @@ def _finalize(
         elif len(overlap_names) >= 2 and geo_names.issubset(segment_names):
             geographies = []
     if not geographies and segments:
-        regional_segment_names = {
-            "north america",
-            "international",
-            "united states",
-            "united states and canada",
-            "americas",
-            "europe",
-            "asia-pacific",
-            "apac",
-            "apj",
-            "greater china",
-            "japan",
-            "rest of world",
-        }
-        regional_segments = [
-            {**item, "scope": "regional_segment"}
-            for item in segments
-            if str(item.get("name") or "").casefold() in regional_segment_names
-        ]
+        regional_segments = _regional_segment_scope_candidates(segments)
+        regional_segments = [{**item, "scope": "regional_segment"} for item in regional_segments]
         if len(regional_segments) >= 2:
             geographies = regional_segments
 
@@ -5633,11 +5787,60 @@ def _amazon_historical_segment(
     match = _search(pattern, flat_text)
     if not match:
         return None
-    prior_bn = _bn_from_millions(match.group(1))
-    current_bn = _bn_from_millions(match.group(2))
+    current_bn = _bn_from_millions(match.group(1))
+    prior_bn = _bn_from_millions(match.group(2))
     if current_bn is None:
         return None
     return _segment(label, current_bn, _pct_change(current_bn, prior_bn))
+
+
+def _amazon_historical_net_sales_block(text: str) -> str:
+    match = _search(
+        r"Net Sales:\s+(.*?Total consolidated\s+\$?\s*\(?[0-9,]+(?:\.[0-9]+)?\)?\s+\$?\s*\(?[0-9,]+(?:\.[0-9]+)?\)?)",
+        text,
+    )
+    return match.group(1) if match else text
+
+
+def _amazon_historical_section_metric(
+    text: str,
+    section_label: str,
+    total_label: str,
+    source_label: str,
+    canonical_label: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    block = _amazon_historical_net_sales_block(text)
+    section_match = _search(
+        rf"{re.escape(section_label)}\s+(.*?)\s+{re.escape(total_label)}\s+\$?\s*\(?[0-9,]+(?:\.[0-9]+)?\)?\s+\$?\s*\(?[0-9,]+(?:\.[0-9]+)?\)?",
+        block,
+    )
+    if not section_match:
+        return None
+    section_text = str(section_match.group(1) or "")
+    value_match = _search(
+        rf"(?:^|\s){re.escape(source_label)}\s+\$?\s*\(?([0-9,]+(?:\.[0-9]+)?)\)?\s+\$?\s*\(?([0-9,]+(?:\.[0-9]+)?)\)?\s+\$?\s*\(?([0-9,]+(?:\.[0-9]+)?)\)?\s+\$?\s*\(?([0-9,]+(?:\.[0-9]+)?)\)?(?=\s|$)",
+        section_text,
+    )
+    if not value_match:
+        return None
+    current_bn = _bn_from_millions(value_match.group(1))
+    prior_bn = _bn_from_millions(value_match.group(2))
+    if current_bn is None:
+        return None
+    return _segment(canonical_label or source_label, current_bn, _pct_change(current_bn, prior_bn))
+
+
+def _amazon_historical_business_segments(text: str) -> list[dict[str, Any]]:
+    return _segment_list(
+        _amazon_historical_section_metric(text, "Consolidated", "Total consolidated", "Media"),
+        _amazon_historical_section_metric(
+            text,
+            "Consolidated",
+            "Total consolidated",
+            "Electronics and other general merchandise",
+        ),
+        _amazon_historical_section_metric(text, "Consolidated", "Total consolidated", "Other (1)", "Other"),
+    )
 
 
 def _parse_amazon_historical(
@@ -5651,107 +5854,53 @@ def _parse_amazon_historical(
         return parsed
 
     flat = release["flat_text"]
+    raw = str(release.get("raw_text") or flat)
     money_symbol = company["money_symbol"]
-    segments = _segment_list(
+    fiscal_label = str(fallback.get("fiscal_label") or "")
+    revenue_bn = _coalesce_number(
+        parsed.get("latest_kpis", {}).get("revenue_bn"),
+        fallback.get("latest_kpis", {}).get("revenue_bn"),
+        fallback.get("revenue_bn"),
+    )
+    business_segments = _amazon_historical_business_segments(raw)
+    operating_segments = _segment_list(
         _amazon_historical_segment(flat, "North America"),
         _amazon_historical_segment(flat, "International"),
         _amazon_historical_segment(flat, "AWS"),
     )
+    regional_geographies = _segment_list(
+        _amazon_historical_segment(flat, "North America"),
+        _amazon_historical_segment(flat, "International"),
+    )
+    segments = list(business_segments)
+    if not _segments_reasonable_for_revenue(segments, revenue_bn):
+        segments = _extract_company_segments(str(company.get("id") or ""), materials, revenue_bn, fiscal_label)
+    if not _segments_reasonable_for_revenue(segments, revenue_bn):
+        segments = list(business_segments) or list(operating_segments)
     if not segments:
         return parsed
-
-    aws = next((item for item in segments if str(item.get("name") or "") == "AWS"), None)
-    north_america = next((item for item in segments if str(item.get("name") or "") == "North America"), None)
-    international = next((item for item in segments if str(item.get("name") or "") == "International"), None)
-    guidance = dict(parsed.get("guidance") or {})
 
     updates = _clean_mapping(
         {
             "current_segments": segments,
-            "management_themes": [
-                _theme(
-                    "AWS 加速扩张",
-                    88,
-                    (
-                        f"AWS 收入 {format_money_bn(float(aws['value_bn']), money_symbol)}，"
-                        f"同比 {format_pct(float(aws['yoy_pct']), signed=True)}。"
-                    )
-                    if aws and aws.get("yoy_pct") is not None
-                    else "AWS 仍是 Amazon 最具盈利质量的业务引擎。",
-                ),
-                _theme(
-                    "北美零售底盘稳固",
-                    80,
-                    (
-                        f"North America 收入 {format_money_bn(float(north_america['value_bn']), money_symbol)}，"
-                        f"同比 {format_pct(float(north_america['yoy_pct']), signed=True)}。"
-                    )
-                    if north_america and north_america.get("yoy_pct") is not None
-                    else "北美零售仍是当季最大收入基础盘。",
-                ),
-                _theme(
-                    "国际业务仍在修复",
-                    72,
-                    (
-                        f"International 收入 {format_money_bn(float(international['value_bn']), money_symbol)}，"
-                        f"同比 {format_pct(float(international['yoy_pct']), signed=True)}。"
-                    )
-                    if international and international.get("yoy_pct") is not None
-                    else "国际业务改善速度仍将影响整体经营杠杆。 ",
-                ),
-            ],
-            "qna_themes": [
-                _theme(
-                    "AWS 增长持续性",
-                    80,
-                    (
-                        f"AWS 已增长至 {format_money_bn(float(aws['value_bn']), money_symbol)}，"
-                        "后续问答会继续围绕云业务需求与利润率路径展开。"
-                    )
-                    if aws
-                    else "AWS 仍是最关键的问答主题。",
-                ),
-                _theme(
-                    "零售利润率兑现",
-                    74,
-                    "北美和国际零售的收入增速与履约、技术投入之间如何平衡，仍是当季最核心的利润率问题。",
-                ),
-            ],
-            "risks": [
-                _theme("高投入压制利润弹性", 66, "物流、内容和技术投入继续偏高时，零售业务利润率修复会慢于收入增长。"),
-                _theme("国际业务波动", 60, "国际业务的利润波动仍显著高于北美和 AWS。"),
-            ],
-            "catalysts": [
-                _theme("AWS 继续抬升 mix", 84, "若 AWS 继续快于公司整体增长，Amazon 的结构质量会继续改善。"),
-                _theme("官方指引给出区间", 74, str(guidance.get("commentary") or "公司已给出下一季收入与经营利润区间。")),
-            ],
+            "current_geographies": [{**item, "scope": "regional_segment"} for item in regional_geographies] if regional_geographies else None,
+            "coverage_notes": [
+                "Amazon 较早季度会优先从官方 Net Sales / Supplemental Worldwide Net Sales 表中动态抽取 Media、Electronics and other general merchandise、Other 等业务类型。"
+            ]
+            + (
+                ["地区结构会同时保留官方披露的 North America / International 区域经营分部口径。"]
+                if regional_geographies
+                else []
+            )
+            + (
+                ["若业务类型表缺失，才回退到 North America / International / AWS 等经营分部口径。"]
+                if not business_segments
+                else []
+            ),
             "income_statement": {
                 **dict(parsed.get("income_statement") or {}),
                 "sources": segments,
-                "annotations": [
-                    {
-                        "title": "AWS 是利润质量核心",
-                        "value": format_money_bn(float(aws["value_bn"]), money_symbol) if aws else "-",
-                        "note": "高利润率云业务继续改善整体结构。",
-                        "color": "#2563EB",
-                    },
-                    {
-                        "title": "北美零售仍是最大盘",
-                        "value": format_money_bn(float(north_america["value_bn"]), money_symbol) if north_america else "-",
-                        "note": "北美仍是收入规模最大的零售市场。",
-                        "color": "#111827",
-                    },
-                    {
-                        "title": "国际业务继续修复",
-                        "value": format_money_bn(float(international["value_bn"]), money_symbol) if international else "-",
-                        "note": "国际零售恢复节奏将决定下一阶段经营杠杆弹性。",
-                        "color": "#F59E0B",
-                    },
-                ],
             },
-            "coverage_notes": [
-                "Amazon 较早季度会优先从官方 earnings release 的 segment highlights 表中动态抽取 North America / International / AWS 收入。"
-            ],
         }
     )
     return _merge_parsed_payload(updates, parsed)
@@ -8350,6 +8499,14 @@ def parse_official_materials(
     except Exception:
         generic = {}
     merged = _merge_parsed_payload(parsed, generic)
+    merged["current_segments"] = _tag_regional_segments(list(merged.get("current_segments") or []))
+    if not merged.get("current_geographies"):
+        regional_segments = [
+            {**item, "scope": "regional_segment"}
+            for item in _regional_segment_scope_candidates(list(merged.get("current_segments") or []))
+        ]
+        if len(regional_segments) >= 2:
+            merged["current_geographies"] = regional_segments
     current_geographies = list(merged.get("current_geographies") or [])
     should_probe_annual_geographies = (
         not current_geographies

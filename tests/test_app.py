@@ -21,7 +21,7 @@ from scripts import audit_dynamic_reports
 from app.config import BUNDLED_NVIDIA_SEGMENT_HISTORY_PATH, BUNDLED_TECH_ANALYSIS_DATA_PATH, DATA_DIR
 from app.db import init_db
 from app.main import app
-from app.services.charts import render_income_statement_svg, render_statement_translation_svg, render_structure_transition_svg
+from app.services.charts import render_income_statement_svg, render_segment_mix_svg, render_statement_translation_svg, render_structure_transition_svg
 import app.services.local_data as local_data_service
 from app.services.local_data import get_company, get_quarter_fixture
 from app.services.local_data import _build_companyfacts_series
@@ -46,6 +46,7 @@ from app.services.official_source_resolver import _expand_related_ir_sources
 from app.services.official_source_resolver import _ir_role_keywords_match, _ir_temporal_alignment
 from app.services.official_source_resolver import _quarter_reference_terms
 from app.services.official_source_resolver import _sec_cik_for_calendar_quarter
+from app.services.narrative_writer import build_call_panel, build_narrative_provenance, compose_summary_headline
 from app.services.pdf_export import _build_raster_pdf_html, _pdf_export_mode
 from app.services.report_quality import evaluate_report_payload
 from app.services.reports import (
@@ -54,13 +55,16 @@ from app.services.reports import (
     _official_material_proxy_summary,
     _source_material_warnings,
     _backfill_historical_core_metrics,
+    _build_current_detail_cards,
     _backfill_historical_segment_history,
+    _mix_page_title,
     _build_income_statement_snapshot,
     _ensure_minimum_qna_topics,
     _enrich_history_with_official_structures,
     _harmonize_historical_structures,
     _segments_are_geography_like,
     _quarter_fallback_for_structure,
+    _sanitize_fixture_payload,
     _sanitize_history_quality_metrics,
     _recompute_history_derivatives,
     _report_cache_is_fresh,
@@ -418,11 +422,184 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         self.assertIn("history_missing", codes)
         self.assertIn("qna_missing", codes)
 
+    def test_compose_summary_headline_reads_like_report_copy(self) -> None:
+        headline = compose_summary_headline(
+            get_company("amazon"),
+            "2025Q4",
+            {
+                "revenue_bn": 35.7,
+                "revenue_yoy_pct": 21.9,
+                "net_income_bn": 0.482,
+                "net_income_yoy_pct": 125.2,
+                "gaap_gross_margin_pct": 48.5,
+            },
+            {"revenue_bn": 35.7, "revenue_yoy_pct": 21.9, "net_income_bn": 0.482, "gross_margin_pct": 48.5},
+            {
+                "current_segments": [
+                    {"name": "North America", "value_bn": 21.5, "yoy_pct": 24.0},
+                    {"name": "AWS", "value_bn": 2.4, "yoy_pct": 69.4},
+                ],
+                "current_geographies": [],
+                "guidance": {"mode": "official", "revenue_bn": 38.0, "comparison_label": "下一季收入指引"},
+                "headline": "当前报告基于结构化季度财务序列生成深度版研究摘要。",
+            },
+        )
+        self.assertIn("Amazon 2025Q4", headline)
+        self.assertIn("AWS", headline)
+        self.assertNotIn("结构化季度财务序列", headline)
+        self.assertNotIn("当前报告", headline)
+
+    def test_build_call_panel_uses_humanized_proxy_copy(self) -> None:
+        provenance = build_narrative_provenance(
+            transcript_source_type="official_material_proxy",
+            has_official_material=True,
+            has_quote_cards=False,
+            synthesized_quotes=False,
+        )
+        panel = build_call_panel(
+            None,
+            [{"label": "AWS", "note": "后面重点看 AWS 增速还能不能继续快过公司整体。"}],
+            provenance,
+        )
+        self.assertEqual(panel["title"], "电话会缺席时，先看这些问题")
+        self.assertTrue(any("财报稿" in line for line in panel["meta_lines"]))
+        self.assertFalse(any("完整电话会实录" in line for line in panel["meta_lines"]))
+
+    def test_evaluate_report_payload_flags_template_language(self) -> None:
+        quality = evaluate_report_payload(
+            {
+                "headline": "当前报告会优先使用结构化季度财务序列与统一研究模板。",
+                "takeaways": [
+                    "当前未抓到完整电话会 transcript，本页按官方材料动态提炼问答主题。",
+                    "当前未接入明确市场一致预期，因此本页先用经营基线替代预期差框架。",
+                ],
+                "call_panel": {
+                    "title": "当前无完整电话会实录，展示推断问答主题",
+                    "meta_lines": ["来源：官方材料。当前未获取到当季完整电话会 transcript / Q&A。"],
+                    "bullets": ["系统会优先展示统一研究模板。"],
+                },
+                "latest_kpis": {"revenue_bn": 10.0, "net_income_bn": 1.0},
+                "historical_cube": [{"quarter_label": "2024Q1", "revenue_bn": 9.0, "net_income_bn": 0.9}],
+                "current_segments": [{"name": "A", "value_bn": 5.0}, {"name": "B", "value_bn": 5.0}],
+                "current_geographies": [],
+                "qna_themes": [{"label": "A"}, {"label": "B"}],
+                "management_themes": [{"label": "A"}, {"label": "B"}],
+                "evidence_cards": [{"title": "A"}, {"title": "B"}],
+                "source_materials": [],
+            },
+            history_window=1,
+        )
+        codes = {item["code"] for item in quality["issues"]}
+        self.assertIn("narrative_template_language", codes)
+
     def test_build_report_payload_contains_quality_report(self) -> None:
         payload = build_report_payload("nvidia", "2025Q4", 12, refresh_source_materials=False)
         self.assertIn("quality_report", payload)
         self.assertIn(payload["quality_report"]["status"], {"pass", "review", "fail"})
         self.assertIsInstance(payload["quality_report"]["score"], int)
+
+    def test_sanitize_fixture_payload_keeps_reported_regional_segments(self) -> None:
+        company = get_company("amazon")
+        sanitized = _sanitize_fixture_payload(
+            company,
+            {
+                "latest_kpis": {"revenue_bn": 29.328, "net_income_bn": 0.214, "revenue_yoy_pct": 14.6},
+                "current_segments": [
+                    {"name": "North America", "value_bn": 18.747, "yoy_pct": 22.3, "scope": "regional_segment"},
+                    {"name": "International", "value_bn": 10.581, "yoy_pct": 3.2, "scope": "regional_segment"},
+                ],
+                "current_geographies": [],
+            },
+            {
+                "revenue_bn": 29.328,
+                "net_income_bn": 0.214,
+                "gross_margin_pct": 48.5,
+                "revenue_yoy_pct": 14.6,
+                "net_income_yoy_pct": -10.5,
+            },
+        )
+        segment_names = [item["name"] for item in sanitized["current_segments"]]
+        self.assertEqual(segment_names, ["North America", "International"])
+        self.assertTrue(all(str(item.get("scope") or "") == "regional_segment" for item in sanitized["current_segments"]))
+
+    def test_render_segment_mix_svg_avoids_duplicate_regional_geography_panel(self) -> None:
+        svg = render_segment_mix_svg(
+            [
+                {"name": "North America", "value_bn": 18.747, "scope": "regional_segment"},
+                {"name": "International", "value_bn": 10.581, "scope": "regional_segment"},
+            ],
+            [
+                {"name": "North America", "value_bn": 18.747, "scope": "regional_segment"},
+                {"name": "International", "value_bn": 10.581, "scope": "regional_segment"},
+            ],
+            {"primary": "#146EB4", "secondary": "#232F3E", "accent": "#FF9900"},
+            "#FF9900",
+        )
+        self.assertIn("公司未单列终端地理收入", svg)
+        self.assertIn("区域经营分部结构", svg)
+        self.assertIn("地区营收结构", svg)
+
+    def test_render_segment_mix_svg_marks_regional_operating_segments_explicitly(self) -> None:
+        svg = render_segment_mix_svg(
+            [
+                {"name": "North America", "value_bn": 18.747, "scope": "regional_segment"},
+                {"name": "International", "value_bn": 10.581, "scope": "regional_segment"},
+            ],
+            [
+                {"name": "United States", "value_bn": 17.126, "scope": "quarterly_mapped_from_official_geography"},
+                {"name": "International", "value_bn": 12.202, "scope": "quarterly_mapped_from_official_geography"},
+            ],
+            {"primary": "#146EB4", "secondary": "#232F3E", "accent": "#FF9900"},
+            "#FF9900",
+        )
+        self.assertIn("区域经营分部结构", svg)
+        self.assertIn("不把它误写成营收类型", svg)
+        self.assertIn("地区营收结构", svg)
+
+    def test_build_current_detail_cards_use_segment_wording_for_regional_operating_segments(self) -> None:
+        company = get_company("amazon")
+        cards = _build_current_detail_cards(
+            company,
+            {
+                "current_segments": [
+                    {"name": "North America", "value_bn": 18.747, "yoy_pct": 22.3, "scope": "regional_segment"},
+                    {"name": "International", "value_bn": 10.581, "yoy_pct": 3.2, "scope": "regional_segment"},
+                ],
+                "current_geographies": [
+                    {
+                        "name": "United States",
+                        "value_bn": 17.126,
+                        "yoy_pct": 20.4,
+                        "scope": "quarterly_mapped_from_official_geography",
+                    },
+                    {
+                        "name": "International",
+                        "value_bn": 12.202,
+                        "yoy_pct": 7.8,
+                        "scope": "quarterly_mapped_from_official_geography",
+                    },
+                ],
+            },
+            [{"quarter_label": "2014Q4", "revenue_bn": 29.328, "ttm_revenue_growth_pct": 14.6, "net_margin_pct": 0.7}],
+            "segment",
+            "$",
+        )
+        self.assertEqual(cards[0]["title"], "头部分部 | North America")
+        self.assertEqual(cards[1]["title"], "高增分部 | International")
+        self.assertEqual(cards[2]["title"], "头部地区 | United States")
+
+    def test_mix_page_title_distinguishes_regional_operating_segments_from_revenue_types(self) -> None:
+        title = _mix_page_title(
+            [
+                {"name": "North America", "value_bn": 18.747, "scope": "regional_segment"},
+                {"name": "International", "value_bn": 10.581, "scope": "regional_segment"},
+            ],
+            [
+                {"name": "United States", "value_bn": 17.126, "scope": "quarterly_mapped_from_official_geography"},
+                {"name": "International", "value_bn": 12.202, "scope": "quarterly_mapped_from_official_geography"},
+            ],
+        )
+        self.assertEqual(title, "当季经营分部与地区结构")
 
     def test_evaluate_report_payload_management_mode_structure_gap_is_minor(self) -> None:
         quality = evaluate_report_payload(
@@ -3221,28 +3398,29 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertEqual(payload["structure_dimension_used"], "management")
         self.assertEqual(payload["payload"]["guidance"]["mode"], "official_context")
         self.assertEqual(payload["payload"]["currency_code"], "USD")
-        self.assertIn("官方展望语境", payload["payload"]["guidance_title"])
+        self.assertIn("管理层怎么描绘下一步", payload["payload"]["guidance_title"])
         self.assertGreaterEqual(len(payload["payload"]["current_detail_cards"]), 3)
         self.assertNotEqual(
             payload["payload"]["current_detail_cards"][0]["title"],
             payload["payload"]["current_detail_cards"][1]["title"],
         )
         self.assertEqual(payload["payload"]["fiscal_label"], "Q1 FY2026")
-        self.assertTrue(any("净利润" in item and "同比" in item for item in payload["payload"]["takeaways"][:3]))
+        self.assertGreaterEqual(len(payload["payload"]["takeaways"]), 3)
+        self.assertFalse(any("结构化季度财务序列" in item for item in payload["payload"]["takeaways"][:3]))
         self.assertGreaterEqual(len(payload["payload"]["call_quote_cards"]), 2)
         self.assertGreaterEqual(len(payload["payload"]["income_statement"]["annotations"]), 3)
         self.assertTrue(payload["payload"]["source_materials"])
         self.assertEqual(payload["payload"]["source_materials"][0]["status"], "disabled")
-        self.assertTrue(any("自动抓取" in item for item in payload["payload"]["coverage_warnings"]))
+        self.assertTrue(payload["payload"]["coverage_warnings"])
+        self.assertFalse(any("自动抓取" in item for item in payload["payload"]["coverage_warnings"]))
         self.assertIn("qna", payload["payload"]["narrative_provenance"])
 
         preview = self.client.get(payload["preview_url"])
         self.assertEqual(preview.status_code, 200)
-        self.assertIn("当前季度与官方展望语境", preview.text)
+        self.assertIn(payload["payload"]["guidance_title"], preview.text)
         self.assertIn("营收与开支可视化图", preview.text)
         self.assertIn("财报科目中文直译", preview.text)
-        self.assertIn("官方管理层锚点", preview.text)
-        self.assertIn("问答主题来源", preview.text)
+        self.assertIn("电话会与问答主题", preview.text)
         self.assertIn("机构视角参考", preview.text)
         self.assertIn("抓取状态", preview.text)
 
@@ -3254,7 +3432,7 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["payload"]["guidance"]["mode"], "official")
-        self.assertIn("下一季指引", payload["payload"]["guidance_title"])
+        self.assertIn("下一季怎么看", payload["payload"]["guidance_title"])
         self.assertGreaterEqual(len(payload["payload"]["sources"]), 2)
 
     @patch("app.services.local_data._fetch_remote_company_series")
@@ -3268,8 +3446,9 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["payload"]["guidance"]["mode"], "proxy")
         self.assertEqual(payload["payload"]["currency_code"], "USD")
-        self.assertIn("结构限制说明", payload["payload"]["historical_insights"][3]["body"])
-        self.assertTrue(any("净利润" in item and "同比" in item for item in payload["payload"]["takeaways"][:3]))
+        self.assertIn("结构边界说明", payload["payload"]["historical_insights"][3]["body"])
+        self.assertGreaterEqual(len(payload["payload"]["takeaways"]), 3)
+        self.assertFalse(any("统一研究模板" in item for item in payload["payload"]["takeaways"][:3]))
 
     @patch("app.services.local_data._fetch_remote_company_series")
     def test_non_usd_remote_company_keeps_reported_currency(self, mock_fetch: object) -> None:
@@ -3300,10 +3479,10 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         upload_id = upload.json()["upload_id"]
 
         record = create_report("avgo", "2025Q4", 12, upload_id, True)
-        self.assertIn("已应用手动上传 transcript", record["payload"]["coverage_warnings"][0])
+        self.assertIn("手动上传的 transcript", record["payload"]["coverage_warnings"][0])
         self.assertTrue(record["payload"]["transcript_summary"]["topics"])
         self.assertEqual(record["payload"]["narrative_provenance"]["qna"]["status"], "manual_transcript")
-        self.assertEqual(record["payload"]["call_panel"]["title"], "手动 transcript 摘要")
+        self.assertEqual(record["payload"]["call_panel"]["title"], "电话会摘录")
 
     def test_automatic_transcript_summary_prefers_real_transcript_over_event_page(self) -> None:
         event_path = self._write_temp_text(
@@ -3406,8 +3585,8 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         payload = record["payload"]
         self.assertIsNone(payload["transcript_summary"])
         self.assertEqual(payload["narrative_provenance"]["qna"]["status"], "official_material_inferred")
-        self.assertEqual(payload["call_panel"]["title"], "当前无完整电话会实录，展示推断问答主题")
-        self.assertIn("当前没有完整 transcript", payload["section_meta"]["management_qna"]["note"])
+        self.assertEqual(payload["call_panel"]["title"], "管理层接下来最可能被追问什么")
+        self.assertIn("电话会原文不完整时", payload["section_meta"]["management_qna"]["note"])
 
     def test_structure_transition_chart_normalizes_each_quarter_to_ratio_view(self) -> None:
         svg = render_structure_transition_svg(
@@ -4851,6 +5030,99 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertAlmostEqual(segment_map["Advertising services"], 15.318, places=3)
         self.assertAlmostEqual(segment_map["Subscription services"], 12.345, places=3)
 
+    def test_extract_company_segments_supports_sectioned_html_tables(self) -> None:
+        raw_html_path = self._write_temp_text(
+            "amazon-sectioned-segments.html",
+            (
+                "<html><body><table>"
+                "<tr><th>Three Months Ended December 31,</th><th>Twelve Months Ended December 31,</th></tr>"
+                "<tr><th>2015</th><th>2014</th><th>2015</th><th>2014</th></tr>"
+                "<tr><th>(unaudited)</th></tr>"
+                "<tr><td>North America</td></tr>"
+                "<tr><td>Net sales</td><td>$</td><td>21,501</td><td>$</td><td>17,333</td><td>$</td><td>63,708</td><td>$</td><td>50,834</td></tr>"
+                "<tr><td>International</td></tr>"
+                "<tr><td>Net sales</td><td>$</td><td>11,841</td><td>$</td><td>10,575</td><td>$</td><td>35,418</td><td>$</td><td>33,510</td></tr>"
+                "<tr><td>AWS</td></tr>"
+                "<tr><td>Net sales</td><td>$</td><td>2,405</td><td>$</td><td>1,420</td><td>$</td><td>7,880</td><td>$</td><td>4,644</td></tr>"
+                "</table></body></html>"
+            ),
+        )
+
+        segments = _extract_company_segments(
+            "amazon",
+            [
+                {
+                    "label": "Amazon Exhibit 99.1",
+                    "kind": "official_release",
+                    "status": "cached",
+                    "raw_text": "Quarterly segment table.",
+                    "flat_text": "Quarterly segment table.",
+                    "raw_path": raw_html_path,
+                }
+            ],
+            revenue_bn=35.747,
+            target_calendar_quarter="2015Q4",
+        )
+
+        segment_map = {item["name"]: item for item in segments}
+        self.assertAlmostEqual(segment_map["North America"]["value_bn"], 21.501, places=3)
+        self.assertAlmostEqual(segment_map["North America"]["yoy_pct"], 24.0, places=1)
+        self.assertAlmostEqual(segment_map["International"]["value_bn"], 11.841, places=3)
+        self.assertAlmostEqual(segment_map["International"]["yoy_pct"], 12.0, places=1)
+        self.assertAlmostEqual(segment_map["AWS"]["value_bn"], 2.405, places=3)
+        self.assertAlmostEqual(segment_map["AWS"]["yoy_pct"], 69.4, places=1)
+
+    def test_extract_company_segments_ignores_old_amazon_sec_noise_when_release_table_exists(self) -> None:
+        release_raw_html_path = self._write_temp_text(
+            "amazon-2014q4-release.html",
+            (
+                "<html><body><table>"
+                "<tr><th>Three Months Ended December 31,</th><th>Twelve Months Ended December 31,</th></tr>"
+                "<tr><th>2014</th><th>2013</th><th>2014</th><th>2013</th></tr>"
+                "<tr><th>(unaudited)</th></tr>"
+                "<tr><td>North America</td></tr>"
+                "<tr><td>Net sales</td><td>$</td><td>18,747</td><td>$</td><td>15,324</td><td>$</td><td>54,526</td><td>$</td><td>44,557</td></tr>"
+                "<tr><td>International</td></tr>"
+                "<tr><td>Net sales</td><td>$</td><td>10,581</td><td>$</td><td>10,248</td><td>$</td><td>34,463</td><td>$</td><td>29,888</td></tr>"
+                "</table></body></html>"
+            ),
+        )
+        sec_noise_text = (
+            "Segment schedule 2014 2013\n"
+            "of those patents, Nos. 7000 8000\n"
+            "U.S. Patents: Nos. 5000 9000\n"
+            "In October 4026 10\n"
+            "In November 4026 14\n"
+            "In December 2013 8\n"
+        )
+
+        segments = _extract_company_segments(
+            "amazon",
+            [
+                {
+                    "label": "Amazon Exhibit 99.1",
+                    "kind": "official_release",
+                    "status": "cached",
+                    "raw_text": "Quarterly segment table.",
+                    "flat_text": "Quarterly segment table.",
+                    "raw_path": release_raw_html_path,
+                },
+                {
+                    "label": "Amazon Form 10-K",
+                    "kind": "sec_filing",
+                    "status": "cached",
+                    "raw_text": sec_noise_text,
+                    "flat_text": _flatten_text(sec_noise_text),
+                },
+            ],
+            revenue_bn=29.328,
+            target_calendar_quarter="2014Q4",
+        )
+
+        self.assertEqual([item["name"] for item in segments], ["North America", "International"])
+        self.assertAlmostEqual(segments[0]["value_bn"], 18.747, places=3)
+        self.assertAlmostEqual(segments[1]["value_bn"], 10.581, places=3)
+
     def test_extract_company_segments_prefers_quarterly_profiled_html_table_over_annual_match(self) -> None:
         raw_html_path = self._write_temp_text(
             "mcdonalds-segments-quarter-vs-year.html",
@@ -5036,6 +5308,109 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         opex_names = [item["name"] for item in parsed["income_statement"]["opex_breakdown"]]
         self.assertIn("Research and development", opex_names)
         self.assertIn("Selling, general and administrative", opex_names)
+
+    def test_parse_official_materials_uses_sectioned_amazon_release_table_for_historical_segments(self) -> None:
+        release_path = self._write_temp_text(
+            "amazon-2015q4-release.txt",
+            (
+                "Fourth Quarter 2015 Net sales increased 22% to $35.7 billion in the fourth quarter, "
+                "compared with $29.3 billion in fourth quarter 2014. "
+                "Operating income increased 88% to $1.1 billion in the fourth quarter, compared with operating income of $591 million in fourth quarter 2014. "
+                "Net income was $482 million in the fourth quarter, or $1.00 per diluted share, compared with net income of $214 million, or $0.45 per diluted share, in fourth quarter 2014."
+            ),
+        )
+        raw_html_path = self._write_temp_text(
+            "amazon-2015q4-release.html",
+            (
+                "<html><body><table>"
+                "<tr><th>Three Months Ended December 31,</th><th>Twelve Months Ended December 31,</th></tr>"
+                "<tr><th>2015</th><th>2014</th><th>2015</th><th>2014</th></tr>"
+                "<tr><th>(unaudited)</th></tr>"
+                "<tr><td>North America</td></tr>"
+                "<tr><td>Net sales</td><td>$</td><td>21,501</td><td>$</td><td>17,333</td><td>$</td><td>63,708</td><td>$</td><td>50,834</td></tr>"
+                "<tr><td>International</td></tr>"
+                "<tr><td>Net sales</td><td>$</td><td>11,841</td><td>$</td><td>10,575</td><td>$</td><td>35,418</td><td>$</td><td>33,510</td></tr>"
+                "<tr><td>AWS</td></tr>"
+                "<tr><td>Net sales</td><td>$</td><td>2,405</td><td>$</td><td>1,420</td><td>$</td><td>7,880</td><td>$</td><td>4,644</td></tr>"
+                "</table></body></html>"
+            ),
+        )
+
+        parsed = parse_official_materials(
+            get_company("amazon"),
+            {
+                "fiscal_label": "2015Q4",
+                "coverage_notes": [],
+                "latest_kpis": {"revenue_bn": 35.747, "revenue_yoy_pct": 21.9},
+            },
+            [
+                {
+                    "label": "Amazon Exhibit 99.1",
+                    "kind": "official_release",
+                    "status": "cached",
+                    "text_path": release_path,
+                    "raw_path": raw_html_path,
+                }
+            ],
+        )
+
+        segments = {item["name"]: item for item in parsed["current_segments"]}
+        self.assertAlmostEqual(segments["North America"]["value_bn"], 21.501, places=3)
+        self.assertAlmostEqual(segments["North America"]["yoy_pct"], 24.0, places=1)
+        self.assertAlmostEqual(segments["International"]["yoy_pct"], 12.0, places=1)
+        self.assertAlmostEqual(segments["AWS"]["yoy_pct"], 69.4, places=1)
+
+    def test_parse_official_materials_prefers_amazon_historical_business_types_over_regional_segments(self) -> None:
+        release_text = (
+            "North America Net sales $ 18,747 $ 15,324 $ 54,526 $ 44,557 "
+            "International Net sales $ 10,581 $ 10,248 $ 34,463 $ 29,888 "
+            "Three Months Ended December 31, Twelve Months Ended December 31, 2014 2013 2014 2013 (unaudited) "
+            "Net Sales: "
+            "North America "
+            "Media $ 3,544 $ 3,513 $ 11,567 $ 10,809 "
+            "Electronics and other general merchandise 13,529 10,648 38,517 29,985 "
+            "Other (1) 1,674 1,170 5,385 3,723 "
+            "Total North America $ 18,747 $ 15,331 $ 55,469 $ 44,517 "
+            "International "
+            "Media $ 3,406 $ 3,714 $ 10,938 $ 10,907 "
+            "Electronics and other general merchandise 7,109 6,478 22,369 18,817 "
+            "Other (1) 66 64 212 211 "
+            "Total International $ 10,581 $ 10,256 $ 33,519 $ 29,935 "
+            "Consolidated "
+            "Media $ 6,950 $ 7,227 $ 22,505 $ 21,716 "
+            "Electronics and other general merchandise 20,638 17,126 60,886 48,802 "
+            "Other (1) 1,740 1,234 5,597 3,934 "
+            "Total consolidated $ 29,328 $ 25,587 $ 88,988 $ 74,452"
+        )
+        release_path = self._write_temp_text("amazon-2014q4-business-types.txt", release_text)
+
+        parsed = parse_official_materials(
+            get_company("amazon"),
+            {
+                "calendar_quarter": "2014Q4",
+                "fiscal_label": "2014Q4",
+                "coverage_notes": [],
+                "latest_kpis": {"revenue_bn": 29.328, "revenue_yoy_pct": 14.6},
+            },
+            [
+                {
+                    "label": "Amazon Exhibit 99.1",
+                    "kind": "official_release",
+                    "status": "cached",
+                    "text_path": release_path,
+                }
+            ],
+        )
+
+        self.assertEqual(
+            [item["name"] for item in parsed["current_segments"]],
+            ["Media", "Electronics and other general merchandise", "Other"],
+        )
+        self.assertAlmostEqual(parsed["current_segments"][0]["value_bn"], 6.95, places=2)
+        self.assertAlmostEqual(parsed["current_segments"][1]["value_bn"], 20.638, places=3)
+        self.assertAlmostEqual(parsed["current_segments"][2]["yoy_pct"], 41.0, places=1)
+        self.assertEqual([item["name"] for item in parsed["current_geographies"]], ["North America", "International"])
+        self.assertTrue(all(str(item.get("scope") or "") == "regional_segment" for item in parsed["current_geographies"]))
 
     def test_official_material_proxy_summary_builds_call_proxy_without_transcript(self) -> None:
         proxy = _official_material_proxy_summary(

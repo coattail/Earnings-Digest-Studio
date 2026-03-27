@@ -113,7 +113,7 @@
         </div>
         <div class="page-split two-col compact-panels">
           <article class="text-panel">
-            <h3>研究结论分层</h3>
+            <h3>这季先看三件事</h3>
             <div class="thesis-stack">
               {% for item in report.layered_takeaways[:3] %}
               <article class="thesis-item">
@@ -211,7 +211,7 @@
 
       <section class="page section-quarterly page-mix">
         <div class="page-no">5 / {{ report.page_count }}</div>
-        {{ render_page_head("mix", "当季营收结构与集中度", report.report_style.quarterly_label, "quarterly") }}
+        {{ render_page_head("mix", report.mix_page_title, report.report_style.quarterly_label, "quarterly") }}
         <div class="chart-card wide-card">{{ report.visuals.segment_mix | safe }}</div>
         <div class="mini-card-grid three-col">
           {% for item in report.current_detail_cards %}
@@ -343,8 +343,8 @@
         </div>
         {% else %}
         <article class="text-panel street-view-empty">
-          <h3>当前未稳定抓到可追溯机构观点</h3>
-          <p>系统会优先展示带机构名、发布时间和链接的公开条目；若当前季度没有足够高质量结果，这一页会保留说明而不是硬拼内容。</p>
+          <h3>这季公开可追踪的卖方条目还不够</h3>
+          <p>我们只放带机构名、发布时间和链接的公开条目；如果这季拿不到足够扎实的内容，这一页宁可留白，也不硬凑观点。</p>
         </article>
         {% endif %}
         <div class="page-split two-col compact-panels">

@@ -227,6 +227,8 @@ COMPANY_REGISTRY = {
             "filing_forms": ["10-Q", "10-K"],
         },
         segment_order=[
+            "Media",
+            "Electronics and other general merchandise",
             "North America",
             "International",
             "AWS",
@@ -851,6 +853,7 @@ SEGMENT_ALIAS_UPDATES = {
         "Aws": "AWS",
         "Amazon Web Services": "AWS",
         "Amazon web services": "AWS",
+        "Other (1)": "Other",
         "Online stores revenue": "Online stores",
         "Third-party seller services revenue": "Third-party seller services",
         "Advertising services revenue": "Advertising services",
