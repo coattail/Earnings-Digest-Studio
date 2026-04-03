@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +22,7 @@ from .schemas import (
     SkillReportResponse,
     UploadResponse,
 )
-from .services.pdf_export import export_html_to_pdf
+from .services.pdf_export import export_html_to_pdf, pdf_export_signature
 from .services.local_data import normalize_calendar_quarter_input, resolve_company_reference
 from .services.reports import (
     company_cards,
@@ -79,6 +81,64 @@ def _report_export_stem(record: dict[str, Any]) -> str:
 
 def _report_html_output_path(record: dict[str, Any]) -> Path:
     return EXPORT_DIR / f"{_report_export_stem(record)}.html"
+
+
+def _report_pdf_metadata_path(record: dict[str, Any], pdf_path: str | None = None) -> Path:
+    candidate = str(pdf_path or record.get("pdf_path") or "").strip()
+    if candidate:
+        resolved = Path(candidate)
+        return resolved.with_name(f"{resolved.name}.meta.json")
+    return EXPORT_DIR / f"{_report_export_stem(record)}.pdf.meta.json"
+
+
+def _report_export_source_hash(html_content: str) -> str:
+    return hashlib.sha256(html_content.encode("utf-8")).hexdigest()
+
+
+def _load_report_export_metadata(record: dict[str, Any], pdf_path: str | None = None) -> dict[str, Any] | None:
+    metadata_path = _report_pdf_metadata_path(record, pdf_path)
+    try:
+        return json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_report_export_metadata(
+    record: dict[str, Any],
+    *,
+    html_content: str,
+    html_path: str,
+    pdf_path: str,
+) -> None:
+    metadata_path = _report_pdf_metadata_path(record, pdf_path)
+    payload = {
+        "source_hash": _report_export_source_hash(html_content),
+        "pdf_profile_signature": pdf_export_signature(),
+        "html_path": html_path,
+        "pdf_path": pdf_path,
+    }
+    metadata_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _can_reuse_report_export(record: dict[str, Any], *, html_content: str, html_path: str, pdf_path: str) -> bool:
+    html_file = Path(html_path)
+    pdf_file = Path(pdf_path)
+    if not html_file.exists() or not pdf_file.exists():
+        return False
+    try:
+        if html_file.read_text(encoding="utf-8") != html_content:
+            return False
+    except OSError:
+        return False
+    metadata = _load_report_export_metadata(record, pdf_path)
+    if not metadata:
+        return False
+    return (
+        metadata.get("source_hash") == _report_export_source_hash(html_content)
+        and metadata.get("pdf_profile_signature") == pdf_export_signature()
+        and metadata.get("html_path") == html_path
+        and metadata.get("pdf_path") == pdf_path
+    )
 
 
 def _write_report_html(record: dict[str, Any], *, show_toolbar: bool = False) -> str:
@@ -277,17 +337,33 @@ def _ensure_report_files(record: dict[str, Any]) -> tuple[Optional[str], Optiona
     existing_pdf_path = str(record.get("pdf_path") or "").strip()
     html_exists = bool(html_path) and Path(html_path).exists()
     pdf_exists = bool(existing_pdf_path) and Path(existing_pdf_path).exists()
-    if html_exists and pdf_exists:
+    html_content = render_report_html(record, show_toolbar=False)
+    if html_exists and pdf_exists and _can_reuse_report_export(
+        record,
+        html_content=html_content,
+        html_path=html_path,
+        pdf_path=existing_pdf_path,
+    ):
         return (html_download_url, pdf_download_url, None, None)
+    generated_html_path: Optional[str] = None
     try:
-        html_content = render_report_html(record, show_toolbar=False)
         html_output_path = _report_html_output_path(record)
         html_output_path.write_text(html_content, encoding="utf-8")
+        generated_html_path = str(html_output_path)
         filename_stem = _report_export_stem(record)
         pdf_path = export_html_to_pdf(filename_stem, html_content)
-        update_report_artifacts(record["id"], html_path=str(html_output_path), pdf_path=pdf_path)
-        return (html_download_url, pdf_download_url, str(html_output_path), None)
+        update_report_artifacts(record["id"], html_path=generated_html_path, pdf_path=pdf_path)
+        _write_report_export_metadata(
+            record,
+            html_content=html_content,
+            html_path=generated_html_path,
+            pdf_path=pdf_path,
+        )
+        return (html_download_url, pdf_download_url, generated_html_path, None)
     except Exception as exc:  # pragma: no cover - environment dependent
+        if generated_html_path and Path(generated_html_path).exists():
+            update_report_artifacts(record["id"], html_path=generated_html_path)
+            return (html_download_url, None, generated_html_path, f"PDF export failed: {exc}")
         if html_exists:
             return (html_download_url, None, html_path, f"PDF export failed: {exc}")
         try:

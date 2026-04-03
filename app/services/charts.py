@@ -2680,8 +2680,26 @@ def _dominant_history_structure_basis(entries: list[dict[str, object]]) -> str:
 
 
 def _growth_stack_plan(entries: list[dict[str, object]]) -> tuple[list[str], list[dict[str, object]], bool]:
-    share_maps = [_segment_share_map(entry) for entry in entries]
-    anchor_segments = next((_entry_structure_items(entry)[0] for entry in reversed(entries) if _entry_structure_items(entry)[0]), [])
+    dominant_basis = _dominant_history_structure_basis(entries)
+    filtered_items: list[list[dict[str, object]]] = []
+    share_maps: list[dict[str, float]] = []
+    for entry in entries:
+        items, basis = _entry_structure_items(entry)
+        if basis and basis != dominant_basis:
+            items = []
+        filtered_items.append(items)
+        total = sum(float(item.get("value_bn") or 0.0) for item in items)
+        if total <= 0:
+            share_maps.append({})
+            continue
+        share_maps.append(
+            {
+                str(item.get("name") or "Business"): float(item.get("value_bn") or 0.0) / total
+                for item in items
+                if float(item.get("value_bn") or 0.0) > 0
+            }
+        )
+    anchor_segments = next((items for items in reversed(filtered_items) if items), [])
     segment_names = [str(item.get("name") or "Business") for item in anchor_segments]
     for share_map in share_maps:
         for name in share_map:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import re
@@ -24,8 +25,9 @@ from scripts import audit_dynamic_reports
 
 from app.config import BUNDLED_NVIDIA_SEGMENT_HISTORY_PATH, BUNDLED_TECH_ANALYSIS_DATA_PATH, DATA_DIR
 from app.db import init_db
-from app.main import app
+from app.main import app, _ensure_report_files
 from app.services.charts import (
+    _growth_stack_plan,
     render_capital_allocation_svg,
     render_growth_overview_svg,
     render_income_statement_svg,
@@ -75,7 +77,13 @@ from app.services.official_source_resolver import _page_links
 from app.services.official_source_resolver import _quarter_reference_terms
 from app.services.official_source_resolver import _sec_cik_for_calendar_quarter
 from app.services.narrative_writer import build_call_panel, build_narrative_provenance, compose_layered_takeaways, compose_summary_headline
-from app.services.pdf_export import _build_raster_pdf_html, _pdf_export_mode, export_html_to_pdf
+from app.services.pdf_export import (
+    _build_raster_pdf_html,
+    _pdf_export_mode,
+    _pdf_export_profile,
+    export_html_to_pdf,
+    pdf_export_signature,
+)
 from app.services.report_quality import evaluate_report_payload
 from app.services.reports import (
     REPORT_PAYLOAD_SCHEMA_VERSION,
@@ -426,6 +434,12 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         with patch.dict(os.environ, {"EARNINGS_DIGEST_PDF_EXPORT_MODE": "raster"}, clear=False):
             self.assertEqual(_pdf_export_mode(), "raster")
 
+    def test_pdf_export_profile_defaults_to_fast(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_pdf_export_profile(), "fast")
+        with patch.dict(os.environ, {"EARNINGS_DIGEST_PDF_PROFILE": "full"}, clear=False):
+            self.assertEqual(_pdf_export_profile(), "full")
+
     def test_export_html_to_pdf_prefers_vector_by_default(self) -> None:
         with patch.dict(os.environ, {}, clear=True), patch(
             "app.services.pdf_export.asyncio.run",
@@ -440,9 +454,26 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
             pdf_path = export_html_to_pdf("sample-report", "<html></html>")
 
         self.assertEqual(pdf_path, "vector-pdf")
-        vector_mock.assert_called_once_with("sample-report", "<html></html>")
+        vector_mock.assert_called_once()
+        self.assertEqual(vector_mock.call_args.args[0], "sample-report")
+        self.assertIn("fast-v1", vector_mock.call_args.args[1])
         raster_mock.assert_not_called()
         run_mock.assert_called_once_with("vector-coroutine")
+
+    def test_export_html_to_pdf_injects_fast_profile_by_default(self) -> None:
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "app.services.pdf_export.asyncio.run",
+            side_effect=lambda coroutine: "vector-pdf",
+        ), patch(
+            "app.services.pdf_export._render_pdf_vector_async",
+            new=Mock(return_value="vector-coroutine"),
+        ) as vector_mock:
+            export_html_to_pdf("sample-report", "<html><body class='report-body'><main>ok</main></body></html>")
+
+        exported_html = vector_mock.call_args.args[1]
+        self.assertIn("pdf-export-fast", exported_html)
+        self.assertIn('name="earnings-digest-pdf-profile"', exported_html)
+        self.assertIn("box-shadow: none !important;", exported_html)
 
     def test_build_raster_pdf_html_embeds_each_page_image(self) -> None:
         html = _build_raster_pdf_html(["page-01.png", "page-02.png"])
@@ -450,6 +481,90 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         self.assertIn("page-02.png", html)
         self.assertIn("@page", html)
         self.assertIn("13.333in 7.5in", html)
+
+    @patch("app.main.update_report_artifacts")
+    @patch("app.main.export_html_to_pdf")
+    @patch("app.main.render_report_html")
+    def test_ensure_report_files_reuses_cached_artifacts_when_metadata_matches(
+        self,
+        mock_render_report_html: object,
+        mock_export_pdf: object,
+        mock_update_report_artifacts: object,
+    ) -> None:
+        html_path = Path(self._write_temp_text("cached-report.html", "<html>report</html>"))
+        pdf_path = Path(self._write_temp_text("cached-report.pdf", "pdf"))
+        pdf_meta_path = pdf_path.with_name(f"{pdf_path.name}.meta.json")
+        html_content = "<html>report</html>"
+        pdf_meta_path.write_text(
+            json.dumps(
+                {
+                    "source_hash": hashlib.sha256(html_content.encode("utf-8")).hexdigest(),
+                    "pdf_profile_signature": pdf_export_signature(),
+                    "html_path": str(html_path),
+                    "pdf_path": str(pdf_path),
+                }
+            ),
+            encoding="utf-8",
+        )
+        mock_render_report_html.return_value = html_content
+        record = {
+            "id": "report-123",
+            "company_id": "nvidia",
+            "calendar_quarter": "2025Q4",
+            "html_path": str(html_path),
+            "pdf_path": str(pdf_path),
+            "payload": {"company_id": "nvidia", "calendar_quarter": "2025Q4"},
+        }
+
+        html_download_url, pdf_download_url, html_result_path, pdf_error = _ensure_report_files(record)
+
+        self.assertEqual(html_download_url, "/reports/report-123/download.html")
+        self.assertEqual(pdf_download_url, "/reports/report-123/download.pdf")
+        self.assertIsNone(html_result_path)
+        self.assertIsNone(pdf_error)
+        mock_export_pdf.assert_not_called()
+        mock_update_report_artifacts.assert_not_called()
+
+    @patch("app.main.update_report_artifacts")
+    @patch("app.main.export_html_to_pdf")
+    @patch("app.main._report_html_output_path")
+    @patch("app.main.render_report_html")
+    def test_ensure_report_files_rebuilds_legacy_cached_artifacts_without_metadata(
+        self,
+        mock_render_report_html: object,
+        mock_report_html_output_path: object,
+        mock_export_pdf: object,
+        mock_update_report_artifacts: object,
+    ) -> None:
+        legacy_html_path = Path(self._write_temp_text("legacy-report.html", "<html>old</html>"))
+        legacy_pdf_path = Path(self._write_temp_text("legacy-report.pdf", "old-pdf"))
+        rebuilt_html_path = self._backup_root / "rebuilt-report.html"
+        rebuilt_pdf_path = self._backup_root / "rebuilt-report.pdf"
+        mock_report_html_output_path.return_value = rebuilt_html_path
+        mock_render_report_html.return_value = "<html>fresh</html>"
+        mock_export_pdf.return_value = str(rebuilt_pdf_path)
+        record = {
+            "id": "report-legacy",
+            "company_id": "asml",
+            "calendar_quarter": "2025Q4",
+            "html_path": str(legacy_html_path),
+            "pdf_path": str(legacy_pdf_path),
+            "payload": {"company_id": "asml", "calendar_quarter": "2025Q4"},
+        }
+
+        html_download_url, pdf_download_url, html_result_path, pdf_error = _ensure_report_files(record)
+
+        self.assertEqual(html_download_url, "/reports/report-legacy/download.html")
+        self.assertEqual(pdf_download_url, "/reports/report-legacy/download.pdf")
+        self.assertEqual(html_result_path, str(rebuilt_html_path))
+        self.assertIsNone(pdf_error)
+        mock_export_pdf.assert_called_once_with("asml-2025q4-deep-report", "<html>fresh</html>")
+        mock_update_report_artifacts.assert_called_once_with(
+            "report-legacy",
+            html_path=str(rebuilt_html_path),
+            pdf_path=str(rebuilt_pdf_path),
+        )
+        self.assertEqual(rebuilt_html_path.read_text(encoding="utf-8"), "<html>fresh</html>")
 
     def test_nvidia_history_cube_has_12_points_and_segments(self) -> None:
         cube = build_historical_quarter_cube("nvidia", "2025Q4", 12)
@@ -6874,6 +6989,33 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertAlmostEqual(metrics["capital_expenditures_bn"], 3.1, places=3)
         self.assertAlmostEqual(metrics["free_cash_flow_bn"], 50.9, places=3)
 
+    def test_extract_cash_flow_metrics_prefers_quarterly_five_period_rows_over_annual_rows(self) -> None:
+        metrics = _extract_cash_flow_metrics_from_materials(
+            [
+                {
+                    "kind": "presentation",
+                    "flat_text": (
+                        "Consolidated statements of cash flows Quarter on Quarter (in millions EUR) "
+                        "Q4 2024 Q1 2025 Q2 2025 Q3 2025 Q4 2025 "
+                        "Net cash provided by (used in) operating activities 9,545 (59) 748 559 11,410 "
+                        "Purchases of property, plant and equipment and intangible assets (706) (417) (429) (315) (470) "
+                        "Free cash flow 1 8,839 (476) 319 244 10,940 1 "
+                        "Consolidated statements of cash flows Year on Year (in millions EUR) "
+                        "2021 2022 2023 2024 2025 "
+                        "Net cash provided by (used in) operating activities 10,847 8,487 5,443 11,166 12,659 "
+                        "Purchases of property, plant and equipment and intangible assets (940) (1,319) (2,196) (2,083) (1,631) "
+                        "Free cash flow 1 9,907 7,168 3,247 9,083 11,028 1 "
+                        "Free cash flow, which is a non-GAAP measure, is defined as net cash provided by (used in) "
+                        "operating activities minus purchases of Property, plant and equipment and intangible assets."
+                    ),
+                }
+            ]
+        )
+
+        self.assertAlmostEqual(metrics["operating_cash_flow_bn"], 11.410, places=3)
+        self.assertAlmostEqual(metrics["capital_expenditures_bn"], 0.470, places=3)
+        self.assertAlmostEqual(metrics["free_cash_flow_bn"], 10.940, places=3)
+
     def test_extract_cash_flow_metrics_ignores_annual_statement_totals_for_single_quarter(self) -> None:
         html_path = self._write_temp_text(
             "visa-annual-cash-flow-table.html",
@@ -8797,6 +8939,73 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertAlmostEqual(segment_map["North America"], 7.280, places=3)
         self.assertAlmostEqual(segment_map["International"], 2.065, places=3)
         self.assertAlmostEqual(segment_map["Channel Development"], 0.523, places=3)
+
+    def test_growth_stack_plan_does_not_mix_geography_history_into_segment_legend(self) -> None:
+        entries = [
+            {
+                "quarter_label": "2020Q4",
+                "revenue_bn": 6.7,
+                "segments": [
+                    {"name": "United States", "value_bn": 3.8, "share_pct": 56.7},
+                    {"name": "China", "value_bn": 1.3, "share_pct": 19.4},
+                    {"name": "Japan", "value_bn": 0.6, "share_pct": 9.0},
+                    {"name": "Canada", "value_bn": 0.4, "share_pct": 6.0},
+                ],
+                "geographies": [
+                    {"name": "United States", "value_bn": 3.8, "share_pct": 56.7},
+                    {"name": "China", "value_bn": 1.3, "share_pct": 19.4},
+                    {"name": "Japan", "value_bn": 0.6, "share_pct": 9.0},
+                    {"name": "Canada", "value_bn": 0.4, "share_pct": 6.0},
+                ],
+                "structure_basis": "geography",
+            },
+            {
+                "quarter_label": "2021Q1",
+                "revenue_bn": 6.9,
+                "segments": [
+                    {"name": "United States", "value_bn": 3.9, "share_pct": 56.5},
+                    {"name": "China", "value_bn": 1.4, "share_pct": 20.3},
+                    {"name": "Japan", "value_bn": 0.6, "share_pct": 8.7},
+                    {"name": "Canada", "value_bn": 0.4, "share_pct": 5.8},
+                ],
+                "geographies": [
+                    {"name": "United States", "value_bn": 3.9, "share_pct": 56.5},
+                    {"name": "China", "value_bn": 1.4, "share_pct": 20.3},
+                    {"name": "Japan", "value_bn": 0.6, "share_pct": 8.7},
+                    {"name": "Canada", "value_bn": 0.4, "share_pct": 5.8},
+                ],
+                "structure_basis": "geography",
+            },
+            {
+                "quarter_label": "2021Q2",
+                "revenue_bn": 7.6,
+                "segments": [
+                    {"name": "North America", "value_bn": 5.5, "share_pct": 72.4},
+                    {"name": "International", "value_bn": 1.6, "share_pct": 21.1},
+                    {"name": "Channel Development", "value_bn": 0.5, "share_pct": 6.5},
+                ],
+                "geographies": [],
+                "structure_basis": "segment",
+            },
+            {
+                "quarter_label": "2021Q3",
+                "revenue_bn": 7.8,
+                "segments": [
+                    {"name": "North America", "value_bn": 5.7, "share_pct": 73.1},
+                    {"name": "International", "value_bn": 1.6, "share_pct": 20.5},
+                    {"name": "Channel Development", "value_bn": 0.5, "share_pct": 6.4},
+                ],
+                "geographies": [],
+                "structure_basis": "segment",
+            },
+        ]
+
+        segment_names, plan, inferred_any = _growth_stack_plan(entries)
+
+        self.assertEqual(segment_names, ["North America", "International", "Channel Development"])
+        self.assertFalse(plan[0]["segments"])
+        self.assertFalse(plan[1]["segments"])
+        self.assertFalse(inferred_any)
 
     def test_generic_parser_extracts_statement_metrics_from_raw_html_sec_table(self) -> None:
         sec_text_path = self._write_temp_text(
