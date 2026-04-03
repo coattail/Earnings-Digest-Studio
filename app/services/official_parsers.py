@@ -5176,7 +5176,7 @@ def _clean_guidance_segment_label(label: str) -> str:
         )
         if ". " in cleaned:
             cleaned = cleaned.split(".")[-1].strip(" ,.;:-")
-        cleaned = re.sub(r"^(?:and\s+)?in\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^(?:and\s+)?(?:in|for)\s+", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"^(?:our|the)\s+", "", cleaned, flags=re.IGNORECASE)
     return cleaned
 
@@ -5188,6 +5188,12 @@ def _guidance_match_is_segment_scoped(match: re.Match[str], window: str) -> bool
         prefix,
         flags=re.IGNORECASE,
     )
+    if not scope_match:
+        scope_match = re.search(
+            r"(?:^|[.;:!?]\s*)(?:in|for)\s+(?P<label>[A-Za-z][A-Za-z0-9&(),./\-\s]{1,120}?)\s*$",
+            prefix,
+            flags=re.IGNORECASE,
+        )
     if not scope_match:
         return False
     label = _clean_guidance_segment_label(scope_match.group("label") or "")
@@ -5208,29 +5214,49 @@ def _extract_generic_guidance(material: Optional[dict[str, Any]]) -> dict[str, A
     if _guidance_excerpt_is_boilerplate(flat_text):
         return {}
     currency_prefix = r"(?:us\$|u\.s\.\$|usd\s+|eur\s+|€|\$)?\s*"
-    guidance_windows = _guidance_candidate_windows(flat_text)
-    if not guidance_windows:
-        return {}
-    segment_ranges = _extract_segment_level_generic_guidance(flat_text, candidate_windows=guidance_windows)
-    if segment_ranges:
-        low_bn = sum(float(item["low_bn"]) for item in segment_ranges)
-        high_bn = sum(float(item["high_bn"]) for item in segment_ranges)
-        segment_labels = "、".join(str(item["label"]) for item in segment_ranges[:3])
-        extra = "等分部口径加总。"
-        if len(segment_ranges) <= 3:
-            extra = f"由 {segment_labels} 分部加总得到。"
+    company_range_patterns = [
+        rf"(?:starting\s+with\s+the\s+total\s+company|total\s+company|companywide|overall).{{0,120}}?(?:expects?|expected|guidance|outlook|we\s+expect).{{0,80}}?(?:revenue|revenues|sales)\s+of\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)?\s+(?:and|to)\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
+        rf"(?:starting\s+with\s+the\s+total\s+company|total\s+company|companywide|overall).{{0,120}}?(?:revenue|revenues|sales).{{0,40}}?(?:between|in\s+the\s+range\s+of)\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)?\s+(?:and|to)\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
+    ]
+    for pattern in company_range_patterns:
+        company_match = _search(pattern, flat_text)
+        if not company_match:
+            continue
+        low_unit = company_match.group(2) or company_match.group(4)
+        high_unit = company_match.group(4) or company_match.group(2)
+        low_bn = _bn_from_unit(company_match.group(1), low_unit)
+        high_bn = _bn_from_unit(company_match.group(3), high_unit)
         return {
             "mode": "official",
             "revenue_bn": _midpoint(low_bn, high_bn),
             "revenue_low_bn": low_bn,
             "revenue_high_bn": high_bn,
-            "comparison_label": "下一季收入指引（分部加总）",
-            "commentary": _guidance_midpoint_commentary(low_bn, high_bn, extra=extra),
+            "comparison_label": "下一季收入指引",
+            "commentary": _guidance_midpoint_commentary(low_bn, high_bn, extra="官方原文已给出明确收入区间。"),
         }
+    guidance_windows = _guidance_candidate_windows(flat_text)
+    if not guidance_windows:
+        return {}
+    segment_ranges = _extract_segment_level_generic_guidance(flat_text, candidate_windows=guidance_windows)
+
+    def _matches_segment_range(low_bn: Optional[float], high_bn: Optional[float]) -> bool:
+        if low_bn is None or high_bn is None:
+            return False
+        for item in segment_ranges:
+            segment_low = float(item.get("low_bn") or 0.0)
+            segment_high = float(item.get("high_bn") or 0.0)
+            if abs(float(low_bn) - segment_low) <= 0.05 and abs(float(high_bn) - segment_high) <= 0.05:
+                return True
+        return False
+
     range_patterns = [
         rf"(?:expects?|expected|guidance|outlook).{{0,120}}?(?:revenue|revenues|sales).{{0,80}}?between\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)\s+and\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
         rf"(?:revenue|revenues|sales).{{0,40}}?(?:is|are)\s+expected.{{0,40}}?between\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)\s+and\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
         rf"(?:revenue|revenues|sales).{{0,40}}?(?:should|will)\s+be.{{0,40}}?(?:between|in\s+the\s+range\s+of)\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)\s+(?:and|to)\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
+        rf"(?:expects?|expected|guidance|outlook).{{0,120}}?(?:revenue|revenues|sales)\s+of\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)\s+(?:and|to)\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
+        rf"(?:we\s+expect|expects?|expected).{{0,60}}?(?:total\s+company\s+)?(?:revenue|revenues|sales)\s+of\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)\s+(?:and|to)\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
+        rf"(?:expects?|expected|guidance|outlook).{{0,120}}?(?:revenue|revenues|sales)\s+of\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)?\s+(?:and|to)\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
+        rf"(?:we\s+expect|expects?|expected).{{0,60}}?(?:total\s+company\s+)?(?:revenue|revenues|sales)\s+of\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)?\s+(?:and|to)\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
     ]
     for pattern in range_patterns:
         range_match_result = _search_guidance_windows_with_window(pattern, guidance_windows)
@@ -5239,8 +5265,12 @@ def _extract_generic_guidance(material: Optional[dict[str, Any]]) -> dict[str, A
         range_match, matched_window = range_match_result
         if _guidance_match_is_segment_scoped(range_match, matched_window):
             continue
-        low_bn = _bn_from_unit(range_match.group(1), range_match.group(2))
-        high_bn = _bn_from_unit(range_match.group(3), range_match.group(4))
+        low_unit = range_match.group(2) or range_match.group(4)
+        high_unit = range_match.group(4) or range_match.group(2)
+        low_bn = _bn_from_unit(range_match.group(1), low_unit)
+        high_bn = _bn_from_unit(range_match.group(3), high_unit)
+        if _matches_segment_range(low_bn, high_bn):
+            continue
         return {
             "mode": "official",
             "revenue_bn": _midpoint(low_bn, high_bn),
@@ -5264,6 +5294,21 @@ def _extract_generic_guidance(material: Optional[dict[str, Any]]) -> dict[str, A
             "revenue_bn": revenue_bn,
             "comparison_label": "下一季收入指引",
             "commentary": commentary,
+        }
+    if segment_ranges:
+        low_bn = sum(float(item["low_bn"]) for item in segment_ranges)
+        high_bn = sum(float(item["high_bn"]) for item in segment_ranges)
+        segment_labels = "、".join(str(item["label"]) for item in segment_ranges[:3])
+        extra = "等分部口径加总。"
+        if len(segment_ranges) <= 3:
+            extra = f"由 {segment_labels} 分部加总得到。"
+        return {
+            "mode": "official",
+            "revenue_bn": _midpoint(low_bn, high_bn),
+            "revenue_low_bn": low_bn,
+            "revenue_high_bn": high_bn,
+            "comparison_label": "下一季收入指引（分部加总）",
+            "commentary": _guidance_midpoint_commentary(low_bn, high_bn, extra=extra),
         }
     point_patterns = [
         rf"(?:expects?|expected|guidance|outlook).{{0,120}}?(?:revenue|revenues|sales).{{0,40}}?{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",

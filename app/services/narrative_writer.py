@@ -88,6 +88,62 @@ def _line_looks_readable(text: Optional[str]) -> bool:
     return True
 
 
+def _excerpt_line(text: str, limit: int) -> str:
+    cleaned = _clean(text)
+    if len(cleaned) <= limit:
+        return cleaned
+    search_window = cleaned[: limit + 1]
+    preferred_cutoff = max(
+        search_window.rfind(token)
+        for token in ("。", "！", "？", "；", ".", "!", "?", ";", "，", ",", " ")
+    )
+    minimum_boundary = max(12, int(limit * 0.55))
+    if preferred_cutoff >= minimum_boundary:
+        if search_window[preferred_cutoff] == " ":
+            return search_window[:preferred_cutoff].rstrip(" ,.;:，；")
+        return search_window[: preferred_cutoff + 1].rstrip(" ,.;:，；")
+    return cleaned[:limit].rstrip(" ,.;:，；")
+
+
+def _looks_like_call_housekeeping(text: Optional[str]) -> bool:
+    cleaned = _clean(text)
+    if not cleaned:
+        return False
+    lowered = cleaned.lower()
+    direct_tokens = (
+        "good afternoon and thank you for joining us",
+        "thanks for joining us today",
+        "welcome to the earnings conference call",
+        "welcome to the conference call",
+        "this call will be recorded",
+        "all lines have been placed on mute",
+        "on the call with me are",
+        "forward-looking statements",
+        "reconciliation of gaap",
+    )
+    if any(token in lowered for token in direct_tokens):
+        return True
+    intro_tokens = ("good afternoon", "thank you for joining us", "welcome to")
+    title_tokens = (
+        "chief executive officer",
+        "chief financial officer",
+        "chief accounting officer",
+        "president and ceo",
+    )
+    return sum(token in lowered for token in intro_tokens) >= 1 and sum(token in lowered for token in title_tokens) >= 2
+
+
+def _normalize_call_panel_bullet(text: Optional[str], *, max_length: int = 160) -> str:
+    cleaned = polish_generated_text(text)
+    if not _line_looks_readable(cleaned) or _looks_like_call_housekeeping(cleaned):
+        return ""
+    cleaned = re.sub(r"^(?:Operator|Analyst|Question(?:er)?|[A-Z][A-Za-z.'’ -]{1,48}):\s*", "", cleaned)
+    compact = _excerpt_line(cleaned, max_length)
+    if not compact:
+        return ""
+    return _trim_sentence(compact)
+
+
 def polish_generated_text(text: Optional[str]) -> str:
     cleaned = _clean(text)
     if not cleaned:
@@ -413,7 +469,7 @@ def build_call_panel(
     if transcript_summary:
         title = "电话会摘录" if transcript_summary.get("source_type") == "manual_transcript" else "电话会要点"
         bullets = dedupe_lines(
-            [str(item) for item in list(transcript_summary.get("highlights") or []) if _line_looks_readable(str(item))],
+            [_normalize_call_panel_bullet(item) for item in list(transcript_summary.get("highlights") or [])],
             limit=2,
         )
         if not bullets:

@@ -81,6 +81,7 @@ from app.services.reports import (
     REPORT_PAYLOAD_SCHEMA_VERSION,
     _automatic_transcript_summary,
     _official_material_proxy_summary,
+    _transcript_highlights,
     _source_material_warnings,
     _backfill_historical_core_metrics,
     _build_capital_allocation_snapshot,
@@ -3678,6 +3679,65 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
             ],
         )
 
+    def test_extract_segment_level_generic_guidance_dedupes_for_prefixed_labels(self) -> None:
+        matches = _extract_segment_level_generic_guidance(
+            (
+                "Now to segment guidance. "
+                "In Productivity and Business Processes we expect revenue of $34.25 to $34.55 billion. "
+                "For Intelligent Cloud, we expect revenue of $34.1 to $34.4 billion. "
+                "In More Personal Computing, we expect revenue to be $12.3 to $12.8 billion. "
+                "For Intelligent Cloud, we expect revenue of $34.1 to $34.4 billion, or growth of 27% to 29%."
+            )
+        )
+
+        self.assertEqual(
+            [item["label"] for item in matches],
+            [
+                "Productivity and Business Processes",
+                "Intelligent Cloud",
+                "More Personal Computing",
+            ],
+        )
+
+    def test_extract_generic_guidance_prefers_total_company_range_over_segment_sum(self) -> None:
+        guidance = _extract_generic_guidance(
+            {
+                "flat_text": (
+                    "Starting with the total company. We expect revenue of $80.65 to $81.75 billion. "
+                    "Now to segment guidance. "
+                    "In Productivity and Business Processes we expect revenue of $34.25 to $34.55 billion. "
+                    "For Intelligent Cloud, we expect revenue of $34.1 to $34.4 billion. "
+                    "In More Personal Computing, we expect revenue to be $12.3 to $12.8 billion."
+                ),
+            }
+        )
+
+        self.assertEqual(guidance["mode"], "official")
+        self.assertEqual(guidance["comparison_label"], "下一季收入指引")
+        self.assertAlmostEqual(guidance["revenue_low_bn"], 80.65, places=2)
+        self.assertAlmostEqual(guidance["revenue_high_bn"], 81.75, places=2)
+        self.assertAlmostEqual(guidance["revenue_bn"], 81.2, places=2)
+        self.assertNotIn("分部加总", guidance["commentary"])
+
+    def test_extract_generic_guidance_captures_total_company_range_outside_guidance_window(self) -> None:
+        guidance = _extract_generic_guidance(
+            {
+                "flat_text": (
+                    "We expect FX to increase revenue growth by 4 points in Productivity and Business Processes. "
+                    "Starting with the total company. We expect revenue of $80.65 to $81.75 billion or growth of 15% to 17%. "
+                    "Microsoft Cloud gross margin percentage should be roughly 65%. "
+                    "Now to segment guidance. "
+                    "In Productivity and Business Processes we expect revenue of $34.25 to $34.55 billion. "
+                    "For Intelligent Cloud, we expect revenue of $34.1 to $34.4 billion. "
+                    "In More Personal Computing, we expect revenue to be $12.3 to $12.8 billion."
+                ),
+            }
+        )
+
+        self.assertEqual(guidance["comparison_label"], "下一季收入指引")
+        self.assertAlmostEqual(guidance["revenue_low_bn"], 80.65, places=2)
+        self.assertAlmostEqual(guidance["revenue_high_bn"], 81.75, places=2)
+
     def test_extract_segment_level_generic_guidance_handles_large_microsoft_10q_quickly(self) -> None:
         flat_text = (
             (
@@ -5540,6 +5600,27 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         )
 
         self.assertIsNone(summary)
+
+    def test_transcript_highlights_skip_call_housekeeping_and_keep_business_points(self) -> None:
+        text = """
+        Jonathan Neilson: Good afternoon and thank you for joining us today. On the call with me are Satya Nadella,
+        chairman and chief executive officer, Amy Hood, chief financial officer, and Alice Jolla. This call will be recorded
+        and all lines have been placed on mute.
+
+        Satya Nadella: Azure and other cloud services revenue grew 39% year over year, with AI services contributing 16 points
+        of growth as enterprise demand remained ahead of available capacity.
+
+        Amy Hood: We continue to expect Microsoft Cloud gross margin percentage to remain resilient as we balance datacenter
+        investments with improving commercial execution.
+        """
+
+        highlights = _transcript_highlights(text)
+
+        self.assertTrue(highlights)
+        self.assertTrue(any("Azure and other cloud services revenue grew 39% year over year" in item for item in highlights))
+        self.assertFalse(any("good afternoon and thank you for joining us" in item.lower() for item in highlights))
+        self.assertFalse(any("on the call with me are" in item.lower() for item in highlights))
+        self.assertTrue(all(len(item) <= 200 for item in highlights))
 
     def test_transcript_qna_topics_backfill_to_full_coverage_minimum(self) -> None:
         enriched = _ensure_minimum_qna_topics(
@@ -10571,6 +10652,42 @@ class ReportRegressionUnitTestCase(unittest.TestCase):
         )
 
         self.assertEqual(panel["bullets"], ["先看 Services 增速能不能继续快于公司整体。"])
+
+    def test_build_call_panel_compacts_long_transcript_highlights_for_fixed_layout(self) -> None:
+        panel = build_call_panel(
+            {
+                "source_type": "official_call_material",
+                "highlights": [
+                    (
+                        "Jonathan Neilson: Good afternoon and thank you for joining us today. On the call with me are "
+                        "Satya Nadella, chairman and chief executive officer, Amy Hood, chief financial officer, and "
+                        "Alice Jolla, chief accounting officer."
+                    ),
+                    (
+                        "Azure and other cloud services revenue grew 39% year over year, with AI services contributing "
+                        "16 points of growth as enterprise demand continued to outpace available capacity across the quarter "
+                        "and management emphasized that monetization is broadening beyond the earliest workloads."
+                    ),
+                ],
+            },
+            [
+                {
+                    "label": "Azure",
+                    "note": "先看 Azure 增长能否继续靠 AI 需求与供给释放共振。",
+                }
+            ],
+            {
+                "qna": {"status": "official_call_material"},
+                "call_panel_meta_lines": ["这页主要依据 电话会材料。"],
+            },
+        )
+
+        self.assertEqual(panel["title"], "电话会要点")
+        self.assertTrue(panel["bullets"])
+        self.assertFalse(any("good afternoon and thank you for joining us" in item.lower() for item in panel["bullets"]))
+        self.assertFalse(any("on the call with me are" in item.lower() for item in panel["bullets"]))
+        self.assertTrue(any("Azure and other cloud services revenue grew 39% year over year" in item for item in panel["bullets"]))
+        self.assertTrue(all(len(item) <= 170 for item in panel["bullets"]))
 
 if __name__ == "__main__":
     unittest.main()

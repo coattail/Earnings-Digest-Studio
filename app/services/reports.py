@@ -4173,6 +4173,10 @@ def _transcript_highlights(text: str) -> list[str]:
         "i would now like to turn",
         "thank you. good afternoon",
         "this call will be recorded",
+        "good afternoon and thank you for joining us",
+        "thanks for joining us today",
+        "welcome to the earnings conference call",
+        "on the call with me are",
     )
     preferred: list[str] = []
     fallback: list[str] = []
@@ -4196,6 +4200,18 @@ def _transcript_highlights(text: str) -> list[str]:
         lowered = chunk.lower()
         if any(token in lowered for token in skip_tokens):
             continue
+        intro_count = sum(token in lowered for token in ("good afternoon", "thank you for joining us", "welcome to"))
+        title_count = sum(
+            token in lowered
+            for token in (
+                "chief executive officer",
+                "chief financial officer",
+                "chief accounting officer",
+                "president and ceo",
+            )
+        )
+        if intro_count >= 1 and title_count >= 2:
+            continue
         if len(chunk) < 80:
             continue
         if any(token in lowered for token in business_tokens):
@@ -4203,7 +4219,7 @@ def _transcript_highlights(text: str) -> list[str]:
         else:
             fallback.append(chunk)
     selected = preferred[:3] if preferred else fallback[:3]
-    return [_excerpt_text(item, 360) for item in selected[:3]]
+    return [_excerpt_text(item, 190) for item in selected[:3]]
 
 
 def _automatic_transcript_summary(source_materials: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
