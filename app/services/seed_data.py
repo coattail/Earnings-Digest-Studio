@@ -759,6 +759,29 @@ COMPANY_REGISTRY = {
         },
         segment_order=["Net sales", "Membership fees"],
     ),
+    "microstrategy": build_company(
+        "microstrategy",
+        "微策略",
+        "Strategy",
+        "MSTR",
+        "比特币资产配置与企业分析软件并行驱动、资本结构波动显著的特殊资产负债表公司。",
+        "#F97316",
+        "#111827",
+        "#FFEDD5",
+        "#FFF7ED",
+        "stockanalysis",
+        "mstr",
+        card_headline="比特币持仓、公允价值波动与软件业务韧性共同决定季度解读框架。",
+        ir_url="https://www.strategy.com/investor-relations",
+        display_order=22,
+        official_source={
+            "sec_cik": "0001050446",
+            "release_forms": ["8-K"],
+            "filing_forms": ["10-Q", "10-K"],
+            "fiscal_year_end_month": 12,
+        },
+        segment_order=["Subscription Services", "Product Licenses", "Product Support", "Other Services", "Bitcoin"],
+    ),
 }
 
 
@@ -824,8 +847,6 @@ SEGMENT_ALIAS_UPDATES = {
         "Google Network members' properties": "Google Network",
         "Google Network revenues": "Google Network",
         "Network Members properties": "Google Network",
-        "Google other": "Google subscriptions, platforms, and devices",
-        "Google Other": "Google subscriptions, platforms, and devices",
         "Google subscriptions": "Google subscriptions, platforms, and devices",
     },
     "microsoft": {

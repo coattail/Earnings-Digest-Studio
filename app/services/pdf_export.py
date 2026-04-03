@@ -13,13 +13,15 @@ from ..utils import slugify
 PDF_EXPORT_MODE_ENV = "EARNINGS_DIGEST_PDF_EXPORT_MODE"
 PDF_PAGE_WIDTH_IN = 13.333
 PDF_PAGE_HEIGHT_IN = 7.5
+PDF_EXPORT_DEFAULT_MODE = "vector"
+PDF_READY_WAIT_UNTIL = "load"
 
 
 def _pdf_export_mode() -> str:
-    raw = str(os.environ.get(PDF_EXPORT_MODE_ENV) or "raster").strip().casefold()
+    raw = str(os.environ.get(PDF_EXPORT_MODE_ENV) or PDF_EXPORT_DEFAULT_MODE).strip().casefold()
     if raw in {"vector", "raster"}:
         return raw
-    return "raster"
+    return PDF_EXPORT_DEFAULT_MODE
 
 
 def _build_raster_pdf_html(image_names: list[str]) -> str:
@@ -72,7 +74,7 @@ async def _render_pdf_vector_async(filename_stem: str, html_content: str) -> str
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch()
         page = await browser.new_page(viewport={"width": 1600, "height": 900}, device_scale_factor=2)
-        await page.set_content(html_content, wait_until="networkidle")
+        await page.set_content(html_content, wait_until=PDF_READY_WAIT_UNTIL)
         await page.pdf(
             path=str(output_path),
             print_background=True,
@@ -88,7 +90,7 @@ async def _render_pdf_raster_async(filename_stem: str, html_content: str) -> str
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch()
         source_page = await browser.new_page(viewport={"width": 1600, "height": 900}, device_scale_factor=2)
-        await source_page.set_content(html_content, wait_until="networkidle")
+        await source_page.set_content(html_content, wait_until=PDF_READY_WAIT_UNTIL)
         page_locator = source_page.locator(".page")
         page_count = await page_locator.count()
         if page_count <= 0:
@@ -105,7 +107,7 @@ async def _render_pdf_raster_async(filename_stem: str, html_content: str) -> str
             raster_html_path = temp_path / "raster-export.html"
             raster_html_path.write_text(_build_raster_pdf_html(image_names), encoding="utf-8")
             pdf_page = await browser.new_page(viewport={"width": 1600, "height": 900}, device_scale_factor=1)
-            await pdf_page.goto(raster_html_path.as_uri(), wait_until="networkidle")
+            await pdf_page.goto(raster_html_path.as_uri(), wait_until=PDF_READY_WAIT_UNTIL)
             await pdf_page.pdf(
                 path=str(output_path),
                 print_background=True,

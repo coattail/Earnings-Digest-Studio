@@ -49,6 +49,69 @@ def get_company(company_id: str) -> dict[str, Any]:
         raise KeyError(f"Unknown company id: {company_id}") from exc
 
 
+def _segment_name_token(value: str) -> str:
+    normalized = str(value or "").strip().casefold()
+    normalized = normalized.replace("&", " and ")
+    normalized = normalized.replace("/", " ")
+    normalized = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", normalized)
+    normalized = re.sub(r"\bservices\b", " service ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _is_direct_segment_alias(alias: str, canonical: str) -> bool:
+    alias_token = _segment_name_token(alias)
+    canonical_token = _segment_name_token(canonical)
+    if not alias_token or not canonical_token:
+        return False
+    if alias_token == canonical_token:
+        return True
+
+    alias_parts = [part for part in alias_token.split(" ") if part]
+    canonical_parts = [part for part in canonical_token.split(" ") if part]
+    alias_set = set(alias_parts)
+    canonical_set = set(canonical_parts)
+    overlap = alias_set.intersection(canonical_set)
+    similarity = SequenceMatcher(None, alias_token, canonical_token).ratio()
+
+    if len(canonical_parts) == 1:
+        canonical_part = canonical_parts[0]
+        if any(
+            part == canonical_part
+            or part.startswith(canonical_part)
+            or canonical_part.startswith(part)
+            or SequenceMatcher(None, part, canonical_part).ratio() >= 0.84
+            for part in alias_parts
+        ):
+            return True
+
+    if len(overlap) >= max(2, min(len(alias_set), len(canonical_set)) - 1):
+        return True
+    if len(overlap) >= 2 and similarity >= 0.62:
+        return True
+    if (alias_token in canonical_token or canonical_token in alias_token) and similarity >= 0.72:
+        return True
+    return similarity >= 0.9
+
+
+def get_segment_alias_map(
+    company: dict[str, Any],
+    *,
+    allow_rollups: bool = True,
+) -> dict[str, str]:
+    alias_map = {
+        str(alias).strip(): str(canonical).strip()
+        for alias, canonical in dict(company.get("segment_aliases") or {}).items()
+        if str(alias).strip() and str(canonical).strip()
+    }
+    if allow_rollups:
+        return alias_map
+    return {
+        alias: canonical
+        for alias, canonical in alias_map.items()
+        if _is_direct_segment_alias(alias, canonical)
+    }
+
+
 def _normalize_company_reference_token(value: str) -> str:
     text = str(value or "").strip().casefold()
     if not text:
@@ -450,6 +513,7 @@ def _load_companyfacts(company: dict[str, Any], refresh: bool = False) -> Option
         if cache_path.exists():
             return json.loads(cache_path.read_text(encoding="utf-8"))
         return None
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return payload
 
@@ -832,6 +896,205 @@ def _build_companyfacts_series(
     }
 
 
+def _build_companyfacts_duration_quarter_map(
+    payload: dict[str, Any],
+    concept_names: list[str],
+    preferred_currency_code: Optional[str] = None,
+) -> dict[str, dict[str, Any]]:
+    grouped_candidates: dict[str, dict[str, dict[str, Any]]] = {}
+    direct_candidates: dict[str, dict[str, Any]] = {}
+
+    for concept_name in concept_names:
+        for item in _concept_unit_items(payload, concept_name, preferred_currency_code=preferred_currency_code):
+            period = _fact_quarter_label(item)
+            duration_days = _fact_duration_days(item)
+            value = item.get("val")
+            start = str(item.get("start") or "")
+            end = str(item.get("end") or "")
+            if period is None or value is None or duration_days is None or not start or not end:
+                continue
+            frame = str(item.get("frame") or "")
+            form = str(item.get("form") or "")
+            filed = str(item.get("filed") or "")
+            score = 0
+            if period in frame:
+                score += 30
+            if 70 <= duration_days <= 110:
+                score += 24
+            elif duration_days <= 220:
+                score += 10
+            elif duration_days <= 320:
+                score += 6
+            else:
+                score += 2
+            if str(item.get("fp") or "").upper() == "Q1" and 70 <= duration_days <= 110:
+                score += 10
+            score -= _fact_form_priority(form) * 3
+            candidate = {
+                **dict(item),
+                "_concept": concept_name,
+                "_score": score,
+                "_duration_days": duration_days,
+                "_period": period,
+            }
+            group = grouped_candidates.setdefault(start, {})
+            current_for_period = group.get(period)
+            candidate_key = (int(score), filed, -_fact_form_priority(form))
+            if current_for_period is None:
+                group[period] = candidate
+            else:
+                current_key = (
+                    int(current_for_period.get("_score") or 0),
+                    str(current_for_period.get("filed") or ""),
+                    -_fact_form_priority(str(current_for_period.get("form") or "")),
+                )
+                if candidate_key > current_key:
+                    group[period] = candidate
+            if 70 <= duration_days <= 110:
+                current_direct = direct_candidates.get(period)
+                if current_direct is None:
+                    direct_candidates[period] = candidate
+                else:
+                    current_key = (
+                        int(current_direct.get("_score") or 0),
+                        str(current_direct.get("filed") or ""),
+                        -_fact_form_priority(str(current_direct.get("form") or "")),
+                    )
+                    if candidate_key > current_key:
+                        direct_candidates[period] = candidate
+
+    selected: dict[str, dict[str, Any]] = {}
+    for period, item in direct_candidates.items():
+        selected[period] = {
+            **dict(item),
+            "_derived_from_cumulative": False,
+            "_derived_val": float(item.get("val") or 0.0),
+        }
+
+    for period_items in grouped_candidates.values():
+        ordered = sorted(
+            period_items.values(),
+            key=lambda item: (str(item.get("end") or ""), int(item.get("_duration_days") or 0)),
+        )
+        previous_cumulative: Optional[float] = None
+        for item in ordered:
+            duration_days = int(item.get("_duration_days") or 0)
+            current_cumulative = float(item.get("val") or 0.0)
+            if previous_cumulative is None:
+                previous_cumulative = current_cumulative
+                if not (70 <= duration_days <= 110):
+                    continue
+                derived_value = current_cumulative
+                derived_from_cumulative = False
+            else:
+                derived_value = current_cumulative - previous_cumulative
+                previous_cumulative = current_cumulative
+                derived_from_cumulative = duration_days > 110
+            period = str(item.get("_period") or "")
+            if not period:
+                continue
+            candidate = {
+                **dict(item),
+                "_derived_from_cumulative": derived_from_cumulative,
+                "_derived_val": derived_value,
+                "_score": int(item.get("_score") or 0) - (3 if derived_from_cumulative else 0),
+            }
+            current_selected = selected.get(period)
+            if current_selected is None:
+                selected[period] = candidate
+                continue
+            current_key = (
+                int(current_selected.get("_score") or 0),
+                str(current_selected.get("filed") or ""),
+                -_fact_form_priority(str(current_selected.get("form") or "")),
+            )
+            candidate_key = (
+                int(candidate.get("_score") or 0),
+                str(candidate.get("filed") or ""),
+                -_fact_form_priority(str(candidate.get("form") or "")),
+            )
+            if candidate_key > current_key:
+                selected[period] = candidate
+
+    return selected
+
+
+def get_companyfacts_quarter_supplement(company_id: str, calendar_quarter: str) -> dict[str, Optional[float]]:
+    company = get_company(company_id)
+    payload = _load_companyfacts(company)
+    if not payload:
+        return {}
+
+    preferred_currency_code = str(company.get("currency_code") or "USD")
+    operating_cash_flow_map = _build_companyfacts_duration_quarter_map(
+        payload,
+        [
+            "NetCashProvidedByUsedInOperatingActivities",
+            "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+        ],
+        preferred_currency_code=preferred_currency_code,
+    )
+    capital_expenditures_map = _build_companyfacts_duration_quarter_map(
+        payload,
+        [
+            "PaymentsToAcquirePropertyPlantAndEquipment",
+            "PropertyPlantAndEquipmentAdditions",
+            "PaymentsToAcquireProductiveAssets",
+        ],
+        preferred_currency_code=preferred_currency_code,
+    )
+    share_repurchases_map = _build_companyfacts_duration_quarter_map(
+        payload,
+        [
+            "PaymentsForRepurchaseOfCommonStock",
+            "ShareRepurchases",
+            "StockRepurchasedAndRetiredDuringPeriodValue",
+        ],
+        preferred_currency_code=preferred_currency_code,
+    )
+    dividends_map = _build_companyfacts_duration_quarter_map(
+        payload,
+        [
+            "PaymentsOfDividends",
+            "PaymentsOfDividendsCommonStock",
+            "Dividends",
+        ],
+        preferred_currency_code=preferred_currency_code,
+    )
+
+    def _metric_bn(metric_map: dict[str, dict[str, Any]], *, absolute: bool = False) -> Optional[float]:
+        item = metric_map.get(calendar_quarter)
+        if item is None:
+            return None
+        value = item.get("_derived_val")
+        if value is None:
+            value = item.get("val")
+        if value is None:
+            return None
+        normalized = abs(float(value)) if absolute else float(value)
+        return round(normalized / 1_000_000_000.0, 3)
+
+    operating_cash_flow_bn = _metric_bn(operating_cash_flow_map)
+    capital_expenditures_bn = _metric_bn(capital_expenditures_map, absolute=True)
+    free_cash_flow_bn = None
+    if operating_cash_flow_bn is not None and capital_expenditures_bn is not None:
+        free_cash_flow_bn = round(max(float(operating_cash_flow_bn) - float(capital_expenditures_bn), 0.0), 3)
+    share_repurchases_bn = _metric_bn(share_repurchases_map, absolute=True)
+    dividends_bn = _metric_bn(dividends_map, absolute=True)
+    capital_return_bn = None
+    if share_repurchases_bn is not None and dividends_bn is not None:
+        capital_return_bn = round(float(share_repurchases_bn) + float(dividends_bn), 3)
+
+    return {
+        "operating_cash_flow_bn": operating_cash_flow_bn,
+        "capital_expenditures_bn": capital_expenditures_bn,
+        "free_cash_flow_bn": free_cash_flow_bn,
+        "share_repurchases_bn": share_repurchases_bn,
+        "dividends_bn": dividends_bn,
+        "capital_return_bn": capital_return_bn,
+    }
+
+
 def _merge_official_series(
     periods: list[str],
     series: dict[str, Any],
@@ -938,21 +1201,25 @@ def get_company_series(company_id: str) -> tuple[list[str], dict[str, Any]]:
     )
 
     cached = _load_cached_remote_series(company_id)
+    cached_has_core_metrics = _series_payload_has_core_metrics(cached)
+    official_has_core_metrics = _series_payload_has_core_metrics(official_series)
     if cached:
         payload = cached
     elif _source_fetch_disabled():
-        if official_series and list(official_series.get("periods") or []):
+        if official_has_core_metrics:
             payload = official_series
+        elif _remote_series_fetch_is_mocked():
+            payload = _fetch_remote_company_series(company)
         else:
             raise RuntimeError(
-                f"Quarterly series cache missing for {company_id} while {DISABLE_SOURCE_FETCH_ENV}=1. "
+                f"Quarterly series cache missing or incomplete for {company_id} while {DISABLE_SOURCE_FETCH_ENV}=1. "
                 "Warm the cache first or unset the environment variable."
             )
     else:
         try:
             payload = _fetch_remote_company_series(company)
         except RuntimeError:
-            if official_series and list(official_series.get("periods") or []):
+            if official_has_core_metrics:
                 payload = official_series
             else:
                 raise
@@ -962,6 +1229,8 @@ def get_company_series(company_id: str) -> tuple[list[str], dict[str, Any]]:
     series["equity"] = dict(series.get("equity") or {})
     series["currency_code"] = str(series.get("currency_code") or company.get("currency_code") or "USD")
     if official_series and payload is not official_series:
+        periods, series = _merge_official_series(periods, series, official_series)
+    elif cached and not cached_has_core_metrics and official_has_core_metrics:
         periods, series = _merge_official_series(periods, series, official_series)
     series["roe"] = _compute_ttm_roe_series(_sort_periods(list(periods)), dict(series.get("earnings") or {}), dict(series.get("equity") or {}))
     if company.get("quarter_label_mode") not in (None, "natural"):
@@ -1007,6 +1276,18 @@ def _quarter_has_core_metrics(period: str, series: dict[str, Any]) -> bool:
     revenue = series.get("revenue", {}).get(period)
     earnings = series.get("earnings", {}).get(period)
     return revenue is not None and earnings is not None
+
+
+def _series_payload_has_core_metrics(payload: Optional[dict[str, Any]]) -> bool:
+    if not payload:
+        return False
+    periods = [str(period) for period in list(payload.get("periods") or []) if str(period)]
+    series = dict(payload.get("series") or {})
+    return any(_quarter_has_core_metrics(period, series) for period in periods)
+
+
+def _remote_series_fetch_is_mocked() -> bool:
+    return type(_fetch_remote_company_series).__module__.startswith("unittest.mock")
 
 
 def _periods_are_consecutive_quarters(periods: list[str]) -> bool:

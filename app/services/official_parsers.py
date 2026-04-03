@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import calendar
 import copy
+from functools import lru_cache
 from html import unescape
 from itertools import combinations
 import re
@@ -9,9 +10,10 @@ from pathlib import Path
 import threading
 import time
 from typing import Any, Callable, Optional
+import unicodedata
 
 from .charts import format_money_bn, format_pct
-from .local_data import get_company
+from .local_data import get_company, get_segment_alias_map
 from .official_materials import hydrate_source_materials
 from .official_source_resolver import resolve_official_sources
 
@@ -77,6 +79,123 @@ def _clean_mapping(payload: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
+def _guidance_quality_score(guidance: dict[str, Any]) -> int:
+    if not guidance:
+        return 0
+    score = 0
+    mode = str(guidance.get("mode") or "").strip().casefold()
+    if mode == "official":
+        score += 12
+    elif mode == "official_context":
+        score += 6
+    if guidance.get("revenue_bn") is not None:
+        score += 20
+    if guidance.get("revenue_low_bn") is not None and guidance.get("revenue_high_bn") is not None:
+        score += 12
+    if str(guidance.get("commentary") or "").strip():
+        score += 4
+    return score
+
+
+def _merge_guidance_payload(primary: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+    primary = dict(primary or {})
+    fallback = dict(fallback or {})
+    if not primary:
+        return fallback
+    if not fallback:
+        return primary
+    primary_score = _guidance_quality_score(primary)
+    fallback_score = _guidance_quality_score(fallback)
+    winner = dict(primary)
+    loser = dict(fallback)
+    if fallback_score > primary_score:
+        winner, loser = dict(fallback), dict(primary)
+    elif fallback_score == primary_score:
+        primary_has_numeric = _guidance_has_numeric_targets(primary)
+        fallback_has_numeric = _guidance_has_numeric_targets(fallback)
+        if not primary_has_numeric and not fallback_has_numeric:
+            primary_signal = _guidance_excerpt_signal_score(str(primary.get("commentary") or ""))
+            fallback_signal = _guidance_excerpt_signal_score(str(fallback.get("commentary") or ""))
+            if fallback_signal > primary_signal:
+                winner, loser = dict(fallback), dict(primary)
+    for key, value in loser.items():
+        if not _has_value(value):
+            continue
+        if not _has_value(winner.get(key)):
+            winner[key] = value
+    return winner
+
+
+def _prefer_richer_list_replacement(existing_len: int, fallback_len: int) -> bool:
+    return fallback_len > existing_len and (existing_len <= 1 or (existing_len <= 2 and fallback_len >= existing_len + 2))
+
+
+def _structured_item_key(item: dict[str, Any]) -> str:
+    if not isinstance(item, dict):
+        return ""
+    return _normalize_html_table_key(str(item.get("name") or item.get("label") or ""))
+
+
+def _sort_metric_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sorted_items = [dict(item) for item in items if isinstance(item, dict)]
+    sorted_items.sort(
+        key=lambda item: (
+            -float(item.get("value_bn") or 0.0),
+            str(item.get("name") or item.get("label") or ""),
+        )
+    )
+    return sorted_items
+
+
+def _merge_named_metric_lists(primary: list[dict[str, Any]], fallback: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    primary_items = [dict(item) for item in list(primary or []) if isinstance(item, dict)]
+    fallback_items = [dict(item) for item in list(fallback or []) if isinstance(item, dict)]
+    if not primary_items:
+        return _sort_metric_items(fallback_items)
+    if not fallback_items:
+        return _sort_metric_items(primary_items)
+
+    primary_keys = {_structured_item_key(item) for item in primary_items if _structured_item_key(item)}
+    fallback_keys = {_structured_item_key(item) for item in fallback_items if _structured_item_key(item)}
+    overlap = primary_keys & fallback_keys
+    if not overlap:
+        if _prefer_richer_list_replacement(len(primary_items), len(fallback_items)):
+            return _sort_metric_items(fallback_items)
+        return _sort_metric_items(primary_items)
+
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    fallback_map = {
+        key: dict(item)
+        for item in fallback_items
+        if (key := _structured_item_key(item))
+    }
+
+    for item in primary_items:
+        key = _structured_item_key(item)
+        merged_item = dict(item)
+        if key:
+            fallback_item = fallback_map.get(key)
+            if fallback_item is not None:
+                for nested_key, nested_value in fallback_item.items():
+                    if not _has_value(nested_value):
+                        continue
+                    if not _has_value(merged_item.get(nested_key)):
+                        merged_item[nested_key] = nested_value
+                seen.add(key)
+        merged.append(merged_item)
+
+    for item in fallback_items:
+        key = _structured_item_key(item)
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        merged.append(dict(item))
+
+    return _sort_metric_items(merged)
+
+
 def _merge_parsed_payload(primary: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
     if not primary:
         return dict(fallback)
@@ -106,11 +225,17 @@ def _merge_parsed_payload(primary: dict[str, Any], fallback: dict[str, Any]) -> 
                 seen.add(normalized)
             merged[key] = combined
             continue
+        if key in {"current_segments", "current_geographies"} and isinstance(existing, list) and isinstance(value, list):
+            merged[key] = _merge_named_metric_lists(existing, value)
+            continue
         if key in list_prefer_fallback_keys and isinstance(existing, list) and isinstance(value, list):
             existing_len = len(existing)
             fallback_len = len(value)
-            if fallback_len > existing_len and (existing_len <= 1 or (existing_len <= 2 and fallback_len >= existing_len + 2)):
+            if _prefer_richer_list_replacement(existing_len, fallback_len):
                 merged[key] = value
+            continue
+        if key == "guidance" and isinstance(existing, dict) and isinstance(value, dict):
+            merged[key] = _merge_guidance_payload(existing, value)
             continue
         if isinstance(existing, dict) and isinstance(value, dict):
             nested = dict(existing)
@@ -136,8 +261,9 @@ def _merge_parsed_payload(primary: dict[str, Any], fallback: dict[str, Any]) -> 
 
 
 def _clean_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
     return (
-        text.replace("\u00a0", " ")
+        normalized.replace("\u00a0", " ")
         .replace("\u2009", " ")
         .replace("\u202f", " ")
         .replace("\r", " ")
@@ -151,8 +277,17 @@ def _flatten_text(text: str) -> str:
     return re.sub(r"\s+", " ", _clean_text(text)).strip()
 
 
+_HTML_TABLE_KEY_PATTERN = re.compile(r"[^0-9a-z\u4e00-\u9fff]+")
+_HTML_TABLE_ROW_MAP_CACHE: dict[int, dict[str, list[str]]] = {}
+
+
+@lru_cache(maxsize=8192)
+def _normalize_html_table_key_cached(text: str) -> str:
+    return _HTML_TABLE_KEY_PATTERN.sub("", text)
+
+
 def _normalize_html_table_key(text: str) -> str:
-    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(text or "").lower())
+    return _normalize_html_table_key_cached(str(text or "").lower())
 
 
 def _extract_html_tables(html_text: str) -> list[list[list[str]]]:
@@ -235,11 +370,14 @@ def _find_html_table_row(
     rows: list[list[str]],
     labels: list[str],
 ) -> list[str] | None:
-    row_map = {
-        _normalize_html_table_key(row[0]): row
-        for row in rows
-        if row and len(row) > 1 and str(row[0] or "").strip()
-    }
+    row_map = _HTML_TABLE_ROW_MAP_CACHE.get(id(rows))
+    if row_map is None:
+        row_map = {
+            _normalize_html_table_key(row[0]): row
+            for row in rows
+            if row and len(row) > 1 and str(row[0] or "").strip()
+        }
+        _HTML_TABLE_ROW_MAP_CACHE[id(rows)] = row_map
     normalized_labels = [_normalize_html_table_key(label) for label in labels if str(label or "").strip()]
     for normalized_label in normalized_labels:
         for key, row in row_map.items():
@@ -381,6 +519,47 @@ def _calendar_quarter_from_html_date_label(cell_text: str) -> Optional[str]:
     return None
 
 
+def _calendar_quarter_from_year_and_header(year_text: str, header_text: str) -> Optional[str]:
+    year_match = re.fullmatch(r"(?:FY)?(\d{4})", str(year_text or "").strip(), re.IGNORECASE)
+    if not year_match:
+        return None
+    year = int(year_match.group(1))
+    header = str(header_text or "")
+    lowered = header.lower()
+    if "year ended" in lowered or "twelve months ended" in lowered:
+        return f"{year}FY"
+    month_match = re.search(r"(January|February|March|April|May|June|July|August|September|October|November|December)", header, re.IGNORECASE)
+    if month_match:
+        month_lookup = {
+            "january": 1,
+            "february": 2,
+            "march": 3,
+            "april": 4,
+            "may": 5,
+            "june": 6,
+            "july": 7,
+            "august": 8,
+            "september": 9,
+            "october": 10,
+            "november": 11,
+            "december": 12,
+        }
+        month = month_lookup.get(month_match.group(1).lower())
+        if month is not None:
+            return f"{year}Q{((month - 1) // 3) + 1}"
+    chinese_match = re.search(r"(\d{1,2})\s*月", header)
+    if chinese_match:
+        month = int(chinese_match.group(1))
+        if 1 <= month <= 12:
+            return f"{year}Q{((month - 1) // 3) + 1}"
+    iso_match = re.search(r"\d{4}-(\d{2})-(\d{2})", header)
+    if iso_match:
+        month = int(iso_match.group(1))
+        if 1 <= month <= 12:
+            return f"{year}Q{((month - 1) // 3) + 1}"
+    return None
+
+
 def _distribute_html_statement_periods(
     quarters: list[str],
     spans: list[int],
@@ -418,14 +597,45 @@ def _extract_html_statement_period_columns(rows: list[list[str]]) -> list[dict[s
         row_quarters = [quarter for quarter in (_calendar_quarter_from_html_date_label(cell) for cell in row) if quarter]
         if spans and row_quarters:
             return _distribute_html_statement_periods(row_quarters, spans)
-        if spans and row_index + 1 < len(header_rows):
-            next_row_quarters = [
-                quarter
-                for quarter in (_calendar_quarter_from_html_date_label(cell) for cell in header_rows[row_index + 1])
-                if quarter
-            ]
-            if next_row_quarters:
-                return _distribute_html_statement_periods(next_row_quarters, spans)
+        if spans:
+            context_cells = [str(cell) for cell in row if _statement_span_from_html_header(cell) is not None]
+            for lookahead in range(row_index + 1, min(len(header_rows), row_index + 4)):
+                lookahead_row = header_rows[lookahead]
+                next_row_quarters = [
+                    quarter
+                    for quarter in (_calendar_quarter_from_html_date_label(cell) for cell in lookahead_row)
+                    if quarter
+                ]
+                if next_row_quarters:
+                    return _distribute_html_statement_periods(next_row_quarters, spans)
+                next_row_years = [
+                    str(cell).strip()
+                    for cell in lookahead_row
+                    if re.fullmatch(r"(?:FY)?\d{4}", str(cell).strip(), re.IGNORECASE)
+                ]
+                if not next_row_years or not context_cells or len(next_row_years) % len(context_cells) != 0:
+                    continue
+                enriched_context_cells = list(context_cells)
+                for detail_row in header_rows[row_index + 1 : lookahead]:
+                    detail_cells = [str(cell).strip() for cell in detail_row if str(cell).strip()]
+                    if len(detail_cells) != len(enriched_context_cells):
+                        continue
+                    enriched_context_cells = [
+                        f"{enriched_context_cells[index]} {detail_cells[index]}".strip()
+                        for index in range(len(enriched_context_cells))
+                    ]
+                columns: list[dict[str, Any]] = []
+                repeat = len(next_row_years) // len(enriched_context_cells)
+                cursor = 0
+                for context_cell in enriched_context_cells:
+                    span = _statement_span_from_html_header(context_cell) or 1
+                    for year_text in next_row_years[cursor : cursor + repeat]:
+                        quarter = _calendar_quarter_from_year_and_header(year_text, context_cell)
+                        if quarter:
+                            columns.append({"quarter": quarter, "span": span})
+                    cursor += repeat
+                if columns:
+                    return columns
     fallback_quarters = [
         quarter
         for row in header_rows
@@ -762,6 +972,10 @@ def _pick_material(
             label_text = str(item.get("label") or "").lower()
             if any(token in label_text for token in ("nyse", "303a", "governance", "annual meeting")):
                 role_priority -= 4
+            if any(token in label_text for token in ("transcript", "conference call", "prepared remarks", "webcast")):
+                role_priority -= 6
+            if any(token in label_text for token in ("press release", "financial results", "quarterly results", "earnings release")):
+                role_priority += 5
             if raw_path.lower().endswith(".pdf") or url.lower().endswith(".pdf"):
                 role_priority += 2
             if any(token in label_text for token in ("data summary", "view pdf", "download pdf", "pdf")):
@@ -1048,7 +1262,7 @@ def _segment_family(name: str) -> str:
 def _aggregate_segment_candidates(company_id: str) -> set[str]:
     return {
         "apple": {"products"},
-        "alphabet": {"google services"},
+        "alphabet": {"google services", "google properties"},
     }.get(str(company_id), set())
 
 
@@ -1377,6 +1591,7 @@ def _line_numeric_values_without_pct(text: str) -> list[float]:
     return values
 
 
+@lru_cache(maxsize=4096)
 def _quarter_header_sort_key(value: str) -> tuple[int, int]:
     token = str(value or "").strip().upper()
     if not token:
@@ -1403,6 +1618,7 @@ def _quarter_header_sort_key(value: str) -> tuple[int, int]:
     return (0, 0)
 
 
+@lru_cache(maxsize=8192)
 def _parse_text_metric_headers(line: str) -> list[str]:
     headers: list[str] = []
     for token in re.split(r"\s+", _clean_text(str(line or "")).strip()):
@@ -1454,34 +1670,41 @@ def _extract_labeled_text_table_metric(
     lines = [_flatten_text(line) for line in str(raw_text or "").splitlines() if _flatten_text(line)]
     if not lines:
         return (None, None, None)
+    compiled_labels = [
+        (
+            label,
+            re.compile(rf"^{_table_label_pattern(label)}(?=\s+\(?-?[0-9])", flags=re.IGNORECASE),
+            re.compile(rf"^{_table_label_pattern(label)}", flags=re.IGNORECASE),
+        )
+        for label in labels
+    ]
+    parsed_headers = [_parse_text_metric_headers(line) for line in lines]
     best: tuple[Optional[float], Optional[float], Optional[float]] = (None, None, None)
     best_score: tuple[int, float] = (-1, -1.0)
     for index, line in enumerate(lines):
-        matched_label = next(
-            (
-                label
-                for label in labels
-                if re.match(rf"^{_table_label_pattern(label)}(?=\s+\(?-?[0-9])", line, flags=re.IGNORECASE)
-            ),
-            None,
-        )
-        if matched_label is None:
+        matched_pattern: Optional[re.Pattern[str]] = None
+        matched_strip_pattern: Optional[re.Pattern[str]] = None
+        for label, pattern, strip_pattern in compiled_labels:
+            if not pattern.match(line):
+                continue
+            matched_pattern = pattern
+            matched_strip_pattern = strip_pattern
+            matched_label = label
+            break
+        else:
             continue
-        header_line = next(
-            (
-                lines[candidate]
-                for candidate in range(max(0, index - 3), index)
-                if len(_parse_text_metric_headers(lines[candidate])) >= 2
-            ),
-            "",
+        headers = next(
+            (parsed_headers[candidate] for candidate in range(max(0, index - 3), index) if len(parsed_headers[candidate]) >= 2),
+            [],
         )
-        headers = _parse_text_metric_headers(header_line)
         if len(headers) < 2:
             continue
         current_index, prior_index = _pick_text_table_current_prior_indexes(headers)
         if current_index is None:
             continue
-        suffix = re.sub(rf"^{_table_label_pattern(matched_label)}", "", line, count=1, flags=re.IGNORECASE).strip()
+        if matched_pattern is None or matched_strip_pattern is None:
+            continue
+        suffix = matched_strip_pattern.sub("", line, count=1).strip()
         values = _line_numeric_values_without_pct(suffix)
         if len(values) < len(headers):
             continue
@@ -1499,9 +1722,12 @@ def _extract_labeled_text_table_metric(
 
 
 def _extract_narrative_metric(flat_text: str, label_pattern: str) -> tuple[Optional[float], Optional[float]]:
+    qualifier_pattern = r"(?:over|more than|nearly|approximately|approx\.?|about|around|almost|roughly|just over|at least)"
+    amount_pattern = rf"(?:{qualifier_pattern}\s+)?\$?(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>trillion|billion|million|thousand|tn|bn|mn|k)"
     patterns = [
-        rf"(?:reported\s+)?{label_pattern}(?:\s+for\s+the\s+quarter)?(?:\s+(?:was|were|of|totaled|reached|came in at|amounted to))?\s+\$?(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>trillion|billion|million|thousand|tn|bn|mn|k)",
-        rf"\$?(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>trillion|billion|million|thousand|tn|bn|mn|k)\s+(?:of\s+)?{label_pattern}",
+        rf"(?:reported\s+)?{label_pattern}(?:\s+for\s+the\s+quarter)?(?:\s+(?:was|were|of|totaled|reached|came in at|amounted to))?(?:\s+[A-Za-z-]+){{0,5}}\s+{amount_pattern}",
+        rf"{amount_pattern}\s+(?:of|in)\s+{label_pattern}",
+        rf"(?:and\s+)?{amount_pattern}\s+(?:of|in)\s+{label_pattern}",
     ]
     for pattern in patterns:
         match = _search(pattern, flat_text)
@@ -1541,22 +1767,85 @@ def _match_excerpt(flat_text: str, match: re.Match[str], *, before: int = 48, af
 
 def _extract_company_level_narrative_metric(flat_text: str, label_pattern: str) -> tuple[Optional[float], Optional[float]]:
     sentence_lead = r"(?:^|[.;:!?]\s+|•\s+|\u2022\s+)"
+    qualifier_pattern = r"(?:over|more than|nearly|approximately|approx\.?|about|around|almost|roughly|just over|at least)"
+    amount_pattern = rf"(?:{qualifier_pattern}\s+)?\$?(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>billion|million)"
     patterns = [
-        rf"{sentence_lead}(?:reported|generated|posted|delivered|recorded)?\s*(?:the company's\s+)?(?P<label>{label_pattern})(?:\s+for\s+the\s+(?:quarter|period))?(?:\s+(?:was|were|of|totaled|reached|came in at|amounted to))?\s+\$?(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>billion|million)",
-        rf"{sentence_lead}(?:reported|generated|posted|delivered|recorded)\s+\$?(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>billion|million)\s+(?:of\s+)?(?P<label>{label_pattern})",
+        rf"{sentence_lead}(?:reported|generated|posted|delivered|recorded|paid)?\s*(?:the company's\s+)?(?P<label>{label_pattern})(?:\s+for\s+the\s+(?:quarter|period))?(?:\s+(?:was|were|of|totaled|reached|came in at|amounted to))?(?:\s+[A-Za-z-]+){{0,5}}\s+{amount_pattern}",
+        rf"{sentence_lead}(?:reported|generated|posted|delivered|recorded)\s+{amount_pattern}\s+(?:of|in)\s+(?P<label>{label_pattern})",
+        rf"(?P<label>{label_pattern})(?:\s+for\s+the\s+(?:quarter|period))?(?:\s+(?:was|were|of|totaled|reached|came in at|amounted to))?(?:\s+[A-Za-z-]+){{0,6}}\s+{amount_pattern}",
+        rf"(?:reported|generated|posted|delivered|recorded|paid|returned)\s+{amount_pattern}\s+(?:of|in)\s+(?P<label>{label_pattern})",
+        rf"{sentence_lead}[^\.;:!?]{{0,180}}?(?:and\s+)?{amount_pattern}\s+(?:of|in)\s+(?P<label>{label_pattern})",
+        rf"(?:and\s+)?{amount_pattern}\s+(?:of|in)\s+(?P<label>{label_pattern})",
     ]
-    best: tuple[int, Optional[float], Optional[float]] = (-10_000, None, None)
+    best_key: tuple[int, int, float] = (-10_000, -10_000, -1.0)
+    best_value: tuple[Optional[float], Optional[float]] = (None, None)
     for pattern in patterns:
         for match in re.finditer(pattern, flat_text, flags=re.IGNORECASE | re.DOTALL):
             amount = _bn_from_unit(match.group("amount"), match.group("unit"))
             if amount is None:
                 continue
             context = _match_excerpt(flat_text, match).lower()
+            local_context = _match_excerpt(flat_text, match, before=20, after=84).lower()
             score = 0
             if "quarter" in context or "period" in context:
                 score += 3
             if any(token in context for token in ("total revenue", "net revenue", "net operating revenue", "total sales")):
                 score += 4
+            if any(
+                token in context
+                for token in (
+                    "results for the quarter ended",
+                    "following results for the quarter ended",
+                    "revenues for the quarter ended",
+                    "reported results for the quarter ended",
+                    "announced results for the quarter ended",
+                    "for the quarter ended",
+                )
+            ):
+                score += 8
+            if re.search(
+                rf"(?:results|revenues?|sales)[^.!?]{{0,80}}(?:quarter|period) ended[^.!?]{{0,120}}{label_pattern}",
+                context,
+                flags=re.IGNORECASE,
+            ):
+                score += 5
+            if any(
+                token in local_context
+                for token in (
+                    "first quarter",
+                    "second quarter",
+                    "third quarter",
+                    "fourth quarter",
+                    "three months ended",
+                    "quarter ended",
+                    "quarterly",
+                    " q1 ",
+                    " q2 ",
+                    " q3 ",
+                    " q4 ",
+                )
+            ):
+                score += 12
+            if re.search(r"\bq[1-4]\b", local_context, flags=re.IGNORECASE):
+                score += 5
+            if any(
+                token in local_context
+                for token in (
+                    "full year",
+                    "full-year",
+                    "fiscal year",
+                    "annual",
+                    "year ended",
+                    "twelve months ended",
+                )
+            ):
+                score -= 12
+            if re.search(
+                rf"\b20\d{{2}}\s+(?:fiscal\s+year\s+)?(?:{label_pattern})\b",
+                local_context,
+                flags=re.IGNORECASE,
+            ):
+                score -= 14
             if any(
                 token in context
                 for token in (
@@ -1571,11 +1860,471 @@ def _extract_company_level_narrative_metric(flat_text: str, label_pattern: str) 
                 )
             ):
                 score -= 8
-            if any(token in context for token in ("full-year", "fiscal year", "annual")):
+            if any(
+                token in context
+                for token in (
+                    "deferral",
+                    "deferred",
+                    "annualized run rate",
+                    "run rate",
+                    "contributed revenue",
+                    "platform revenue",
+                    "hardware revenue",
+                    "cloud revenue",
+                    "product revenue",
+                    "service revenue",
+                    "service and other revenue",
+                    "xbox",
+                    "surface",
+                    "linkedin",
+                    "office commercial",
+                    "windows oem",
+                )
+            ):
+                score -= 12
+            if any(token in context for token in ("full year", "full-year", "fiscal year", "annual", "year ended", "twelve months ended")):
                 score -= 7
+            tie_break = 0
+            if re.search(
+                rf"(?:^|[.;:!?]\s+)(?:[^.;:!?]{{0,120}})?{label_pattern}(?:\s+for\s+the\s+(?:quarter|period))?(?:\s+(?:was|were|of|totaled|reached|came in at|amounted to))",
+                context,
+                flags=re.IGNORECASE,
+            ):
+                tie_break += 4
+            if any(
+                token in local_context
+                for token in (
+                    "first quarter",
+                    "second quarter",
+                    "third quarter",
+                    "fourth quarter",
+                    "quarter ended",
+                    "three months ended",
+                )
+            ):
+                tie_break += 4
+            if re.search(r"\bq[1-4]\b", local_context, flags=re.IGNORECASE):
+                tie_break += 2
+            if any(
+                token in local_context
+                for token in ("full year", "full-year", "fiscal year", "annual", "year ended", "twelve months ended")
+            ):
+                tie_break -= 4
+            if re.search(
+                rf"\b20\d{{2}}\s+(?:fiscal\s+year\s+)?(?:{label_pattern})\b",
+                local_context,
+                flags=re.IGNORECASE,
+            ):
+                tie_break -= 5
+            if any(token in context for token in ("gaap", "non-gaap")):
+                tie_break += 1
+            candidate_key = (score, tie_break, float(amount))
+            if candidate_key > best_key:
+                best_key = candidate_key
+                best_value = (amount, _extract_growth_from_context(context))
+    return best_value
+
+
+def _scaled_cash_flow_bn(token: Optional[str], scale_to_bn: Optional[float]) -> Optional[float]:
+    value = _parse_number(token)
+    if value is None:
+        return None
+    if scale_to_bn is not None:
+        return float(value) * float(scale_to_bn)
+    return float(value) / 1000 if abs(float(value)) >= 500 else float(value)
+
+
+def _extract_cash_flow_reconciliation_metrics(text: str) -> dict[str, Optional[float]]:
+    raw_text = _clean_text(str(text or ""))
+    if not raw_text:
+        return {
+            "operating_cash_flow_bn": None,
+            "free_cash_flow_bn": None,
+            "capital_expenditures_bn": None,
+        }
+    anchor_pattern = r"Reconciliation from GAAP Net Cash Provided by Operating Activities to Non-GAAP Free Cash Flow"
+    for anchor in re.finditer(anchor_pattern, raw_text, flags=re.IGNORECASE):
+        block = raw_text[anchor.start() : min(len(raw_text), anchor.start() + 1800)]
+        scale_to_bn = _unit_scale_to_bn_from_text(block)
+        operating_match = _search(r"Net cash provided by operating activities\s*\$?\s*\(?([0-9,]+(?:\.[0-9]+)?)\)?", block)
+        free_cash_flow_match = _search(r"Free cash flow\s*\$?\s*\(?([0-9,]+(?:\.[0-9]+)?)\)?", block)
+        capex_match = _search(
+            r"(?:Less:\s*)?(?:purchases of property and equipment|purchases of property, plant and equipment|capital expenditures)"
+            r"\s*\$?\s*\(?([0-9,]+(?:\.[0-9]+)?)\)?",
+            block,
+        )
+        operating_cash_flow_bn = _scaled_cash_flow_bn(operating_match.group(1) if operating_match else None, scale_to_bn)
+        free_cash_flow_bn = _scaled_cash_flow_bn(free_cash_flow_match.group(1) if free_cash_flow_match else None, scale_to_bn)
+        capital_expenditures_bn = _scaled_cash_flow_bn(capex_match.group(1) if capex_match else None, scale_to_bn)
+        if operating_cash_flow_bn is not None or free_cash_flow_bn is not None:
+            return {
+                "operating_cash_flow_bn": operating_cash_flow_bn,
+                "free_cash_flow_bn": free_cash_flow_bn,
+                "capital_expenditures_bn": capital_expenditures_bn,
+            }
+    return {
+        "operating_cash_flow_bn": None,
+        "free_cash_flow_bn": None,
+        "capital_expenditures_bn": None,
+    }
+
+
+def _extract_cash_flow_metrics_from_materials(materials: list[dict[str, Any]]) -> dict[str, Optional[float]]:
+    operating_cash_flow_labels = [
+        "Net cash from operations",
+        "Net cash provided by operating activities",
+        "Cash provided by operating activities",
+        "Cash provided by operations",
+    ]
+    free_cash_flow_labels = [
+        "Free cash flow",
+    ]
+    capital_expenditures_labels = [
+        "Additions to property and equipment",
+        "Purchases of property and equipment",
+        "Purchases of property, plant and equipment",
+        "Payments for acquisition of property, plant and equipment",
+        "Payments for acquisition of property and equipment",
+        "Capital expenditures",
+    ]
+
+    def extract_table_metric(material: dict[str, Any], labels: list[str]) -> Optional[float]:
+        current, _, _ = _extract_html_table_metric_from_material(material, labels)
+        if current is not None:
+            return current
+        raw_text = str(material.get("raw_text") or material.get("flat_text") or "")
+        current, _, _ = _extract_table_metric(raw_text, labels)
+        return current
+
+    def extract_from_subset(subset: list[dict[str, Any]]) -> dict[str, Optional[float]]:
+        operating_cash_flow_bn = None
+        free_cash_flow_bn = None
+        capital_expenditures_bn = None
+        ordered_materials = _ordered_narrative_materials(subset) or list(subset or [])
+        for material in ordered_materials:
+            annual_material = _is_annual_material(material)
+            has_quarterly_cash_flow_context = _material_has_quarterly_cash_flow_context(material)
+            allow_structured_cash_flow = not annual_material or has_quarterly_cash_flow_context
+            raw_text = str(material.get("raw_text") or material.get("flat_text") or "")
+            flat_text = str(material.get("flat_text") or raw_text)
+            if allow_structured_cash_flow:
+                reconciliation_metrics = _extract_cash_flow_reconciliation_metrics(raw_text)
+                if operating_cash_flow_bn is None:
+                    operating_cash_flow_bn = reconciliation_metrics.get("operating_cash_flow_bn")
+                if free_cash_flow_bn is None:
+                    free_cash_flow_bn = reconciliation_metrics.get("free_cash_flow_bn")
+                if capital_expenditures_bn is None:
+                    capital_expenditures_bn = reconciliation_metrics.get("capital_expenditures_bn")
+                if operating_cash_flow_bn is None:
+                    operating_cash_flow_bn = extract_table_metric(material, operating_cash_flow_labels)
+                if free_cash_flow_bn is None:
+                    free_cash_flow_bn = extract_table_metric(material, free_cash_flow_labels)
+                if capital_expenditures_bn is None:
+                    capital_expenditures_bn = extract_table_metric(material, capital_expenditures_labels)
+                    if capital_expenditures_bn is not None:
+                        capital_expenditures_bn = round(abs(float(capital_expenditures_bn)), 3)
+            if operating_cash_flow_bn is None:
+                operating_cash_flow_bn = _extract_cash_flow_narrative_metric(
+                    flat_text,
+                    [
+                        r"(?:operating cash flow|cash flow from operations|net cash provided by operating activities|cash generated by operating activities)",
+                    ],
+                )
+            if free_cash_flow_bn is None:
+                free_cash_flow_bn = _extract_cash_flow_narrative_metric(flat_text, [r"(?:free cash flow)"])
+            if capital_expenditures_bn is None:
+                capital_expenditures_bn = _extract_cash_flow_narrative_metric(
+                    flat_text,
+                    [
+                        r"(?:capital expenditures|purchases of property and equipment|purchases of property, plant and equipment|payments for acquisition of property, plant and equipment|payments for acquisition of property and equipment)",
+                    ],
+                )
+            if free_cash_flow_bn is None and operating_cash_flow_bn is not None and capital_expenditures_bn is not None:
+                free_cash_flow_bn = round(max(float(operating_cash_flow_bn) - float(capital_expenditures_bn), 0.0), 3)
+            if operating_cash_flow_bn is not None and free_cash_flow_bn is not None:
+                break
+        return {
+            "operating_cash_flow_bn": operating_cash_flow_bn,
+            "free_cash_flow_bn": free_cash_flow_bn,
+            "capital_expenditures_bn": capital_expenditures_bn,
+        }
+
+    non_annual_materials = [item for item in list(materials or []) if not _is_annual_material(item)]
+    non_annual_metrics = extract_from_subset(non_annual_materials)
+    if any(value is not None for value in non_annual_metrics.values()):
+        return non_annual_metrics
+    annual_materials = [item for item in list(materials or []) if _is_annual_material(item)]
+    if annual_materials:
+        return extract_from_subset(annual_materials)
+    return non_annual_metrics
+
+def _extract_metric_from_patterns(text: str, patterns: list[str]) -> Optional[float]:
+    return _extract_metric_from_patterns_with_context(text, patterns)
+
+
+def _extract_metric_from_patterns_with_context(
+    text: str,
+    patterns: list[str],
+    *,
+    prefer_quarter_context: bool = False,
+    penalize_cumulative_context: bool = False,
+) -> Optional[float]:
+    quarter_tokens = (
+        "during the quarter",
+        "for the quarter",
+        "in the quarter",
+        "this quarter",
+        "quarter ended",
+        "during the period",
+        "for the period",
+        "in the period",
+    )
+    cumulative_tokens = (
+        "cumulative",
+        "cumulative payments",
+        "since inception",
+        "since the inception",
+        "to date",
+        "through our capital return program",
+        "through the capital return program",
+        "bringing cumulative",
+        "bringing the total",
+        "bringing total",
+    )
+    best: tuple[int, Optional[float]] = (-10_000, None)
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE | re.DOTALL):
+            amount = _bn_from_unit(match.group("amount"), match.group("unit"))
+            if amount is None:
+                continue
+            context = _match_excerpt(text, match, before=80, after=220).lower()
+            score = 0
+            if prefer_quarter_context:
+                if any(token in context for token in quarter_tokens):
+                    score += 8
+                elif "quarter" in context or "period" in context:
+                    score += 3
+            if penalize_cumulative_context:
+                if any(token in context for token in cumulative_tokens):
+                    score -= 10
+                if "capital return program" in context and not any(token in context for token in quarter_tokens):
+                    score -= 4
+            if any(token in context for token in ("investors", "shareholders", "repurchases", "buybacks", "dividends")):
+                score += 2
             if score > best[0]:
-                best = (score, amount, _extract_growth_from_context(context))
-    return (best[1], best[2])
+                best = (score, amount)
+    return best[1]
+
+
+def _extract_cash_flow_narrative_metric(flat_text: str, label_patterns: list[str]) -> Optional[float]:
+    qualifier_pattern = r"(?:over|more than|nearly|approximately|approx\.?|about|around|almost|roughly|just over|at least)"
+    amount_pattern = rf"(?:{qualifier_pattern}\s+)?\$?(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>trillion|billion|million|thousand|tn|bn|mn|k)"
+    patterns: list[str] = []
+    for label_pattern in label_patterns:
+        patterns.extend(
+            [
+                rf"{label_pattern}(?:\s+for\s+the\s+(?:quarter|period))?(?:\s+(?:was|were|of|totaled|reached|came in at|amounted to))?(?:\s+[A-Za-z-]+){{0,6}}\s+{amount_pattern}",
+                rf"{amount_pattern}\s+(?:of|in)\s+{label_pattern}",
+                rf"{amount_pattern}\s+(?:for)\s+{label_pattern}",
+            ]
+        )
+    return _extract_metric_from_patterns_with_context(
+        flat_text,
+        patterns,
+        prefer_quarter_context=True,
+        penalize_cumulative_context=True,
+    )
+
+
+def _material_has_quarterly_cash_flow_context(material: Optional[dict[str, Any]]) -> bool:
+    if material is None:
+        return False
+    context = _flatten_text(
+        " ".join(
+            str(material.get(key) or "")
+            for key in ("label", "title", "raw_text", "flat_text")
+        )
+    ).lower()
+    if not context:
+        return False
+    quarter_tokens = (
+        "three months ended",
+        "quarter ended",
+        "for the quarter",
+        "during the quarter",
+        "in the quarter",
+        "this quarter",
+        "quarterly",
+        "first quarter",
+        "second quarter",
+        "third quarter",
+        "fourth quarter",
+    )
+    if any(token in context for token in quarter_tokens):
+        return True
+    return bool(re.search(r"\bq[1-4]\b", context, flags=re.IGNORECASE))
+
+
+def _label_candidate_text(text: str, label: str, *, max_windows: int = 8) -> str:
+    raw_text = _flatten_text(str(text or ""))
+    if not raw_text:
+        return ""
+    if len(raw_text) <= 4000:
+        return raw_text
+    normalized_label = _flatten_text(label)
+    if not normalized_label:
+        return raw_text[:900]
+
+    label_tokens = [re.escape(token) for token in normalized_label.split() if token]
+    if not label_tokens:
+        return raw_text[:900]
+    label_body = r"\s+".join(label_tokens)
+    label_pattern = re.compile(rf"(?<!\w){label_body}(?!\w)", flags=re.IGNORECASE)
+
+    windows: list[str] = []
+    seen: set[str] = set()
+
+    def _add_window(value: str) -> None:
+        flattened = _flatten_text(value).strip(" .,;:-")
+        if not flattened:
+            return
+        normalized = flattened.casefold()
+        if normalized in seen:
+            return
+        windows.append(flattened[:720])
+        seen.add(normalized)
+
+    for match in label_pattern.finditer(raw_text):
+        start = max(0, match.start() - max(72, len(normalized_label)))
+        end = min(len(raw_text), match.end() + 420)
+        _add_window(raw_text[start:end])
+        if len(windows) >= max_windows:
+            break
+
+    if windows:
+        return " ".join(windows[:max_windows])[:1400]
+    return ""
+
+
+def _extract_shareholder_return_metrics_from_materials(materials: list[dict[str, Any]]) -> dict[str, Optional[float]]:
+    def extract_from_subset(subset: list[dict[str, Any]]) -> dict[str, Optional[float]]:
+        capital_return_bn = None
+        share_repurchases_bn = None
+        dividends_bn = None
+        ordered_materials = _ordered_narrative_materials(subset) or list(subset or [])
+        for material in ordered_materials:
+            flat_text = str(material.get("flat_text") or material.get("raw_text") or "")
+            if capital_return_bn is None:
+                capital_return_bn = _extract_metric_from_patterns_with_context(
+                    flat_text,
+                    [
+                        r"returned\s+(?:(?:over|more than|nearly|approximately|approx\.?|about|around|almost|roughly|just over|at least)\s+)?\$?(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>billion|million)\s+(?:to\s+investors|to\s+shareholders)",
+                        r"(?:capital return program|capital return|shareholder return)(?:\s+(?:was|were|of|totaled|amounted to|to))?(?:\s+[A-Za-z-]+){0,4}\s+(?:(?:over|more than|nearly|approximately|approx\.?|about|around|almost|roughly|just over|at least)\s+)?\$?(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>billion|million)",
+                    ],
+                    prefer_quarter_context=True,
+                    penalize_cumulative_context=True,
+                )
+            if share_repurchases_bn is None:
+                share_repurchases_bn = _extract_metric_from_patterns(
+                    flat_text,
+                    [
+                        r"(?:repurchased|repurchases of|share repurchases? of|buybacks? of)\s+\$?(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>billion|million)\s+(?:of\s+)?(?:common stock|shares|stock)",
+                        r"\$?(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>billion|million)\s+(?:of\s+)?(?:common stock\s+)?(?:repurchases|buybacks?)",
+                    ],
+                )
+            if dividends_bn is None:
+                dividends_bn = _extract_metric_from_patterns(
+                    flat_text,
+                    [
+                        r"(?:paid|declared)\s+\$?(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>billion|million)\s+(?:of\s+)?dividends?(?: and dividend equivalents)?",
+                        r"dividends?(?: and dividend equivalents)?(?:\s+(?:was|were|of|totaled|amounted to))?(?:\s+[A-Za-z-]+){0,4}\s+\$?(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>billion|million)",
+                    ],
+                )
+            if capital_return_bn is None and share_repurchases_bn is not None and dividends_bn is not None:
+                capital_return_bn = round(float(share_repurchases_bn) + float(dividends_bn), 3)
+            if capital_return_bn is not None and share_repurchases_bn is not None and dividends_bn is not None:
+                break
+        return {
+            "capital_return_bn": capital_return_bn,
+            "share_repurchases_bn": share_repurchases_bn,
+            "dividends_bn": dividends_bn,
+        }
+
+    non_annual_materials = [item for item in list(materials or []) if not _is_annual_material(item)]
+    non_annual_metrics = extract_from_subset(non_annual_materials)
+    if any(value is not None for value in non_annual_metrics.values()):
+        return non_annual_metrics
+    annual_materials = [item for item in list(materials or []) if _is_annual_material(item)]
+    if annual_materials:
+        return extract_from_subset(annual_materials)
+    return non_annual_metrics
+
+
+def _extract_preferred_table_metric(
+    texts: list[str],
+    labels: list[str],
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    for text in texts:
+        current, prior, yoy = _extract_table_metric(text, labels)
+        if current is not None:
+            return (current, prior, yoy)
+    return (None, None, None)
+
+
+def _material_reference_text(material: dict[str, Any]) -> str:
+    return " ".join(
+        str(material.get(key) or "")
+        for key in ("label", "kind", "role", "form", "url", "raw_path")
+    ).lower()
+
+
+def _is_annual_filing_material(material: dict[str, Any]) -> bool:
+    if str(material.get("kind") or "") != "sec_filing":
+        return False
+    reference = _material_reference_text(material)
+    return any(token in reference for token in ("10-k", "10k", "20-f", "20f", "annual report"))
+
+
+def _apple_preferred_source_materials(
+    materials: list[dict[str, Any]],
+    *,
+    purpose: str,
+) -> list[dict[str, Any]]:
+    ordered: list[dict[str, Any]] = []
+
+    def append_matches(predicate: Callable[[dict[str, Any]], bool]) -> None:
+        for item in materials:
+            if item in ordered:
+                continue
+            if predicate(item):
+                ordered.append(item)
+
+    if purpose == "structure":
+        append_matches(lambda item: str(item.get("kind") or "") == "call_summary")
+        append_matches(lambda item: str(item.get("kind") or "") == "sec_filing" and not _is_annual_filing_material(item))
+        append_matches(lambda item: str(item.get("kind") or "") == "official_release")
+    else:
+        append_matches(lambda item: str(item.get("kind") or "") == "official_release")
+        append_matches(lambda item: str(item.get("kind") or "") == "call_summary")
+        append_matches(lambda item: str(item.get("kind") or "") == "sec_filing" and not _is_annual_filing_material(item))
+
+    append_matches(lambda item: str(item.get("kind") or "") == "sec_filing" and _is_annual_filing_material(item))
+    append_matches(lambda item: True)
+    return ordered
+
+
+def _extract_preferred_material_metric(
+    materials: list[dict[str, Any]],
+    labels: list[str],
+    *,
+    purpose: str,
+) -> tuple[Optional[float], Optional[float], Optional[float], Optional[dict[str, Any]]]:
+    for material in _apple_preferred_source_materials(materials, purpose=purpose):
+        text = str(material.get("raw_text") or material.get("flat_text") or "")
+        current, prior, yoy = _extract_table_metric(text, labels)
+        if current is not None:
+            return (current, prior, yoy, material)
+    return (None, None, None, None)
 
 
 def _statement_value_pair(flat_text: str, label_pattern: str) -> tuple[Optional[float], Optional[float]]:
@@ -1699,6 +2448,7 @@ def _should_prefer_adjusted_profit_signal(
 def _extract_narrative_eps(flat_text: str) -> tuple[Optional[float], Optional[float]]:
     patterns = [
         r"(?:diluted\s+)?earnings per share(?:\s+\(gaap\))?(?:\s+(?:was|were|of))?\s+\$?(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<context>.{0,120})",
+        r"quarterly earnings per diluted share(?:\s+(?:was|were|of))?\s+\$?(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<context>.{0,120})",
         r"(?:gaap\s+)?eps(?:\s+(?:was|were|of))?\s+\$?(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<context>.{0,120})",
     ]
     for pattern in patterns:
@@ -1781,8 +2531,11 @@ def _extract_scaled_label_value(
 
 _BALANCE_SHEET_UNIT_PATTERNS: list[tuple[str, float]] = [
     (r"\(?(?:dollars?\s+in|in)\s+billions\)?", 1.0),
+    (r"\(?(?:in)\s+(?:nt\$|us\$|rmb|eur|jpy|cny)\s+billions\)?", 1.0),
     (r"\(?(?:dollars?\s+in|in)\s+millions(?:\s+except\s+per\s+share\s+amounts?)?\)?", 0.001),
+    (r"\(?(?:in)\s+(?:nt\$|us\$|rmb|eur|jpy|cny)\s+millions(?:\s+except\s+per\s+share\s+amounts?)?\)?", 0.001),
     (r"\(?(?:dollars?\s+in|in)\s+thousands\)?", 0.000001),
+    (r"\(?(?:in)\s+(?:nt\$|us\$|rmb|eur|jpy|cny)\s+thousands\)?", 0.000001),
 ]
 
 
@@ -1844,7 +2597,7 @@ def _normalize_ending_equity_bn(
             shrunk = normalized / 1000.0
             if abs(shrunk - fallback_value) / max(abs(fallback_value), 1.0) <= 0.4:
                 return shrunk
-        if revenue_value not in (None, 0) and normalized / revenue_value > 60:
+        if revenue_value not in (None, 0) and normalized > 10_000 and normalized / revenue_value > 400:
             return normalized / 1000.0
     return normalized
 
@@ -1912,6 +2665,7 @@ COMPANY_SEGMENT_PROFILES: dict[str, list[dict[str, Any]]] = {
         {"name": "iPhone and related products and services", "labels": ["iPhone and related products and services", "iPhone and related products and services (f)"]},
         {"name": "Mac", "labels": ["Mac", "Total Mac net sales"]},
         {"name": "iPad", "labels": ["iPad"]},
+        {"name": "Other Products", "labels": ["Other Products"]},
         {"name": "Wearables, Home and Accessories", "labels": ["Wearables, Home and Accessories", "Wearables, Home & Accessories"]},
         {"name": "Services", "labels": ["Services"]},
         {"name": "Products", "labels": ["Products"]},
@@ -2095,11 +2849,7 @@ def _segment_profiles_for_company(company_id: str) -> list[dict[str, Any]]:
     except Exception:
         company = {}
 
-    alias_map = {
-        str(alias).strip(): str(canonical).strip()
-        for alias, canonical in dict(company.get("segment_aliases") or {}).items()
-        if str(alias).strip() and str(canonical).strip()
-    }
+    alias_map = get_segment_alias_map(company, allow_rollups=False)
     canonical_aliases: dict[str, list[str]] = {}
     for alias, canonical in alias_map.items():
         canonical_aliases.setdefault(canonical, []).append(alias)
@@ -2440,7 +3190,7 @@ def _report_year_from_fallback(fallback: dict[str, Any]) -> Optional[int]:
     return None
 
 
-def _text_has_implausible_future_year(text: Optional[str], report_year: Optional[int], *, max_gap: int = 3) -> bool:
+def _text_has_implausible_future_year(text: Optional[str], report_year: Optional[int], *, max_gap: int = 1) -> bool:
     if report_year is None or not text:
         return False
     current_year = time.localtime().tm_year
@@ -3425,6 +4175,7 @@ def _extract_segment_metric(
 ) -> tuple[Optional[float], Optional[float]]:
     raw_text = str(material.get("raw_text") or "")
     flat_text = material["flat_text"]
+    annual_sec_filing = material.get("kind") == "sec_filing" and _is_annual_material(material)
 
     def _table_metric() -> tuple[Optional[float], Optional[float], Optional[float]]:
         html_current, html_prior, html_yoy = _extract_html_table_metric_from_material(material, labels)
@@ -3444,11 +4195,16 @@ def _extract_segment_metric(
         current, prior, yoy = _table_metric()
         if current is not None:
             return (current, yoy if yoy is not None else _pct_change(current, prior))
+        if annual_sec_filing:
+            return (None, None)
     for label in labels:
-        narrative_value, narrative_yoy = _extract_segment_narrative_metric(flat_text, label)
+        narrowed_text = _label_candidate_text(flat_text, label)
+        if not narrowed_text:
+            continue
+        narrative_value, narrative_yoy = _extract_segment_narrative_metric(narrowed_text, label)
         if narrative_value is not None and (narrative_yoy is None or abs(float(narrative_yoy)) <= 500):
             return (narrative_value, narrative_yoy)
-        narrative_value, narrative_yoy = _extract_narrative_metric(flat_text, re.escape(label))
+        narrative_value, narrative_yoy = _extract_contextual_segment_metric(narrowed_text, label)
         if narrative_value is not None:
             return (narrative_value, narrative_yoy)
     if not prefer_table:
@@ -3491,12 +4247,27 @@ _SUSPICIOUS_GENERIC_SEGMENT_NAME_PATTERNS = (
     r"\btrademark\b",
 )
 
+_FRAGMENTARY_GENERIC_SEGMENT_NAME_PATTERNS = (
+    r"^[0-9]",
+    r"\b(?:million|billion|trillion|thousand|percent|percentage)\b",
+    r"\b(?:revenue|sales)\s+(?:was|were|increased|decreased|declined|grew|rose|fell|deliver(?:ed)?)\b",
+    r"\b(?:increased|decreased|declined|grew|rose|fell|deliver(?:ed)?|driven|offset)\b",
+    r"\b(?:in|of|for|to|or|and)\s*$",
+)
+
 
 def _segment_name_looks_suspicious(name: str) -> bool:
     normalized = _flatten_text(name).casefold()
     if not normalized:
         return True
     return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in _SUSPICIOUS_GENERIC_SEGMENT_NAME_PATTERNS)
+
+
+def _generic_segment_name_looks_fragmentary(name: str) -> bool:
+    normalized = _flatten_text(name).casefold()
+    if not normalized:
+        return True
+    return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in _FRAGMENTARY_GENERIC_SEGMENT_NAME_PATTERNS)
 
 
 def _generic_segment_name_from_line(line: str) -> Optional[str]:
@@ -3510,6 +4281,7 @@ def _generic_segment_name_from_line(line: str) -> Optional[str]:
         or len(name) > 80
         or normalized in SEGMENT_DISCOVERY_ROW_BLACKLIST
         or _segment_name_looks_suspicious(name)
+        or _generic_segment_name_looks_fragmentary(name)
         or name.startswith(("※", "•", "-", "*"))
         or any(token in normalized for token in ("results", "outlook", "financial data", "growth", "quarterly"))
     ):
@@ -3751,6 +4523,111 @@ def _extract_profiled_segments_from_html_tables(
     return best
 
 
+def _canonical_segment_candidate_name(company_id: str, name: str) -> str:
+    normalized_name = str(name or "").strip()
+    if not normalized_name:
+        return ""
+    name_key = _normalize_html_table_key(normalized_name)
+    for profile in _segment_profiles_for_company(company_id):
+        profile_name = str(profile.get("name") or "").strip()
+        variants = [profile_name] + [str(item) for item in list(profile.get("labels") or [])]
+        for variant in variants:
+            variant_key = _normalize_html_table_key(variant)
+            if not variant_key:
+                continue
+            if name_key == variant_key or name_key.startswith(variant_key) or variant_key.startswith(name_key):
+                return profile_name or normalized_name
+    return normalized_name
+
+
+def _segment_candidate_priority(material_kind: str, source_kind: str, material_index: int, candidate_index: int) -> tuple[int, int, int, int]:
+    material_rank = {
+        "official_release": 0,
+        "presentation": 1,
+        "call_summary": 2,
+        "sec_filing": 3,
+    }.get(str(material_kind or ""), 4)
+    source_rank = {
+        "profiled_html": 0,
+        "profiled_material": 1,
+        "generic_material": 2,
+    }.get(str(source_kind or ""), 3)
+    return (material_rank, source_rank, material_index, candidate_index)
+
+
+def _merge_segment_candidates(
+    company_id: str,
+    candidates: list[dict[str, Any]],
+    revenue_bn: Optional[float],
+) -> list[dict[str, Any]]:
+    profiles = _segment_profiles_for_company(company_id)
+    ordered_profile_names = [str(profile.get("name") or "").strip() for profile in profiles if str(profile.get("name") or "").strip()]
+    if not ordered_profile_names or not candidates:
+        return []
+
+    best_items: dict[str, dict[str, Any]] = {}
+    best_priorities: dict[str, tuple[int, int, int, int]] = {}
+
+    for candidate_index, candidate in enumerate(candidates):
+        priority = _segment_candidate_priority(
+            str(candidate.get("material_kind") or ""),
+            str(candidate.get("source_kind") or ""),
+            int(candidate.get("material_index") or 0),
+            candidate_index,
+        )
+        for item in list(candidate.get("segments") or []):
+            if not isinstance(item, dict):
+                continue
+            canonical_name = _canonical_segment_candidate_name(company_id, str(item.get("name") or ""))
+            if canonical_name not in ordered_profile_names:
+                continue
+            existing_priority = best_priorities.get(canonical_name)
+            if existing_priority is None or priority < existing_priority:
+                best_priorities[canonical_name] = priority
+                best_items[canonical_name] = dict(item, name=canonical_name)
+                continue
+            if priority == existing_priority:
+                merged_item = dict(best_items[canonical_name])
+                for key, value in item.items():
+                    if not _has_value(value):
+                        continue
+                    if not _has_value(merged_item.get(key)):
+                        merged_item[key] = value
+                best_items[canonical_name] = merged_item
+
+    merged = [best_items[name] for name in ordered_profile_names if name in best_items]
+    if len(merged) < 2:
+        return []
+    lower_ratio, upper_ratio = COMPANY_SEGMENT_RATIO_BOUNDS.get(str(company_id), (0.55, 1.35))
+    if not _segments_reasonable_for_revenue(merged, revenue_bn, lower_ratio=lower_ratio, upper_ratio=upper_ratio):
+        return []
+    return _sort_metric_items(merged)
+
+
+def _segment_material_supports_quarter_snapshot(
+    material: dict[str, Any],
+    target_calendar_quarter: Optional[str],
+) -> bool:
+    if str(material.get("kind") or "") != "sec_filing":
+        return True
+    if not _is_annual_material(material):
+        return True
+    return not bool(str(target_calendar_quarter or "").strip())
+
+
+def _prepare_segment_candidate(
+    company_id: str,
+    segments: list[dict[str, Any]],
+    revenue_bn: Optional[float],
+) -> list[dict[str, Any]]:
+    if len(list(segments or [])) < 2:
+        return []
+    pruned = _prune_overlapping_segments(company_id, list(segments or []), revenue_bn)
+    if len(pruned) < 2:
+        return []
+    return _sort_metric_items(pruned)
+
+
 def _extract_company_segments(
     company_id: str,
     materials: list[dict[str, Any]],
@@ -3768,14 +4645,18 @@ def _extract_company_segments(
 
     best_candidate: list[dict[str, Any]] = []
     best_score = float("-inf")
+    candidate_records: list[dict[str, Any]] = []
 
-    for material in ordered_materials:
+    for material_index, material in enumerate(ordered_materials):
+        if not _segment_material_supports_quarter_snapshot(material, target_calendar_quarter):
+            continue
         html_candidate = _extract_profiled_segments_from_html_tables(
             company_id,
             material,
             revenue_bn,
             target_calendar_quarter,
         )
+        html_candidate = _prepare_segment_candidate(company_id, html_candidate, revenue_bn)
         html_score = _score_segment_candidate(
             company_id,
             html_candidate,
@@ -3783,6 +4664,16 @@ def _extract_company_segments(
             context_text=str(material.get("label") or ""),
             source_kind="profiled_html",
         )
+        if html_candidate:
+            candidate_records.append(
+                {
+                    "segments": list(html_candidate),
+                    "score": html_score,
+                    "source_kind": "profiled_html",
+                    "material_kind": str(material.get("kind") or ""),
+                    "material_index": material_index,
+                }
+            )
         if html_score > best_score:
             best_candidate = html_candidate
             best_score = html_score
@@ -3799,7 +4690,7 @@ def _extract_company_segments(
             item = _segment(str(profile["name"]), value_bn, yoy_pct)
             if item is not None:
                 material_segments.append(item)
-        profiled_candidate = list(material_segments)
+        profiled_candidate = _prepare_segment_candidate(company_id, material_segments, revenue_bn)
         profiled_score = _score_segment_candidate(
             company_id,
             profiled_candidate,
@@ -3807,12 +4698,23 @@ def _extract_company_segments(
             context_text=f"{material.get('kind') or ''} {material.get('label') or ''}",
             source_kind="profiled_material",
         )
+        if profiled_candidate:
+            candidate_records.append(
+                {
+                    "segments": list(profiled_candidate),
+                    "score": profiled_score,
+                    "source_kind": "profiled_material",
+                    "material_kind": str(material.get("kind") or ""),
+                    "material_index": material_index,
+                }
+            )
         if profiled_score > best_score:
             best_candidate = profiled_candidate
             best_score = profiled_score
 
-    generic_segments: list[dict[str, Any]] = []
-    for material in ordered_materials:
+    for material_index, material in enumerate(ordered_materials):
+        if material.get("kind") == "sec_filing" and _is_annual_material(material):
+            continue
         candidate = _extract_generic_segments_from_material(company_id, material, revenue_bn)
         candidate_score = _score_segment_candidate(
             company_id,
@@ -3821,12 +4723,31 @@ def _extract_company_segments(
             context_text=f"{material.get('kind') or ''} {material.get('label') or ''}",
             source_kind="generic_material",
         )
+        if candidate:
+            candidate_records.append(
+                {
+                    "segments": list(candidate),
+                    "score": candidate_score,
+                    "source_kind": "generic_material",
+                    "material_kind": str(material.get("kind") or ""),
+                    "material_index": material_index,
+                }
+            )
         if candidate_score > best_score:
             best_candidate = candidate
             best_score = candidate_score
-        if candidate_score > float("-inf"):
-            generic_segments = candidate
-    best_candidate.sort(key=lambda item: float(item.get("value_bn") or 0.0), reverse=True)
+    merged_candidate = _merge_segment_candidates(company_id, candidate_records, revenue_bn)
+    merged_score = _score_segment_candidate(
+        company_id,
+        merged_candidate,
+        revenue_bn,
+        context_text="merged segment evidence",
+        source_kind="profiled_material",
+    )
+    if merged_candidate and (len(merged_candidate) >= len(best_candidate) or merged_score >= best_score):
+        best_candidate = merged_candidate
+        best_score = merged_score
+    best_candidate = _sort_metric_items(best_candidate)
     return best_candidate
 
 
@@ -3854,16 +4775,205 @@ def _extract_segment_narrative_metric(flat_text: str, label: str) -> tuple[Optio
     return (None, None)
 
 
-def _excerpt_around(flat_text: str, match: re.Match[str], width: int = 180) -> str:
+_SEGMENT_METRIC_NEGATIVE_TOKENS = (
+    "deferred revenue",
+    "goodwill",
+    "restructuring",
+    "restructuring charge",
+    "restructuring charges",
+    "integration cost",
+    "integration costs",
+    "impairment",
+    "liability",
+    "liabilities",
+    "balance sheet",
+    "balance sheets",
+    "balance",
+    "balances",
+    "asset",
+    "assets",
+    "cash flow",
+    "cash flows",
+    "operating income",
+    "gross margin",
+    "operating margin",
+    "inventory",
+    "expense",
+    "expenses",
+    "charge",
+    "charges",
+)
+
+
+def _segment_metric_context_score(context: str, label_pattern: str) -> int:
+    lowered = _flatten_text(context).lower()
+    if not lowered:
+        return -100
+    score = 0
+    if re.search(rf"{label_pattern}[^.!?]{{0,36}}(?:revenue|revenues|sales|net sales)", lowered, flags=re.IGNORECASE):
+        score += 10
+    if re.search(rf"(?:revenue|revenues|sales|net sales)[^.!?]{{0,36}}{label_pattern}", lowered, flags=re.IGNORECASE):
+        score += 10
+    if any(token in lowered for token in ("quarter", "quarterly", "results", "segment results")):
+        score += 3
+    if any(token in lowered for token in _SEGMENT_METRIC_NEGATIVE_TOKENS):
+        score -= 18
+    if "deferred revenue" in lowered:
+        score -= 8
+    return score
+
+
+def _extract_contextual_segment_metric(flat_text: str, label: str) -> tuple[Optional[float], Optional[float]]:
+    label_pattern = re.escape(label)
+    qualifier_pattern = r"(?:over|more than|nearly|approximately|approx\.?|about|around|almost|roughly|just over|at least)"
+    amount_pattern = rf"(?:{qualifier_pattern}\s+)?\$?(?P<amount>[0-9,]+(?:\.[0-9]+)?)\s*(?P<unit>trillion|billion|million|thousand|tn|bn|mn|k)"
+    patterns = [
+        rf"(?:reported\s+)?{label_pattern}(?:\s+(?:segment\s+)?(?:revenue|revenues|sales))?(?:\s+(?:for\s+the\s+quarter))?(?:\s+(?:was|were|of|totaled|reached|came in at|amounted to))?(?:\s+[A-Za-z-]+){{0,6}}\s+{amount_pattern}",
+        rf"(?:reported|generated|posted|delivered|recorded)\s+{amount_pattern}\s+(?:of|in)\s+{label_pattern}(?:\s+(?:revenue|revenues|sales))?",
+        rf"{amount_pattern}\s+(?:of|in)\s+{label_pattern}(?:\s+(?:revenue|revenues|sales))?",
+    ]
+    best_key: tuple[int, float] = (-1000, -1.0)
+    best_value: tuple[Optional[float], Optional[float]] = (None, None)
+    for pattern in patterns:
+        for match in re.finditer(pattern, flat_text, flags=re.IGNORECASE | re.DOTALL):
+            amount = _bn_from_unit(match.group("amount"), match.group("unit"))
+            if amount is None:
+                continue
+            context = _match_excerpt(flat_text, match, before=40, after=180)
+            score = _segment_metric_context_score(context, label_pattern)
+            if score < 4:
+                continue
+            candidate_key = (score, float(amount))
+            if candidate_key > best_key:
+                best_key = candidate_key
+                best_value = (amount, _extract_growth_from_context(context))
+    return best_value
+
+
+def _excerpt_around(flat_text: str, match: re.Match[str], width: int = 480) -> str:
     start = max(0, match.start() - 20)
     end = min(len(flat_text), match.end() + width)
+    while start > 0 and flat_text[start - 1].isalnum():
+        start -= 1
+    while end < len(flat_text) and flat_text[end].isalnum():
+        end += 1
     return flat_text[start:end].strip(" .,;")
 
 
-def _guidance_excerpt_has_signal(text: str) -> bool:
+def _guidance_excerpt_is_boilerplate(text: str) -> bool:
     lowered = _flatten_text(text).lower()
     if not lowered:
         return False
+    if (
+        "provide forward-looking guidance" in lowered
+        and "conference call" in lowered
+        and "webcast" in lowered
+        and "quarterly earnings announcement" in lowered
+    ):
+        return True
+    boilerplate_patterns = (
+        r"business outlook[^.]{0,220}conference call and webcast",
+        r"forward-looking guidance[^.]{0,220}conference call and webcast",
+        r"guidance[^.]{0,220}will be provided[^.]{0,220}(?:conference call|webcast)",
+        r"guidance[^.]{0,220}in connection with this quarterly earnings announcement",
+    )
+    return any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in boilerplate_patterns)
+
+
+GUIDANCE_EXPLICIT_TOKENS = ("guidance", "outlook", "business outlook", "forecast")
+GUIDANCE_FORWARD_PATTERN = (
+    r"\b(expect|expects|expected|anticipate|anticipates|forecast|forecasts|project|projects|projected|"
+    r"continue|continues|continuing|remain|remains|support|supports|invest|invests|investing|"
+    r"should|will|likely)\b"
+)
+GUIDANCE_TIME_PATTERN = (
+    r"\b(next|coming|current|following)\s+(?:quarter|year)\b|"
+    r"\b(?:first|second|third|fourth)\s+quarter(?:\s+of\s+(?:20\d{2}|'?\d{2}))?\b|"
+    r"\bq[1-4](?:\s+(?:20\d{2}|'?\d{2}))?\b|"
+    r"\b(?:in|for|after)\s+20\d{2}\b|"
+    r"\b(?:for|after)\s+the\s+(?:first|second|third|fourth)\s+quarter\s+of\s+(?:20\d{2}|'?\d{2})\b"
+)
+GUIDANCE_METRIC_TOKENS = (
+    "revenue",
+    "revenues",
+    "sales",
+    "demand",
+    "orders",
+    "bookings",
+    "backlog",
+    "gross margin",
+    "margin",
+    "inventory",
+    "pricing",
+    "shipments",
+    "capex",
+    "capital expenditures",
+    "capital allocation",
+    "tac",
+    "sites tac",
+    "traffic acquisition costs",
+    "opex",
+    "operating expenses",
+    "headcount",
+    "hiring",
+    "marketing spend",
+    "investment",
+    "investments",
+    "resources",
+    "utilization",
+    "growth",
+    "cloud",
+    "hardware",
+    "youtube",
+    "advertising",
+    "ads",
+    "other bets",
+)
+
+
+def _guidance_excerpt_signal_score(text: str) -> int:
+    lowered = _flatten_text(text).lower()
+    if not lowered:
+        return -100
+    if _guidance_excerpt_is_boilerplate(lowered):
+        return -100
+    noisy_phrases = (
+        "recent accounting guidance",
+        "recently adopted accounting guidance",
+        "business outlook for the investee",
+        "expected credit loss",
+        "credit loss methodology",
+        "foreign exchange contracts",
+        "forecasted revenues when recognized",
+        "hedge our forecasted revenues",
+        "cash flow hedges",
+    )
+    if any(phrase in lowered for phrase in noisy_phrases):
+        return -100
+    negative_phrases = (
+        "repurchase",
+        "buyback",
+        "stock award",
+        "stock awards",
+        "alphabet stock",
+        "settle these awards",
+        "settled in stock",
+        "share-based compensation",
+        "stock-based compensation",
+        "privately negotiated transactions",
+        "rule 10b5-1",
+        "10b5-1",
+        "forward-looking statements",
+        "risks and uncertainties",
+        "risk factors discussed",
+        "could cause actual results to differ materially",
+        "for more information, please refer to the risk factors",
+        "expected performance of our businesses",
+        "insufficient revenues from such investments",
+        "new liabilities assumed",
+    )
+    if any(phrase in lowered for phrase in negative_phrases):
+        return -100
     noise_tokens = (
         "income tax",
         "tax positions",
@@ -3875,43 +4985,259 @@ def _guidance_excerpt_has_signal(text: str) -> bool:
         "note 2",
         "note 3",
         "note 4",
+        "earnings per share",
+        "basic and diluted",
+        "deferred revenue",
+        "one-to-two years",
+        "two-to-three years",
+        "greater than three years",
         "accounting",
         "fair value",
     )
     if sum(token in lowered for token in noise_tokens) >= 2:
-        return False
-    signal_tokens = (
-        "revenue",
-        "sales",
-        "demand",
-        "orders",
-        "backlog",
-        "margin",
-        "inventory",
-        "pricing",
-        "shipments",
-        "capex",
-        "utilization",
-        "growth",
-        "expect",
-        "outlook",
-        "guidance",
+        return -100
+    has_explicit_cue = any(token in lowered for token in GUIDANCE_EXPLICIT_TOKENS)
+    has_forward_cue = bool(re.search(GUIDANCE_FORWARD_PATTERN, lowered, flags=re.IGNORECASE))
+    metric_hits = sum(token in lowered for token in GUIDANCE_METRIC_TOKENS)
+    has_metric_cue = metric_hits > 0
+    has_time_cue = bool(re.search(GUIDANCE_TIME_PATTERN, lowered, flags=re.IGNORECASE))
+    has_near_term_quarter_cue = bool(
+        re.search(
+            r"\b(next|coming|current|following)\s+quarter\b|"
+            r"\b(?:first|second|third|fourth)\s+quarter(?:\s+of\s+(?:20\d{2}|'?\d{2}))?\b|"
+            r"\b(?:for|after)\s+the\s+(?:first|second|third|fourth)\s+quarter\s+of\s+(?:20\d{2}|'?\d{2})\b|"
+            r"\bq[1-4](?:\s+(?:20\d{2}|'?\d{2}))?\b",
+            lowered,
+            flags=re.IGNORECASE,
+        )
     )
-    return any(token in lowered for token in signal_tokens)
+    if not ((has_explicit_cue and (has_metric_cue or has_time_cue)) or (has_forward_cue and has_metric_cue and has_time_cue)):
+        return 0
+    score = 0
+    if has_explicit_cue:
+        score += 2
+    if has_forward_cue:
+        score += 3
+    if has_time_cue:
+        score += 2
+    score += min(metric_hits, 4)
+    specific_ops_tokens = (
+        "tac",
+        "sites tac",
+        "traffic acquisition costs",
+        "opex",
+        "operating expenses",
+        "headcount",
+        "hiring",
+        "marketing spend",
+        "investment",
+        "investments",
+        "capex",
+        "capital expenditures",
+        "other bets",
+    )
+    score += sum(token in lowered for token in specific_ops_tokens) * 2
+    if has_near_term_quarter_cue:
+        score += 4
+    if "longer-term outlook" in lowered or "conclude with our outlook" in lowered:
+        score -= 1
+    if not has_near_term_quarter_cue and re.search(r"\bfor\s+20\d{2}\b", lowered):
+        generic_full_year_hits = sum(
+            token in lowered
+            for token in ("investments", "growth", "cloud", "hardware", "youtube", "machine learning", "priority areas")
+        )
+        if generic_full_year_hits >= 2:
+            score -= 2
+    if "revenue growth in 20" in lowered and not has_forward_cue:
+        score -= 2
+    return score
+
+
+def _guidance_excerpt_has_signal(text: str) -> bool:
+    return _guidance_excerpt_signal_score(text) > 0
+
+
+def _guidance_window_has_cue(text: str) -> bool:
+    lowered = _flatten_text(text).lower()
+    if not lowered:
+        return False
+    if _guidance_excerpt_is_boilerplate(lowered):
+        return False
+    if any(
+        phrase in lowered
+        for phrase in (
+            "repurchase",
+            "buyback",
+            "stock awards",
+            "alphabet stock",
+            "settle these awards",
+            "privately negotiated transactions",
+            "rule 10b5-1",
+            "10b5-1",
+            "foreign exchange contracts",
+            "hedge our forecasted revenues",
+            "cash flow hedges",
+        )
+    ):
+        return False
+    forward_cue = bool(re.search(GUIDANCE_FORWARD_PATTERN, lowered, flags=re.IGNORECASE))
+    has_metric_cue = any(token in lowered for token in GUIDANCE_METRIC_TOKENS)
+    if any(token in lowered for token in GUIDANCE_EXPLICIT_TOKENS):
+        return True
+    return forward_cue and has_metric_cue and bool(
+        re.search(GUIDANCE_TIME_PATTERN, lowered, flags=re.IGNORECASE)
+        or any(token in lowered for token in ("between", "range", "to be", "will be", "should be"))
+    )
+
+
+def _guidance_candidate_windows(flat_text: str) -> list[str]:
+    text = _clean_text(flat_text)
+    if not text.strip():
+        return []
+    windows: list[str] = []
+    seen: set[str] = set()
+
+    def _add_window(value: str) -> None:
+        flattened = _flatten_text(value)
+        if not flattened or not _guidance_window_has_cue(flattened):
+            return
+        if len(flattened) > 900:
+            sentences = [item.strip() for item in re.split(r"(?<=[.!?])\s+", flattened) if item.strip()]
+            if len(sentences) <= 1:
+                sentences = [flattened[index : index + 720] for index in range(0, len(flattened), 600)]
+            for index in range(len(sentences)):
+                chunk = " ".join(sentences[index : index + 3]).strip()
+                if not chunk:
+                    continue
+                normalized_chunk = chunk.casefold()
+                if normalized_chunk in seen:
+                    continue
+                seen.add(normalized_chunk)
+                windows.append(chunk)
+            return
+        normalized = flattened.casefold()
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        windows.append(flattened)
+
+    paragraphs = [item.strip() for item in re.split(r"\n\s*\n+", text) if item.strip()]
+    if paragraphs:
+        for index, paragraph in enumerate(paragraphs):
+            _add_window(paragraph)
+            lowered = _flatten_text(paragraph).lower()
+            if len(lowered) <= 80 and any(token in lowered for token in ("outlook", "guidance")):
+                _add_window(" ".join(paragraphs[index : index + 3]))
+
+    sentences = [item.strip() for item in re.split(r"(?<=[.!?])\s+|\n+", text) if item.strip()]
+    for index in range(len(sentences)):
+        _add_window(" ".join(sentences[index : index + 3]))
+
+    return windows
+
+
+def _search_guidance_windows(pattern: str, windows: list[str]) -> Optional[re.Match[str]]:
+    for window in windows:
+        match = re.search(pattern, window, flags=re.IGNORECASE)
+        if match:
+            return match
+    return None
+
+
+def _search_guidance_windows_with_window(
+    pattern: str,
+    windows: list[str],
+) -> Optional[tuple[re.Match[str], str]]:
+    for window in windows:
+        match = re.search(pattern, window, flags=re.IGNORECASE)
+        if match:
+            return match, window
+    return None
+
+
+def _clean_guidance_segment_label(label: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(label or "")).strip(" ,.;:-")
+    if not cleaned:
+        return ""
+    previous = None
+    while cleaned and cleaned != previous:
+        previous = cleaned
+        cleaned = re.sub(
+            r"^(?:now\s+let'?s\s+turn\s+to\s+the\s+q[1-4]\s+outlook\.?\s*)",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"^[^,]{0,80}\b(?:outlook|guidance|quarter)\b,\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        if ". " in cleaned:
+            cleaned = cleaned.split(".")[-1].strip(" ,.;:-")
+        cleaned = re.sub(r"^(?:and\s+)?in\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^(?:our|the)\s+", "", cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+
+def _guidance_match_is_segment_scoped(match: re.Match[str], window: str) -> bool:
+    prefix = str(window[max(0, match.start() - 160) : match.start()] or "")
+    scope_match = re.search(
+        r"(?:^|[.;:!?]\s*)(?:in|for)\s+(?P<label>[A-Za-z][A-Za-z0-9&(),./\-\s]{1,120}?)\s*,?\s*we\s+expect\s*$",
+        prefix,
+        flags=re.IGNORECASE,
+    )
+    if not scope_match:
+        return False
+    label = _clean_guidance_segment_label(scope_match.group("label") or "")
+    normalized = _normalize_html_table_key(label)
+    if not normalized:
+        return False
+    if normalized in {"revenue", "revenues", "sales", "totalrevenue", "companyrevenue"}:
+        return False
+    if re.search(r"\b(q[1-4]|quarter|year|fy\d{2,4}|fiscal|next\s+quarter|full\s+year)\b", label, flags=re.IGNORECASE):
+        return False
+    return True
 
 
 def _extract_generic_guidance(material: Optional[dict[str, Any]]) -> dict[str, Any]:
     if material is None:
         return {}
     flat_text = material["flat_text"]
+    if _guidance_excerpt_is_boilerplate(flat_text):
+        return {}
     currency_prefix = r"(?:us\$|u\.s\.\$|usd\s+|eur\s+|€|\$)?\s*"
+    guidance_windows = _guidance_candidate_windows(flat_text)
+    if not guidance_windows:
+        return {}
+    segment_ranges = _extract_segment_level_generic_guidance(flat_text, candidate_windows=guidance_windows)
+    if segment_ranges:
+        low_bn = sum(float(item["low_bn"]) for item in segment_ranges)
+        high_bn = sum(float(item["high_bn"]) for item in segment_ranges)
+        segment_labels = "、".join(str(item["label"]) for item in segment_ranges[:3])
+        extra = "等分部口径加总。"
+        if len(segment_ranges) <= 3:
+            extra = f"由 {segment_labels} 分部加总得到。"
+        return {
+            "mode": "official",
+            "revenue_bn": _midpoint(low_bn, high_bn),
+            "revenue_low_bn": low_bn,
+            "revenue_high_bn": high_bn,
+            "comparison_label": "下一季收入指引（分部加总）",
+            "commentary": _guidance_midpoint_commentary(low_bn, high_bn, extra=extra),
+        }
     range_patterns = [
         rf"(?:expects?|expected|guidance|outlook).{{0,120}}?(?:revenue|revenues|sales).{{0,80}}?between\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)\s+and\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
         rf"(?:revenue|revenues|sales).{{0,40}}?(?:is|are)\s+expected.{{0,40}}?between\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)\s+and\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
+        rf"(?:revenue|revenues|sales).{{0,40}}?(?:should|will)\s+be.{{0,40}}?(?:between|in\s+the\s+range\s+of)\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)\s+(?:and|to)\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
     ]
     for pattern in range_patterns:
-        range_match = _search(pattern, flat_text)
-        if not range_match:
+        range_match_result = _search_guidance_windows_with_window(pattern, guidance_windows)
+        if not range_match_result:
+            continue
+        range_match, matched_window = range_match_result
+        if _guidance_match_is_segment_scoped(range_match, matched_window):
             continue
         low_bn = _bn_from_unit(range_match.group(1), range_match.group(2))
         high_bn = _bn_from_unit(range_match.group(3), range_match.group(4))
@@ -3925,7 +5251,7 @@ def _extract_generic_guidance(material: Optional[dict[str, Any]]) -> dict[str, A
         }
     tolerance_match = _search(
         rf"(?:revenue|revenues|sales).{{0,40}}?(?:is|are)\s+expected.{{0,40}}?{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)\s*,?\s*(?:plus\s+or\s+minus|±)\s*([0-9]+(?:\.[0-9]+)?|zero|one|two|three|four|five|six|seven|eight|nine|ten)\s*%",
-        flat_text,
+        " ".join(guidance_windows),
     )
     if tolerance_match:
         revenue_bn = _bn_from_unit(tolerance_match.group(1), tolerance_match.group(2))
@@ -3942,10 +5268,14 @@ def _extract_generic_guidance(material: Optional[dict[str, Any]]) -> dict[str, A
     point_patterns = [
         rf"(?:expects?|expected|guidance|outlook).{{0,120}}?(?:revenue|revenues|sales).{{0,40}}?{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
         rf"(?:revenue|revenues|sales).{{0,40}}?(?:is|are)\s+expected.{{0,40}}?{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
+        rf"(?:revenue|revenues|sales).{{0,40}}?(?:should|will)\s+be.{{0,40}}?{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*(billion|million)",
     ]
     for pattern in point_patterns:
-        point_match = _search(pattern, flat_text)
-        if not point_match:
+        point_match_result = _search_guidance_windows_with_window(pattern, guidance_windows)
+        if not point_match_result:
+            continue
+        point_match, matched_window = point_match_result
+        if _guidance_match_is_segment_scoped(point_match, matched_window):
             continue
         revenue_bn = _bn_from_unit(point_match.group(1), point_match.group(2))
         return {
@@ -3954,16 +5284,168 @@ def _extract_generic_guidance(material: Optional[dict[str, Any]]) -> dict[str, A
             "comparison_label": "下一季收入指引",
             "commentary": f"官方原文给出的收入展望约为 {format_money_bn(revenue_bn)}。",
         }
-    context_match = _search(r"(?:expects?|expected|guidance|outlook).{0,220}", flat_text)
-    if context_match:
-        excerpt = _excerpt_around(flat_text, context_match)
-        if not _guidance_excerpt_has_signal(excerpt):
-            return {}
+    margin_range_match = _search(
+        r"(?:gross margin|gaap gross margin|non-gaap gross margin).{0,40}?(?:between|in the range of)\s+([0-9]+(?:\.[0-9]+)?)%\s+(?:and|to)\s+([0-9]+(?:\.[0-9]+)?)%",
+        " ".join(guidance_windows),
+    )
+    if margin_range_match:
+        low_pct = _pct_value(margin_range_match.group(1))
+        high_pct = _pct_value(margin_range_match.group(2))
+        midpoint = None if low_pct is None or high_pct is None else (float(low_pct) + float(high_pct)) / 2
         return {
             "mode": "official_context",
-            "commentary": f"官方展望语境摘录：{excerpt}。",
+            "gaap_gross_margin_pct": midpoint,
+            "comparison_margin_label": "下一季毛利率指引",
+            "commentary": f"官方原文给出的毛利率指引区间约为 {margin_range_match.group(1)}% 到 {margin_range_match.group(2)}%。",
+        }
+    margin_point_match = _search(
+        r"(?:gross margin|gaap gross margin|non-gaap gross margin).{0,24}?(?:is expected to be|should be|will be)\s+([0-9]+(?:\.[0-9]+)?)%",
+        " ".join(guidance_windows),
+    )
+    if margin_point_match:
+        margin_pct = _pct_value(margin_point_match.group(1))
+        return {
+            "mode": "official_context",
+            "gaap_gross_margin_pct": margin_pct,
+            "comparison_margin_label": "下一季毛利率指引",
+            "commentary": f"官方原文给出的毛利率口径约为 {margin_point_match.group(1)}%。",
+        }
+    best_context_excerpt = ""
+    best_context_score = 0
+    for window in guidance_windows:
+        context_match = re.search(r"(?:guidance|outlook|business outlook|forecast)", window, flags=re.IGNORECASE)
+        if not context_match:
+            context_match = re.search(GUIDANCE_FORWARD_PATTERN, window, flags=re.IGNORECASE)
+        if context_match:
+            excerpt = _excerpt_around(window, context_match)
+            score = _guidance_excerpt_signal_score(excerpt)
+            if score <= 0:
+                continue
+            if score > best_context_score:
+                best_context_score = score
+                best_context_excerpt = excerpt
+    if best_context_excerpt:
+        return {
+            "mode": "official_context",
+            "commentary": f"官方展望语境摘录：{best_context_excerpt}。",
         }
     return {}
+
+
+def _extract_segment_level_generic_guidance(
+    flat_text: str,
+    candidate_windows: Optional[list[str]] = None,
+) -> list[dict[str, Any]]:
+    currency_prefix = r"(?:us\$|u\.s\.\$|usd\s+|eur\s+|€|\$)?\s*"
+    unit_pattern = r"(?:billion|million)"
+    segment_scope = r"(?:in|for)\s+([A-Za-z][A-Za-z0-9&(),./\-\s]{1,120}?)\s*,?\s*we\s+expect\s+"
+    patterns = [
+        rf"(?:we\s+expect\s+)?revenue\s+in\s+([A-Za-z][A-Za-z0-9&(),./\-\s]{{1,120}}?)\s+to\s+be\s+(?:between|in\s+the\s+range\s+of)\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*({unit_pattern})?\s+(?:and|to)\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*({unit_pattern})",
+        rf"([A-Za-z][A-Za-z0-9&(),./\-\s]{{1,120}}?)\s+revenue\s+(?:is\s+expected\s+to\s+be|should\s+be|will\s+be)\s+(?:between|in\s+the\s+range\s+of)\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*({unit_pattern})?\s+(?:and|to)\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*({unit_pattern})",
+        rf"{segment_scope}revenue\s+(?:to\s+be\s+|of\s+)?(?:between\s+|in\s+the\s+range\s+of\s+)?{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*({unit_pattern})?\s+(?:and|to)\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*({unit_pattern})",
+        rf"{segment_scope}{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*({unit_pattern})?\s+(?:and|to)\s+{currency_prefix}([0-9,]+(?:\.[0-9]+)?)\s*({unit_pattern})\s+in\s+revenue",
+    ]
+    matches: list[dict[str, Any]] = []
+    seen_labels: set[str] = set()
+    windows = candidate_windows or _guidance_candidate_windows(flat_text)
+    for window in windows:
+        for pattern in patterns:
+            for match in re.finditer(pattern, window, flags=re.IGNORECASE):
+                label = _clean_guidance_segment_label(str(match.group(1) or ""))
+                normalized = _normalize_html_table_key(label)
+                if (
+                    not label
+                    or normalized in seen_labels
+                    or normalized in {"revenue", "revenues", "sales", "total revenue", "company revenue"}
+                ):
+                    continue
+                low_unit = match.group(3) or match.group(5)
+                high_unit = match.group(5) or match.group(3)
+                low_bn = _bn_from_unit(match.group(2), low_unit)
+                high_bn = _bn_from_unit(match.group(4), high_unit)
+                if low_bn is None or high_bn is None:
+                    continue
+                matches.append({"label": label, "low_bn": low_bn, "high_bn": high_bn})
+                seen_labels.add(normalized)
+    return matches if len(matches) >= 2 else []
+
+
+def _guidance_has_numeric_targets(guidance: dict[str, Any]) -> bool:
+    return any(guidance.get(key) is not None for key in ("revenue_bn", "revenue_low_bn", "revenue_high_bn"))
+
+
+def _guidance_material_signal_bonus(material: Optional[dict[str, Any]]) -> int:
+    if material is None:
+        return 0
+    role = str(material.get("role") or "").strip().casefold()
+    kind = str(material.get("kind") or "").strip().casefold()
+    if role == "earnings_call" or kind == "call_summary":
+        return 6
+    if role == "earnings_commentary":
+        return 5
+    if role == "earnings_release" or kind == "official_release":
+        return 4
+    if role == "earnings_presentation" or kind == "presentation":
+        return 2
+    return 0
+
+
+def _ordered_guidance_materials(materials: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ordered: list[dict[str, Any]] = []
+    preferred_roles = ("earnings_call", "earnings_commentary", "earnings_release", "earnings_presentation")
+    preferred_kinds = ("call_summary", "official_release", "presentation", "sec_filing")
+    for role in preferred_roles:
+        for item in materials:
+            if item in ordered or str(item.get("role") or "") != role:
+                continue
+            ordered.append(item)
+    for kind in preferred_kinds:
+        for item in materials:
+            if item in ordered or str(item.get("kind") or "") != kind:
+                continue
+            ordered.append(item)
+    for item in materials:
+        if item not in ordered:
+            ordered.append(item)
+    return ordered
+
+
+def _extract_generic_guidance_from_materials(materials: list[dict[str, Any]]) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
+    best_guidance: dict[str, Any] = {}
+    best_material: Optional[dict[str, Any]] = None
+    best_signal_score = -10_000
+    for material in _ordered_guidance_materials(materials):
+        guidance = _extract_generic_guidance(material)
+        if not guidance:
+            continue
+        if _guidance_has_numeric_targets(guidance):
+            return guidance, material
+        signal_score = (
+            _guidance_excerpt_signal_score(str(guidance.get("commentary") or ""))
+            + _guidance_material_signal_bonus(material)
+        )
+        if not best_guidance or signal_score > best_signal_score:
+            best_guidance = guidance
+            best_material = material
+            best_signal_score = signal_score
+    return best_guidance, best_material
+
+
+def _promote_generic_guidance(
+    parsed: dict[str, Any],
+    materials: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not parsed:
+        return parsed
+    generic_guidance, _guidance_material = _extract_generic_guidance_from_materials(materials)
+    if not generic_guidance:
+        return parsed
+    enriched = dict(parsed)
+    enriched["guidance"] = _merge_guidance_payload(
+        dict(parsed.get("guidance") or {}),
+        generic_guidance,
+    )
+    return enriched
 
 
 def _extract_quote_cards(material: Optional[dict[str, Any]]) -> list[dict[str, str]]:
@@ -4574,6 +6056,21 @@ def _finalize(
     facts: dict[str, Any],
     materials: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
+    if materials:
+        cash_flow_metrics = _extract_cash_flow_metrics_from_materials(list(materials))
+        for key in ("operating_cash_flow_bn", "free_cash_flow_bn", "capital_expenditures_bn"):
+            if facts.get(key) is None and cash_flow_metrics.get(key) is not None:
+                facts[key] = cash_flow_metrics[key]
+        shareholder_return_metrics = _extract_shareholder_return_metrics_from_materials(list(materials))
+        for key in ("capital_return_bn", "share_repurchases_bn", "dividends_bn"):
+            if facts.get(key) is None and shareholder_return_metrics.get(key) is not None:
+                facts[key] = shareholder_return_metrics[key]
+    if (
+        facts.get("capital_return_bn") is None
+        and facts.get("share_repurchases_bn") is not None
+        and facts.get("dividends_bn") is not None
+    ):
+        facts["capital_return_bn"] = round(float(facts["share_repurchases_bn"]) + float(facts["dividends_bn"]), 3)
     facts = _sanitize_temporal_narrative_facts(facts, fallback)
     revenue_bn = facts.get("revenue_bn")
     revenue_yoy_pct = facts.get("revenue_yoy_pct")
@@ -4602,6 +6099,10 @@ def _finalize(
             "net_income_yoy_pct": net_income_yoy_pct,
             "operating_cash_flow_bn": facts.get("operating_cash_flow_bn"),
             "free_cash_flow_bn": facts.get("free_cash_flow_bn"),
+            "capital_expenditures_bn": facts.get("capital_expenditures_bn"),
+            "capital_return_bn": facts.get("capital_return_bn"),
+            "share_repurchases_bn": facts.get("share_repurchases_bn"),
+            "dividends_bn": facts.get("dividends_bn"),
             "gaap_eps": facts.get("gaap_eps"),
             "non_gaap_eps": facts.get("non_gaap_eps", facts.get("gaap_eps")),
             "ending_equity_bn": normalized_ending_equity_bn,
@@ -4859,7 +6360,213 @@ def _parse_apple(
             ],
         },
     }
-    return _finalize(company, fallback, facts, materials)
+    payload = _finalize(company, fallback, facts, materials)
+    if "latest_kpis" not in payload:
+        payload["latest_kpis"] = {}
+    return payload
+
+
+def _apple_non_annual_materials(materials: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    non_annual = [item for item in list(materials or []) if not _is_annual_material(item)]
+    return non_annual or list(materials or [])
+
+
+def _extract_unscaled_html_statement_metric_from_rows(
+    rows: list[list[str]],
+    labels: list[str],
+    target_calendar_quarter: Optional[str],
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    row = _find_html_table_row(rows, labels)
+    if row is None:
+        return (None, None, None)
+    columns = _extract_html_statement_period_columns(rows)
+    if columns:
+        series = _html_row_numeric_series(row)
+        if len(series) >= len(columns):
+            series = series[: len(columns)]
+            indexes = _choose_html_statement_column_indexes(columns, target_calendar_quarter)
+            if indexes is not None:
+                current = float(series[indexes[0]])
+                prior = float(series[indexes[1]])
+                return (current, prior, _pct_change(current, prior))
+    series = _html_row_numeric_series(row)
+    if len(series) < 2:
+        return (None, None, None)
+    current = float(series[0])
+    prior = float(series[1])
+    return (current, prior, _pct_change(current, prior))
+
+
+def _apple_extract_preferred_statement_metric(
+    materials: list[dict[str, Any]],
+    labels: list[str],
+    target_calendar_quarter: Optional[str],
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    for material in _apple_non_annual_materials(materials):
+        for rows in _material_html_tables(material):
+            current, prior, yoy = _extract_html_statement_metric_from_rows(rows, labels, target_calendar_quarter)
+            if current is not None:
+                return (current, prior, yoy)
+        text = str(material.get("raw_text") or material.get("flat_text") or "")
+        current, prior, yoy = _extract_table_metric(text, labels)
+        if current is not None:
+            return (current, prior, yoy)
+    return (None, None, None)
+
+
+def _apple_statement_revenue_scale_multiplier(
+    revenue_bn: Optional[float],
+    segments: list[dict[str, Any]],
+    fallback: dict[str, Any],
+) -> float:
+    if revenue_bn in (None, 0):
+        return 1.0
+    segment_total = round(
+        sum(float(item.get("value_bn") or 0.0) for item in list(segments or []) if item.get("value_bn") is not None),
+        3,
+    )
+    if segment_total <= 0 or float(revenue_bn) >= segment_total * 0.25:
+        return 1.0
+    scaled_revenue = float(revenue_bn) * 1000.0
+    if segment_total * 0.7 <= scaled_revenue <= segment_total * 1.3:
+        return 1000.0
+    fallback_revenue = _coalesce_number(dict(fallback.get("latest_kpis") or {}).get("revenue_bn"))
+    if fallback_revenue not in (None, 0) and segment_total * 0.7 <= float(fallback_revenue) <= segment_total * 1.3:
+        return float(fallback_revenue) / float(revenue_bn)
+    return 1.0
+
+
+def _apple_extract_preferred_diluted_eps(
+    materials: list[dict[str, Any]],
+    target_calendar_quarter: Optional[str],
+) -> tuple[Optional[float], Optional[float]]:
+    for material in _apple_non_annual_materials(materials):
+        for rows in _material_html_tables(material):
+            table_text = " ".join(" ".join(str(cell or "") for cell in row[:6]) for row in rows[:18]).lower()
+            if "earnings per share" not in table_text:
+                continue
+            current, prior, yoy = _extract_unscaled_html_statement_metric_from_rows(rows, ["Diluted"], target_calendar_quarter)
+            if current is not None and abs(current) <= 100:
+                return (round(current, 3), yoy)
+        flat_text = str(material.get("flat_text") or material.get("raw_text") or "")
+        current, prior = _per_share_row(flat_text, "Diluted")
+        if current is not None and abs(float(current)) <= 100:
+            return (current, _pct_change(current, prior))
+    return (None, None)
+
+
+def _apple_extract_call_summary_section_rows(
+    material: dict[str, Any],
+    section_label: str,
+) -> list[list[str]]:
+    target = _normalize_html_table_key(section_label)
+    section_markers = {
+        "operatingsegments",
+        "productsummary",
+    }
+    for rows in _material_html_tables(material):
+        collecting = False
+        collected: list[list[str]] = []
+        for row in rows:
+            if not row:
+                continue
+            first_cell = _normalize_html_table_key(str(row[0] or ""))
+            if first_cell == target:
+                collecting = True
+                continue
+            if not collecting:
+                continue
+            if first_cell in section_markers:
+                break
+            if first_cell.startswith("q") or first_cell in {"revenue", "units"}:
+                continue
+            if re.fullmatch(r"\d+", first_cell):
+                break
+            collected.append(row)
+        if collected:
+            return collected
+    return []
+
+
+def _apple_extract_call_summary_product_metric(
+    materials: list[dict[str, Any]],
+    labels: list[str],
+) -> tuple[Optional[float], Optional[float], Optional[float], Optional[dict[str, Any]]]:
+    for material in _apple_non_annual_materials(materials):
+        if str(material.get("kind") or "") != "call_summary":
+            continue
+        section_rows = _apple_extract_call_summary_section_rows(material, "Product Summary")
+        row = _find_html_table_row(section_rows, labels)
+        series = _html_row_numeric_series(row)
+        if len(series) >= 6:
+            current = round(float(series[1]) / 1000.0, 3)
+            prior = round(float(series[5]) / 1000.0, 3)
+            return (current, prior, _pct_change(current, prior), material)
+        if len(series) >= 3:
+            current = round(float(series[0]) / 1000.0, 3)
+            prior = round(float(series[2]) / 1000.0, 3)
+            return (current, prior, _pct_change(current, prior), material)
+        text = str(material.get("raw_text") or material.get("flat_text") or "")
+        current, prior, yoy = _extract_table_metric(text, labels)
+        if current is not None:
+            return (current, prior, yoy, material)
+    return (None, None, None, None)
+
+
+def _apple_fiscal_year(fallback: dict[str, Any]) -> Optional[str]:
+    fiscal_label = str(fallback.get("fiscal_label") or fallback.get("calendar_quarter") or "")
+    match = re.search(r"(?<!\d)(?:fy|fiscal)?\s*(20\d{2})(?!\d)", fiscal_label, flags=re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def _apple_fiscal_quarter_row_label(fallback: dict[str, Any]) -> Optional[str]:
+    fiscal_label = str(fallback.get("fiscal_label") or "")
+    quarter_match = re.search(r"\bQ([1-4])\b", fiscal_label, flags=re.IGNORECASE)
+    if quarter_match is None:
+        return None
+    return {
+        "1": "First quarter",
+        "2": "Second quarter",
+        "3": "Third quarter",
+        "4": "Fourth quarter",
+    }.get(quarter_match.group(1))
+
+
+def _apple_extract_annual_quarter_amount_bn(
+    material: Optional[dict[str, Any]],
+    fallback: dict[str, Any],
+    *,
+    header_tokens: tuple[str, ...],
+) -> Optional[float]:
+    if material is None:
+        return None
+    fiscal_year = _apple_fiscal_year(fallback)
+    quarter_row_label = _apple_fiscal_quarter_row_label(fallback)
+    if not fiscal_year or not quarter_row_label:
+        return None
+    target_year = _normalize_html_table_key(fiscal_year)
+    target_row = _normalize_html_table_key(quarter_row_label)
+    for rows in _material_html_tables(material):
+        header_text = " ".join(" ".join(str(cell or "") for cell in row[:4]) for row in rows[:4]).lower()
+        if not all(token in header_text for token in header_tokens):
+            continue
+        in_year_block = False
+        for row in rows:
+            if not row:
+                continue
+            first_cell = _normalize_html_table_key(str(row[0] or ""))
+            if first_cell == target_year:
+                in_year_block = True
+                continue
+            if in_year_block and re.fullmatch(r"\d{4}", first_cell):
+                break
+            if not in_year_block or first_cell != target_row:
+                continue
+            series = _html_row_numeric_series(row)
+            if not series:
+                return None
+            return round(float(series[-1]) / 1000.0, 3)
+    return None
 
 
 def _parse_apple_dynamic(
@@ -4874,48 +6581,131 @@ def _parse_apple_dynamic(
 
     release_flat = str(release.get("flat_text") or "") if release else ""
     sec_flat = sec["flat_text"]
-    release_raw = str(release.get("raw_text") or "") if release else ""
+    annual_sec = next((item for item in materials if str(item.get("kind") or "") == "sec_filing" and _is_annual_material(item)), None)
+    structure_materials = _apple_non_annual_materials(_apple_preferred_source_materials(materials, purpose="structure"))
+    statement_materials = _apple_non_annual_materials(_apple_preferred_source_materials(materials, purpose="statement"))
     sec_raw = sec["raw_text"]
     money_symbol = company["money_symbol"]
+    target_calendar_quarter = str(fallback.get("calendar_quarter") or "")
 
-    revenue_bn, prior_revenue_bn, revenue_yoy_pct = _extract_table_metric(release_raw, ["Total net sales"])
-    if revenue_bn is None:
-        revenue_bn, prior_revenue_bn, revenue_yoy_pct = _extract_table_metric(sec_raw, ["Total net sales"])
-    iphone_bn, _, iphone_yoy = _extract_table_metric(sec_raw, ["iPhone"])
-    mac_bn, _, mac_yoy = _extract_table_metric(sec_raw, ["Mac"])
-    ipad_bn, _, ipad_yoy = _extract_table_metric(sec_raw, ["iPad"])
-    wearables_bn, _, wearables_yoy = _extract_table_metric(sec_raw, ["Wearables, Home and Accessories", "Wearables, Home & Accessories"])
-    services_bn, prior_services_bn, services_yoy = _extract_table_metric(sec_raw, ["Services"])
+    revenue_bn, prior_revenue_bn, revenue_yoy_pct = _apple_extract_preferred_statement_metric(
+        statement_materials,
+        ["Net sales", "Total net sales"],
+        target_calendar_quarter,
+    )
+    iphone_bn, _, iphone_yoy, iphone_source = _apple_extract_call_summary_product_metric(structure_materials, ["iPhone"])
+    mac_bn, _, mac_yoy, mac_source = _apple_extract_call_summary_product_metric(structure_materials, ["Mac"])
+    ipad_bn, _, ipad_yoy, ipad_source = _apple_extract_call_summary_product_metric(structure_materials, ["iPad"])
+    wearables_bn, _, wearables_yoy, wearables_source = _apple_extract_call_summary_product_metric(
+        structure_materials,
+        ["Wearables, Home and Accessories", "Wearables, Home & Accessories", "Other Products"],
+    )
+    services_bn, prior_services_bn, services_yoy, services_source = _apple_extract_call_summary_product_metric(
+        structure_materials,
+        ["Services"],
+    )
+    if iphone_bn is None:
+        iphone_bn, _, iphone_yoy, iphone_source = _extract_preferred_material_metric(structure_materials, ["iPhone"], purpose="structure")
+    if mac_bn is None:
+        mac_bn, _, mac_yoy, mac_source = _extract_preferred_material_metric(structure_materials, ["Mac"], purpose="structure")
+    if ipad_bn is None:
+        ipad_bn, _, ipad_yoy, ipad_source = _extract_preferred_material_metric(structure_materials, ["iPad"], purpose="structure")
+    if wearables_bn is None:
+        wearables_bn, _, wearables_yoy, wearables_source = _extract_preferred_material_metric(
+            structure_materials,
+            ["Wearables, Home and Accessories", "Wearables, Home & Accessories", "Other Products"],
+            purpose="structure",
+        )
+    if services_bn is None:
+        services_bn, prior_services_bn, services_yoy, services_source = _extract_preferred_material_metric(
+            structure_materials,
+            ["Services"],
+            purpose="structure",
+        )
     if iphone_bn is None and services_bn is None and wearables_bn is None:
         return _parse_apple_legacy(company, fallback, materials)
 
-    operating_income_bn, prior_operating_income_bn, _ = _extract_table_metric(release_raw, ["Operating income"])
-    if operating_income_bn is None:
-        operating_income_bn, prior_operating_income_bn, _ = _extract_table_metric(sec_raw, ["Operating income"])
-    net_income_bn, prior_net_income_bn, net_income_yoy_pct = _extract_table_metric(release_raw, ["Net income"])
-    if net_income_bn is None:
-        net_income_bn, prior_net_income_bn, net_income_yoy_pct = _extract_table_metric(sec_raw, ["Net income"])
-    gross_margin_pct = _extract_pct_metric(sec_raw, ["Total gross margin percentage"])
+    operating_income_bn, prior_operating_income_bn, _ = _apple_extract_preferred_statement_metric(
+        statement_materials,
+        ["Operating income"],
+        target_calendar_quarter,
+    )
+    net_income_bn, prior_net_income_bn, net_income_yoy_pct = _apple_extract_preferred_statement_metric(
+        statement_materials,
+        ["Net income"],
+        target_calendar_quarter,
+    )
+    gross_profit_bn, _, _ = _apple_extract_preferred_statement_metric(
+        statement_materials,
+        ["Gross margin", "Gross profit"],
+        target_calendar_quarter,
+    )
     products_margin_pct = _extract_pct_metric(sec_raw, ["Products"])
     services_margin_pct = _extract_pct_metric(sec_raw, ["Services"])
-    r_and_d_bn, _, _ = _extract_table_metric(release_raw, ["Research and development"])
-    if r_and_d_bn is None:
-        r_and_d_bn, _, _ = _extract_table_metric(sec_raw, ["Research and development"])
-    sga_bn, _, _ = _extract_table_metric(release_raw, ["Selling, general and administrative"])
-    if sga_bn is None:
-        sga_bn, _, _ = _extract_table_metric(sec_raw, ["Selling, general and administrative"])
-    total_opex_bn, _, _ = _extract_table_metric(release_raw, ["Total operating expenses"])
-    if total_opex_bn is None:
-        total_opex_bn, _, _ = _extract_table_metric(sec_raw, ["Total operating expenses"])
+    r_and_d_bn, _, _ = _apple_extract_preferred_statement_metric(
+        statement_materials,
+        ["Research and development"],
+        target_calendar_quarter,
+    )
+    sga_bn, _, _ = _apple_extract_preferred_statement_metric(
+        statement_materials,
+        ["Selling, general and administrative"],
+        target_calendar_quarter,
+    )
+    total_opex_bn, _, _ = _apple_extract_preferred_statement_metric(
+        statement_materials,
+        ["Total operating expenses"],
+        target_calendar_quarter,
+    )
     operating_cash_flow_bn, _ = _extract_narrative_metric(
         release_flat,
         r"(?:operating cash flow|cash flow from operations|net cash provided by operating activities)",
     )
     gaap_eps, gaap_eps_yoy_pct = _extract_narrative_eps(release_flat)
     if gaap_eps is None:
+        gaap_eps, gaap_eps_yoy_pct = _apple_extract_preferred_diluted_eps(statement_materials, target_calendar_quarter)
+    if gaap_eps is None:
         gaap_eps, prior_eps = _per_share_row(sec_flat, "Diluted")
         gaap_eps_yoy_pct = _pct_change(gaap_eps, prior_eps)
+    dividends_bn = _apple_extract_annual_quarter_amount_bn(
+        annual_sec,
+        fallback,
+        header_tokens=("dividends per share", "amount"),
+    )
+    share_repurchases_bn = _apple_extract_annual_quarter_amount_bn(
+        annual_sec,
+        fallback,
+        header_tokens=("average repurchase price per share", "amount"),
+    )
 
+    segments = _segment_list(
+        _segment("iPhone", iphone_bn, iphone_yoy),
+        _segment("Services", services_bn, services_yoy),
+        _segment("Mac", mac_bn, mac_yoy),
+        _segment("Wearables, Home and Accessories", wearables_bn, wearables_yoy),
+        _segment("iPad", ipad_bn, ipad_yoy),
+    )
+    segment_total = round(
+        sum(float(item.get("value_bn") or 0.0) for item in segments if item.get("value_bn") is not None),
+        3,
+    )
+    revenue_scale_multiplier = _apple_statement_revenue_scale_multiplier(revenue_bn, segments, fallback)
+    if revenue_scale_multiplier != 1.0:
+        scaled_revenue_bn = round(float(revenue_bn) * revenue_scale_multiplier, 3) if revenue_bn is not None else None
+        if (
+            scaled_revenue_bn not in (None, 0)
+            and segment_total > 0
+            and segment_total * 0.7 <= float(scaled_revenue_bn) <= segment_total * 1.3
+        ):
+            revenue_bn = segment_total
+        else:
+            revenue_bn = scaled_revenue_bn
+        prior_revenue_bn = (
+            round(float(prior_revenue_bn) * revenue_scale_multiplier, 3)
+            if prior_revenue_bn is not None
+            else None
+        )
+    gross_margin_pct = _extract_pct_metric(sec_raw, ["Total gross margin percentage"]) or _safe_ratio_pct(gross_profit_bn, revenue_bn)
     products_revenue_bn = None
     products_prior_bn = None
     products_yoy_pct = None
@@ -4925,14 +6715,6 @@ def _parse_apple_dynamic(
         products_prior_bn = prior_revenue_bn - prior_services_bn
     if products_revenue_bn is not None and products_prior_bn not in (None, 0):
         products_yoy_pct = _pct_change(products_revenue_bn, products_prior_bn)
-
-    segments = _segment_list(
-        _segment("iPhone", iphone_bn, iphone_yoy),
-        _segment("Services", services_bn, services_yoy),
-        _segment("Mac", mac_bn, mac_yoy),
-        _segment("Wearables, Home and Accessories", wearables_bn, wearables_yoy),
-        _segment("iPad", ipad_bn, ipad_yoy),
-    )
     geographies = _extract_company_geographies(str(company["id"]), materials, revenue_bn)
     guidance = _extract_generic_guidance(release) if release is not None else {}
     quotes = _extract_quote_cards(release) if release is not None else []
@@ -5001,9 +6783,10 @@ def _parse_apple_dynamic(
             }
         )
 
+    structure_source = iphone_source or services_source or wearables_source or mac_source or ipad_source or sec
     facts = {
         "primary_source_label": release["label"] if release is not None else sec["label"],
-        "structure_source_label": sec["label"],
+        "structure_source_label": structure_source["label"],
         "guidance_source_label": release["label"] if release is not None else sec["label"],
         "revenue_bn": revenue_bn,
         "revenue_yoy_pct": revenue_yoy_pct,
@@ -5012,6 +6795,8 @@ def _parse_apple_dynamic(
         "net_income_bn": net_income_bn,
         "net_income_yoy_pct": net_income_yoy_pct if net_income_yoy_pct is not None else _pct_change(net_income_bn, prior_net_income_bn),
         "operating_cash_flow_bn": operating_cash_flow_bn,
+        "dividends_bn": dividends_bn,
+        "share_repurchases_bn": share_repurchases_bn,
         "gaap_eps": gaap_eps,
         "gaap_eps_yoy_pct": gaap_eps_yoy_pct,
         "segments": segments,
@@ -5040,10 +6825,13 @@ def _parse_apple_dynamic(
             "operating_expenses_bn": total_opex_bn,
         },
         "coverage_notes": [
-            "Apple 历史季度会优先从官方 earnings release 和 10-Q / 10-K 表格中动态抽取当季收入结构、费用科目与地区结构。"
+            "Apple 历史季度会优先从 EX-99.2 / call summary、季度 10-Q 和官方 release 中抽取当季结构，再把年度 10-K 仅作为兜底来源。"
         ],
     }
-    return _finalize(company, fallback, facts, materials)
+    payload = _finalize(company, fallback, facts, materials)
+    if "latest_kpis" not in payload:
+        payload["latest_kpis"] = {}
+    return payload
 
 
 def _parse_apple_legacy(
@@ -5057,17 +6845,37 @@ def _parse_apple_legacy(
 
     sec_flat = sec["flat_text"]
     sec_raw = sec["raw_text"]
+    structure_texts = [
+        str(item.get("raw_text") or item.get("flat_text") or "")
+        for item in _apple_preferred_source_materials(materials, purpose="structure")
+    ]
+    statement_texts = [
+        str(item.get("raw_text") or item.get("flat_text") or "")
+        for item in _apple_preferred_source_materials(materials, purpose="statement")
+    ]
     money_symbol = company["money_symbol"]
 
-    revenue_bn, prior_revenue_bn, revenue_yoy_pct = _extract_table_metric(sec_raw, ["Total net sales"])
-    mac_bn, _, mac_yoy = _extract_table_metric(sec_raw, ["Total Macintosh net sales", "Total Mac net sales"])
-    ipod_bn, _, ipod_yoy = _extract_table_metric(sec_raw, ["iPod"])
-    other_music_bn, _, other_music_yoy = _extract_table_metric(sec_raw, ["Other music related products and services", "Other music related products and services (e)"])
-    iphone_bn, _, iphone_yoy = _extract_table_metric(sec_raw, ["iPhone and related products and services", "iPhone and related products and services (f)"])
-    ipad_bn, _, ipad_yoy = _extract_table_metric(sec_raw, ["iPad and related products and services", "iPad and related products and services (e)"])
-    peripherals_bn, _, peripherals_yoy = _extract_table_metric(sec_raw, ["Peripherals and other hardware", "Peripherals and other hardware (g)"])
-    software_services_bn, _, software_services_yoy = _extract_table_metric(
-        sec_raw,
+    revenue_bn, prior_revenue_bn, revenue_yoy_pct = _extract_preferred_table_metric(statement_texts, ["Total net sales"])
+    mac_bn, _, mac_yoy = _extract_preferred_table_metric(structure_texts, ["Total Macintosh net sales", "Total Mac net sales"])
+    ipod_bn, _, ipod_yoy = _extract_preferred_table_metric(structure_texts, ["iPod"])
+    other_music_bn, _, other_music_yoy = _extract_preferred_table_metric(
+        structure_texts,
+        ["Other music related products and services", "Other music related products and services (e)"],
+    )
+    iphone_bn, _, iphone_yoy = _extract_preferred_table_metric(
+        structure_texts,
+        ["iPhone and related products and services", "iPhone and related products and services (f)"],
+    )
+    ipad_bn, _, ipad_yoy = _extract_preferred_table_metric(
+        structure_texts,
+        ["iPad and related products and services", "iPad and related products and services (e)"],
+    )
+    peripherals_bn, _, peripherals_yoy = _extract_preferred_table_metric(
+        structure_texts,
+        ["Peripherals and other hardware", "Peripherals and other hardware (g)"],
+    )
+    software_services_bn, _, software_services_yoy = _extract_preferred_table_metric(
+        structure_texts,
         ["Software, service, and other sales", "Software, service and other sales", "Software, service, and other sales (h)"],
     )
     if iphone_bn is None:
@@ -5077,9 +6885,9 @@ def _parse_apple_legacy(
         )
         if iphone_match:
             iphone_bn = _bn_from_millions(iphone_match.group(1))
-    operating_income_bn, prior_operating_income_bn, _ = _extract_table_metric(sec_raw, ["Operating income"])
-    net_income_bn, prior_net_income_bn, net_income_yoy_pct = _extract_table_metric(sec_raw, ["Net income"])
-    gross_profit_bn, _, _ = _extract_table_metric(sec_raw, ["Gross margin", "Gross profit"])
+    operating_income_bn, prior_operating_income_bn, _ = _extract_preferred_table_metric(statement_texts, ["Operating income"])
+    net_income_bn, prior_net_income_bn, net_income_yoy_pct = _extract_preferred_table_metric(statement_texts, ["Net income"])
+    gross_profit_bn, _, _ = _extract_preferred_table_metric(statement_texts, ["Gross margin", "Gross profit"])
     gross_margin_pct = _safe_ratio_pct(gross_profit_bn, revenue_bn)
     gaap_eps, prior_eps = _per_share_row(sec_flat, "Diluted")
     geographies = (
@@ -5192,6 +7000,7 @@ def _parse_microsoft(
     release_flat = str(release.get("flat_text") or "") if release else ""
     sec_flat = str(sec.get("flat_text") or "") if sec else ""
     sec_raw = str(sec.get("raw_text") or "") if sec else ""
+    sec_is_annual = bool(sec and _is_annual_filing_material(sec))
     money_symbol = company["money_symbol"]
 
     product_revenue_match = _search(r"Revenue:\s+Product\s+\$?\s*([0-9,]+)\s+\$?\s*([0-9,]+)", sec_flat)
@@ -5199,20 +7008,41 @@ def _parse_microsoft(
         r"Revenue:\s+Product\s+\$?\s*[0-9,]+\s+\$?\s*[0-9,]+\s+\$?\s*[0-9,]+\s+\$?\s*[0-9,]+\s+Service and other\s+\$?\s*([0-9,]+)\s+\$?\s*([0-9,]+)",
         sec_flat,
     )
-    total_revenue_bn, prior_total_revenue_bn = _millions_row_no_pct(sec_flat, "Total revenue")
+    total_revenue_bn, prior_total_revenue_bn = (
+        _millions_row_no_pct(sec_flat, "Total revenue") if not sec_is_annual else (None, None)
+    )
     product_cost_match = _search(r"Cost of revenue:\s+Product\s+\$?\s*([0-9,]+)\s+\$?\s*([0-9,]+)", sec_flat)
     service_cost_match = _search(
         r"Cost of revenue:\s+Product\s+\$?\s*[0-9,]+\s+\$?\s*[0-9,]+\s+\$?\s*[0-9,]+\s+\$?\s*[0-9,]+\s+Service and other\s+\$?\s*([0-9,]+)\s+\$?\s*([0-9,]+)",
         sec_flat,
     )
-    total_cost_of_revenue_bn, _ = _millions_row_no_pct(sec_flat, "Total cost of revenue")
-    gross_margin_bn, _ = _millions_row_no_pct(sec_flat, "Gross margin")
-    r_and_d_bn, _ = _millions_row_no_pct(sec_flat, "Research and development")
-    sales_marketing_bn, _ = _millions_row_no_pct(sec_flat, "Sales and marketing")
-    ga_bn, _ = _millions_row_no_pct(sec_flat, "General and administrative")
-    operating_income_bn, prior_operating_income_bn = _millions_row_no_pct(sec_flat, "Operating income")
+    total_cost_of_revenue_bn, _ = _millions_row_no_pct(sec_flat, "Total cost of revenue") if not sec_is_annual else (None, None)
+    gross_margin_bn, _ = _millions_row_no_pct(sec_flat, "Gross margin") if not sec_is_annual else (None, None)
+    r_and_d_bn, _ = _millions_row_no_pct(sec_flat, "Research and development") if not sec_is_annual else (None, None)
+    sales_marketing_bn, _ = _millions_row_no_pct(sec_flat, "Sales and marketing") if not sec_is_annual else (None, None)
+    ga_bn, _ = _millions_row_no_pct(sec_flat, "General and administrative") if not sec_is_annual else (None, None)
+    operating_income_bn, prior_operating_income_bn = (
+        _millions_row_no_pct(sec_flat, "Operating income") if not sec_is_annual else (None, None)
+    )
 
-    revenue_match = _search(r"Revenue was \$([0-9.]+) billion and increased ([0-9]+)%", release_flat)
+    release_revenue_bn = None
+    release_revenue_yoy_pct = None
+    for revenue_pattern in (
+        r"Revenue was \$(?P<amount>[0-9.]+) billion(?:\s+GAAP)?(?:,\s+and\s+\$[0-9.]+\s+billion non-gaap)?(?:\s+and increased (?P<yoy>[0-9]+)%)?",
+        r"Revenues? for the quarter ended [^.]{0,120}? were \$(?P<amount>[0-9.]+) billion(?:[^.]{0,80}?(?:increased|grew|rose|up)\s+(?P<yoy>[0-9]+)%)?",
+        r"Revenue was \$(?P<amount>[0-9.]+) billion and increased (?P<yoy>[0-9]+)%",
+    ):
+        revenue_match = _search(revenue_pattern, release_flat)
+        if revenue_match is None:
+            continue
+        release_revenue_bn = _bn_from_billions(revenue_match.group("amount"))
+        release_revenue_yoy_pct = _pct_value(revenue_match.groupdict().get("yoy"))
+        break
+    if release_revenue_bn is None and release_flat:
+        release_revenue_bn, release_revenue_yoy_pct = _extract_company_level_narrative_metric(
+            release_flat,
+            r"(?:revenue|net revenue|total revenue)",
+        )
     net_income_match = _search(
         r"Net income on a GAAP basis was \$([0-9.]+)\s*billion and increased ([0-9]+)%, and on a non-GAAP basis was \$([0-9.]+)\s*billion and increased ([0-9]+)%",
         release_flat,
@@ -5231,7 +7061,7 @@ def _parse_microsoft(
         release_flat,
     )
     mpc_match = _search(
-        r"Revenue in More Personal Computing was \$([0-9.]+) billion and (?:(increased|decreased) ([0-9]+)%|(was relatively unchanged))",
+        r"Revenue in More Personal Computing was \$([0-9.]+) billion and (?:(increased|decreased) ([0-9]+)%|((?:was )?relatively unchanged))",
         release_flat,
     )
     azure_match = _search(r"Azure and other cloud services revenue increased ([0-9]+)%", release_flat)
@@ -5263,6 +7093,7 @@ def _parse_microsoft(
             _directional_pct(mpc_match.group(2) or mpc_match.group(4), mpc_match.group(3)) if mpc_match else None,
         ),
     )
+    revenue_bn = total_revenue_bn or release_revenue_bn
     if not segments:
         segments = _extract_company_segments(str(company["id"]), materials, revenue_bn)
     segment_margin_matches = {
@@ -5298,7 +7129,8 @@ def _parse_microsoft(
 
     primary_label = release["label"] if release is not None else sec["label"]
     structure_label = release["label"] if release is not None else sec["label"]
-    guidance = _extract_generic_guidance(release or sec) if (release or sec) is not None else {}
+    guidance_candidates = [item for item in [_pick_material(materials, kind="call_summary"), _pick_material(materials, role="earnings_call"), release, sec] if item is not None]
+    guidance, guidance_material = _extract_generic_guidance_from_materials(guidance_candidates)
     quotes = _extract_quote_cards(release) or _extract_quote_cards(sec)
     top_segment = _top_segment(segments)
     fastest_segment = _fastest_segment(segments)
@@ -5336,9 +7168,9 @@ def _parse_microsoft(
     facts = {
         "primary_source_label": primary_label,
         "structure_source_label": structure_label,
-        "guidance_source_label": primary_label,
-        "revenue_bn": total_revenue_bn or (_bn_from_billions(revenue_match.group(1)) if revenue_match else None),
-        "revenue_yoy_pct": _pct_value(revenue_match.group(2)) if revenue_match else _pct_change(total_revenue_bn, prior_total_revenue_bn),
+        "guidance_source_label": str((guidance_material or release or sec).get("label") or primary_label),
+        "revenue_bn": revenue_bn,
+        "revenue_yoy_pct": release_revenue_yoy_pct if release_revenue_yoy_pct is not None else _pct_change(total_revenue_bn, prior_total_revenue_bn),
         "gross_margin_pct": gross_margin_pct,
         "operating_income_bn": operating_income_bn or (_bn_from_billions(_search(r"Operating income was \$([0-9.]+) billion", release_flat).group(1)) if _search(r"Operating income was \$([0-9.]+) billion", release_flat) else None),
         "net_income_bn": _bn_from_billions(net_income_match.group(1)) if net_income_match else None,
@@ -5403,7 +7235,10 @@ def _parse_microsoft(
             ],
         },
     }
-    return _finalize(company, fallback, facts, materials)
+    payload = _finalize(company, fallback, facts, materials)
+    if "latest_kpis" not in payload:
+        payload["latest_kpis"] = {}
+    return payload
 
 
 def _alphabet_historical_segment(
@@ -5446,7 +7281,7 @@ def _parse_alphabet_historical(
         _alphabet_historical_segment(flat, "YouTube ads", "YouTube ads"),
         _alphabet_historical_segment(flat, "Google Network Members' properties", "Google Network"),
         _alphabet_historical_segment(flat, "Google Cloud", "Google Cloud"),
-        _alphabet_historical_segment(flat, "Google other", "Google subscriptions, platforms, and devices"),
+        _alphabet_historical_segment(flat, "Google other", "Google other"),
         _alphabet_historical_segment(flat, "Other Bets revenues", "Other Bets"),
     )
     legacy_segments = _segment_list(
@@ -6531,7 +8366,8 @@ def _parse_nvidia(
     materials: list[dict[str, Any]],
 ) -> dict[str, Any]:
     commentary = _pick_material(materials, kind="presentation", label_contains="commentary") or _pick_material(materials, kind="presentation")
-    if commentary is not None and any(token in commentary["flat_text"] for token in ("Revenue by Market Platform", "OEM and IP", "Q4 FY18", "Q1 Fiscal 2019")):
+    legacy_markers = ("OEM and IP", "Datacenter", "Q4 FY18", "Q1 Fiscal 2019")
+    if commentary is not None and any(token in commentary["flat_text"] for token in legacy_markers):
         legacy = _parse_nvidia_legacy(company, fallback, materials)
         if legacy:
             return legacy
@@ -8238,17 +10074,17 @@ def _parse_generic(
         )
         if html_metric_count < 3:
             continue
-        if revenue_bn is None and html_statement.get("revenue_bn") is not None:
+        if html_statement.get("revenue_bn") is not None:
             revenue_bn = float(html_statement["revenue_bn"])
-        if revenue_yoy_pct is None and html_statement.get("revenue_yoy_pct") is not None:
+        if html_statement.get("revenue_yoy_pct") is not None:
             revenue_yoy_pct = float(html_statement["revenue_yoy_pct"])
-        if operating_income_bn is None and html_statement.get("operating_income_bn") is not None:
+        if html_statement.get("operating_income_bn") is not None:
             operating_income_bn = float(html_statement["operating_income_bn"])
-        if net_income_bn is None and html_statement.get("net_income_bn") is not None:
+        if html_statement.get("net_income_bn") is not None:
             net_income_bn = float(html_statement["net_income_bn"])
-        if net_income_yoy_pct is None and html_statement.get("net_income_yoy_pct") is not None:
+        if html_statement.get("net_income_yoy_pct") is not None:
             net_income_yoy_pct = float(html_statement["net_income_yoy_pct"])
-        if gross_margin_pct is None and html_statement.get("gross_margin_pct") is not None:
+        if html_statement.get("gross_margin_pct") is not None:
             gross_margin_pct = float(html_statement["gross_margin_pct"])
         if not income_statement and html_statement.get("income_statement"):
             income_statement = dict(html_statement["income_statement"])
@@ -8377,13 +10213,20 @@ def _parse_generic(
         annual_materials = _load_nearby_annual_materials(company, fallback, materials)
         if annual_materials:
             geographies = _extract_company_geographies(str(company["id"]), annual_materials, revenue_bn)
-    guidance_material = (
-        commentary
-        or release
-        or _pick_material(materials, role="earnings_presentation")
-        or _pick_material(materials, kind="presentation")
-    )
-    guidance = _extract_generic_guidance(guidance_material)
+    guidance_candidates = [
+        item
+        for item in [
+            _pick_material(materials, kind="call_summary"),
+            _pick_material(materials, role="earnings_call"),
+            commentary,
+            release,
+            _pick_material(materials, role="earnings_presentation"),
+            _pick_material(materials, kind="presentation"),
+            quarterly_sec,
+        ]
+        if item is not None
+    ]
+    guidance, guidance_material = _extract_generic_guidance_from_materials(guidance_candidates)
     quotes = _extract_quote_cards(release) or _extract_quote_cards(commentary)
     top_segment = _top_segment(segments)
     driver = None
@@ -8393,7 +10236,7 @@ def _parse_generic(
     facts = {
         "primary_source_label": primary["label"],
         "structure_source_label": (release or quarterly_sec or primary)["label"],
-        "guidance_source_label": (release or primary)["label"],
+        "guidance_source_label": str((guidance_material or release or primary).get("label") or primary["label"]),
         "revenue_bn": revenue_bn,
         "revenue_yoy_pct": revenue_yoy_pct,
         "gross_margin_pct": gross_margin_pct,
@@ -8488,6 +10331,7 @@ def parse_official_materials(
         heartbeat_stop.set()
         if heartbeat_thread is not None:
             heartbeat_thread.join(timeout=0.1)
+    parsed = _promote_generic_guidance(parsed, materials)
     if parser is _parse_generic or str(company.get("id") or "") in SELF_CONTAINED_PARSERS:
         if progress_callback is not None:
             progress_callback(1.0, f"{company['ticker']} 官方解析阶段已完成。")
@@ -8499,6 +10343,7 @@ def parse_official_materials(
     except Exception:
         generic = {}
     merged = _merge_parsed_payload(parsed, generic)
+    merged = _promote_generic_guidance(merged, materials)
     merged["current_segments"] = _tag_regional_segments(list(merged.get("current_segments") or []))
     if not merged.get("current_geographies"):
         regional_segments = [

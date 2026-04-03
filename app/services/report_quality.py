@@ -51,6 +51,26 @@ NARRATIVE_PROVENANCE_MARKERS = (
 )
 
 
+def _topic_note_looks_placeholder(note: Any) -> bool:
+    cleaned = re.sub(r"\s+", " ", str(note or "")).strip()
+    if not cleaned:
+        return True
+    if any(marker in cleaned for marker in ("关键词聚类", "来自自动抓取的官方电话会材料", "来自官方补充材料", "来自手动上传 transcript")):
+        return True
+    if "..." in cleaned or "…" in cleaned:
+        return True
+    if re.search(r"(?:同比|环比)\s*[-–—]", cleaned):
+        return True
+    if cleaned.endswith(("...", "…", "-", "—", "–", ":", "：", ",", "，")):
+        return True
+    readable_terms = re.findall(r"[A-Za-z\u4e00-\u9fff]{2,}", cleaned)
+    return len(readable_terms) < 3
+
+
+def _placeholder_topic_count(items: list[dict[str, Any]]) -> int:
+    return sum(1 for item in items if _topic_note_looks_placeholder(item.get("note")))
+
+
 def _safe_float(value: Any) -> Optional[float]:
     if value is None:
         return None
@@ -242,6 +262,24 @@ def evaluate_report_payload(
         issues.append(_issue("major", "qna_sparse", "问答主题过少，电话会页信息密度不足。"))
     if len(management_themes) < 2:
         issues.append(_issue("minor", "management_theme_sparse", "管理层主题数量偏少。"))
+    qna_placeholder_count = _placeholder_topic_count(qna_themes)
+    management_placeholder_count = _placeholder_topic_count(management_themes)
+    if qna_placeholder_count > 0:
+        issues.append(
+            _issue(
+                "major" if qna_placeholder_count >= min(2, len(qna_themes)) else "minor",
+                "qna_placeholder_topics",
+                f"问答主题里仍有 {qna_placeholder_count} 条占位/模板化摘要，电话会页可读性不足。",
+            )
+        )
+    if management_placeholder_count > 0:
+        issues.append(
+            _issue(
+                "major" if management_placeholder_count >= 2 else "minor",
+                "management_placeholder_topics",
+                f"管理层主题里仍有 {management_placeholder_count} 条占位/模板化摘要，执行层信号不够完整。",
+            )
+        )
     if len(evidence_cards) < 2:
         issues.append(_issue("major", "evidence_sparse", "证据卡片不足，回溯原文的可验证性下降。"))
 
@@ -335,6 +373,10 @@ def evaluate_report_payload(
             issues.append(_issue("critical", "full_coverage_qna_sparse", "Full coverage 模式要求至少 3 条电话会/问答主题。"))
         if len(management_themes) < 3:
             issues.append(_issue("critical", "full_coverage_management_sparse", "Full coverage 模式要求至少 3 条管理层主题。"))
+        if qna_placeholder_count > 0:
+            issues.append(_issue("critical", "full_coverage_qna_placeholder_topics", "Full coverage 模式不允许问答主题保留占位/模板化摘要。"))
+        if management_placeholder_count > 0:
+            issues.append(_issue("critical", "full_coverage_management_placeholder_topics", "Full coverage 模式不允许管理层主题保留占位/模板化摘要。"))
         if len(evidence_cards) < 3:
             issues.append(_issue("critical", "full_coverage_evidence_sparse", "Full coverage 模式要求至少 3 张证据卡片。"))
 
@@ -410,6 +452,8 @@ def evaluate_report_payload(
         "narrative_template_phrase_hits": template_phrase_hits,
         "narrative_repeated_ngram_hits": repeated_ngram_hits,
         "narrative_provenance_heavy_ratio": provenance_heavy_ratio,
+        "qna_placeholder_topic_count": qna_placeholder_count,
+        "management_placeholder_topic_count": management_placeholder_count,
     }
 
     return {

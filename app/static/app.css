@@ -2375,6 +2375,41 @@ a {
   line-height: 1.44;
 }
 
+.page-guidance .compact-panels {
+  gap: 12px;
+}
+
+.page-guidance [data-autofit-block="guidance-panel"] {
+  padding: 10px 12px 9px;
+}
+
+.page-guidance [data-autofit-block="guidance-panel"] h3 {
+  margin-bottom: 5px;
+  font-size: 15px;
+}
+
+.page-guidance [data-autofit-block="guidance-panel"] .warning-list,
+.page-guidance [data-autofit-block="guidance-panel"] .summary-list,
+.page-guidance [data-autofit-block="guidance-panel"] p {
+  font-size: 10.8px;
+  line-height: 1.28;
+}
+
+.page-guidance [data-autofit-block="guidance-panel"] li {
+  margin-bottom: 4px;
+}
+
+.page-guidance [data-autofit-block="guidance-panel"] .panel-followup {
+  margin-top: 8px !important;
+  padding-top: 8px;
+}
+
+.page-guidance [data-autofit-block="guidance-panel"] .panel-source,
+.page-guidance [data-autofit-block="guidance-panel"] .panel-mini-title {
+  font-size: 9px !important;
+  line-height: 1.2 !important;
+}
+
 .page-management-qna .signal-followup-panels,
 .page-risks .signal-followup-panels {
   gap: 12px;

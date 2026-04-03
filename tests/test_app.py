@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import io
 import json
 import os
+import re
+import signal
 import shutil
 import sys
 import tempfile
 import time
 import unittest
+import zipfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -21,10 +25,19 @@ from scripts import audit_dynamic_reports
 from app.config import BUNDLED_NVIDIA_SEGMENT_HISTORY_PATH, BUNDLED_TECH_ANALYSIS_DATA_PATH, DATA_DIR
 from app.db import init_db
 from app.main import app
-from app.services.charts import render_income_statement_svg, render_segment_mix_svg, render_statement_translation_svg, render_structure_transition_svg
+from app.services.charts import (
+    render_capital_allocation_svg,
+    render_growth_overview_svg,
+    render_income_statement_svg,
+    render_segment_mix_svg,
+    render_statement_translation_svg,
+    render_structure_transition_svg,
+    render_validation_checklist_svg,
+)
 import app.services.local_data as local_data_service
 from app.services.local_data import get_company, get_quarter_fixture
 from app.services.local_data import _build_companyfacts_series
+from app.services.local_data import get_companyfacts_quarter_supplement
 from app.services.local_data import get_supported_quarters
 from app.services.local_data import normalize_calendar_quarter_input, resolve_company_reference
 from app.services.institutional_views import get_institutional_views
@@ -32,22 +45,37 @@ from app.services.official_parsers import parse_official_materials
 from app.services.official_parsers import _apple_legacy_geographies
 from app.services.official_parsers import _extract_company_geographies
 from app.services.official_parsers import _extract_company_segments
+from app.services.official_parsers import _extract_cash_flow_metrics_from_materials
+from app.services.official_parsers import _extract_shareholder_return_metrics_from_materials
+from app.services.official_parsers import _extract_company_level_narrative_metric
+from app.services.official_parsers import _extract_html_statement_metric_from_rows
 from app.services.official_parsers import _extract_generic_guidance
+from app.services.official_parsers import _extract_segment_level_generic_guidance
+from app.services.official_parsers import _label_candidate_text
 from app.services.official_parsers import _extract_quote_cards
 from app.services.official_parsers import _extract_table_metric
 from app.services.official_parsers import _flatten_text
+from app.services.official_parsers import _guidance_excerpt_signal_score
+from app.services.official_parsers import _guidance_excerpt_has_signal
 from app.services.official_parsers import _merge_parsed_payload
+from app.services.official_parsers import _merge_guidance_payload
+from app.services.official_parsers import _parse_generic
+from app.services.official_parsers import _parse_microsoft
+from app.services.official_parsers import _pick_material
 from app.services.official_parsers import _prefer_richer_geographies
 from app.services.official_parsers import _sanitize_temporal_narrative_facts
 from app.services.official_source_resolver import resolve_official_sources
 from app.services.official_source_resolver import _discover_attachment_url
+from app.services.official_source_resolver import _discover_wayback_sources
 from app.services.official_source_resolver import _discover_default_sitemap_urls, _discover_sitemap_sources
+from app.services.official_source_resolver import _documentish_page_link
 from app.services.official_source_resolver import _expand_related_ir_sources
 from app.services.official_source_resolver import _ir_role_keywords_match, _ir_temporal_alignment
+from app.services.official_source_resolver import _page_links
 from app.services.official_source_resolver import _quarter_reference_terms
 from app.services.official_source_resolver import _sec_cik_for_calendar_quarter
-from app.services.narrative_writer import build_call_panel, build_narrative_provenance, compose_summary_headline
-from app.services.pdf_export import _build_raster_pdf_html, _pdf_export_mode
+from app.services.narrative_writer import build_call_panel, build_narrative_provenance, compose_layered_takeaways, compose_summary_headline
+from app.services.pdf_export import _build_raster_pdf_html, _pdf_export_mode, export_html_to_pdf
 from app.services.report_quality import evaluate_report_payload
 from app.services.reports import (
     REPORT_PAYLOAD_SCHEMA_VERSION,
@@ -55,24 +83,32 @@ from app.services.reports import (
     _official_material_proxy_summary,
     _source_material_warnings,
     _backfill_historical_core_metrics,
+    _build_capital_allocation_snapshot,
     _build_current_detail_cards,
+    _build_expectation_reset_snapshot,
+    _guidance_display_value,
     _backfill_historical_segment_history,
     _mix_page_title,
     _build_income_statement_snapshot,
     _ensure_minimum_qna_topics,
     _enrich_history_with_official_structures,
     _harmonize_historical_structures,
+    _merge_fixture_payload,
     _segments_are_geography_like,
+    _stabilize_topic_cards,
     _quarter_fallback_for_structure,
     _sanitize_fixture_payload,
     _sanitize_history_quality_metrics,
+    _normalize_historical_segments,
     _recompute_history_derivatives,
     _report_cache_is_fresh,
     _normalize_segment_items,
+    _build_scoreboard,
     build_historical_quarter_cube,
     build_report_payload,
     company_quarters,
     create_report,
+    ensure_report_payload_defaults,
     resolve_calendar_quarter_from_months,
     resolve_structure_dimension,
 )
@@ -319,6 +355,8 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         self.addCleanup(self._restore_full_coverage_env)
         if DATA_DIR.exists():
             shutil.move(str(DATA_DIR), str(self._data_backup_path))
+        reports_service.REPORT_JOB_STATES.clear()
+        reports_service.REPORT_JOB_FUTURES.clear()
         init_db()
         self.client = TestClient(app)
 
@@ -326,6 +364,36 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         path = self._backup_root / filename
         path.write_text(content, encoding="utf-8")
         return str(path)
+
+    def _load_backup_official_material(self, company_id: str, calendar_quarter: str, filename: str) -> dict[str, object]:
+        bundled_path = Path(__file__).resolve().parents[1] / "app" / "data" / "cache" / "official-materials" / company_id / calendar_quarter / filename
+        path = self._data_backup_path / "cache" / "official-materials" / company_id / calendar_quarter / filename
+        if not path.exists():
+            path = DATA_DIR / "cache" / "official-materials" / company_id / calendar_quarter / filename
+        if not path.exists():
+            path = bundled_path
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        original_data_dir = DATA_DIR.resolve()
+        backup_data_dir = self._data_backup_path.resolve()
+        bundled_data_dir = (Path(__file__).resolve().parents[1] / "app" / "data").resolve()
+        loaded_from_bundled = path.resolve() == bundled_path.resolve()
+        for key in ("text_path", "raw_path"):
+            value = payload.get(key)
+            if not value:
+                continue
+            source_path = Path(str(value))
+            try:
+                relative = source_path.resolve().relative_to(original_data_dir)
+            except ValueError:
+                try:
+                    bundled_relative = source_path.resolve().relative_to(bundled_data_dir)
+                except ValueError:
+                    bundled_relative = None
+                if loaded_from_bundled and bundled_relative is not None:
+                    payload[key] = str(bundled_data_dir / bundled_relative)
+                continue
+            payload[key] = str((bundled_data_dir if loaded_from_bundled else backup_data_dir) / relative)
+        return payload
 
     def _restore_data_dir(self) -> None:
         if DATA_DIR.exists():
@@ -349,11 +417,31 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
     def test_calendar_quarter_mapping_uses_majority_months(self) -> None:
         self.assertEqual(resolve_calendar_quarter_from_months(["2025-11", "2025-12", "2026-01"]), "2025Q4")
 
-    def test_pdf_export_mode_defaults_to_raster(self) -> None:
+    def test_pdf_export_mode_defaults_to_vector(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(_pdf_export_mode(), "raster")
+            self.assertEqual(_pdf_export_mode(), "vector")
         with patch.dict(os.environ, {"EARNINGS_DIGEST_PDF_EXPORT_MODE": "vector"}, clear=False):
             self.assertEqual(_pdf_export_mode(), "vector")
+        with patch.dict(os.environ, {"EARNINGS_DIGEST_PDF_EXPORT_MODE": "raster"}, clear=False):
+            self.assertEqual(_pdf_export_mode(), "raster")
+
+    def test_export_html_to_pdf_prefers_vector_by_default(self) -> None:
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "app.services.pdf_export.asyncio.run",
+            side_effect=lambda coroutine: "vector-pdf",
+        ) as run_mock, patch(
+            "app.services.pdf_export._render_pdf_vector_async",
+            new=Mock(return_value="vector-coroutine"),
+        ) as vector_mock, patch(
+            "app.services.pdf_export._render_pdf_raster_async",
+            new=Mock(return_value="raster-coroutine"),
+        ) as raster_mock:
+            pdf_path = export_html_to_pdf("sample-report", "<html></html>")
+
+        self.assertEqual(pdf_path, "vector-pdf")
+        vector_mock.assert_called_once_with("sample-report", "<html></html>")
+        raster_mock.assert_not_called()
+        run_mock.assert_called_once_with("vector-coroutine")
 
     def test_build_raster_pdf_html_embeds_each_page_image(self) -> None:
         html = _build_raster_pdf_html(["page-01.png", "page-02.png"])
@@ -497,6 +585,15 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         self.assertIn("quality_report", payload)
         self.assertIn(payload["quality_report"]["status"], {"pass", "review", "fail"})
         self.assertIsInstance(payload["quality_report"]["score"], int)
+        self.assertEqual(payload["page_count"], 20)
+        self.assertIn("capital_allocation", payload)
+        self.assertIn("expectation_reset", payload)
+        self.assertIn("balance_quality", payload)
+        self.assertIn("validation_checklist", payload)
+        self.assertIn("capital_allocation", payload["visuals"])
+        self.assertIn("expectation_reset", payload["visuals"])
+        self.assertIn("balance_quality", payload["visuals"])
+        self.assertIn("validation_checklist", payload["visuals"])
 
     def test_sanitize_fixture_payload_keeps_reported_regional_segments(self) -> None:
         company = get_company("amazon")
@@ -797,6 +894,31 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
             ],
             "source_date": "2011-02-28",
         }
+        self.assertFalse(reports_service._historical_official_cache_is_temporally_aligned(entry, cached_payload))
+
+    def test_historical_official_cache_alignment_rejects_quarter_misaligned_apple_cache(self) -> None:
+        entry = {
+            "period_end": "2017-09-30",
+            "revenue_bn": 52.579,
+            "net_income_bn": 10.714,
+        }
+        cached_payload = {
+            "latest_kpis": {
+                "revenue_bn": 229.234,
+                "gaap_eps": 9.21,
+                "operating_cash_flow_bn": 15.7,
+            },
+            "current_segments": [
+                {"name": "iPhone", "value_bn": 46.677},
+                {"name": "Services", "value_bn": 8.501},
+            ],
+            "current_geographies": [
+                {"name": "Americas", "value_bn": 96.6},
+                {"name": "Europe", "value_bn": 54.938},
+            ],
+            "source_date": "2017-11-02",
+        }
+
         self.assertFalse(reports_service._historical_official_cache_is_temporally_aligned(entry, cached_payload))
 
     @patch("app.services.local_data.get_company_series")
@@ -1141,10 +1263,41 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
             },
         ]
         enriched = _backfill_historical_segment_history(company, history)
-        self.assertEqual(len(enriched[0]["segments"]), 6)
-        self.assertTrue(enriched[0]["segments_inferred"])
+        self.assertFalse(enriched[0]["segments"])
+        self.assertFalse(enriched[0].get("segments_inferred"))
         self.assertEqual(len(enriched[2]["segments"]), 6)
         self.assertTrue(enriched[2]["segments_inferred"])
+
+    def test_backfill_historical_geography_history_leaves_edge_quarters_unfilled(self) -> None:
+        history = [
+            {"quarter_label": "2025Q1", "revenue_bn": 20.0, "geographies": []},
+            {
+                "quarter_label": "2025Q2",
+                "revenue_bn": 22.0,
+                "geographies": [
+                    {"name": "United States", "value_bn": 10.0, "share_pct": 45.5},
+                    {"name": "EMEA", "value_bn": 6.0, "share_pct": 27.3},
+                    {"name": "APAC", "value_bn": 6.0, "share_pct": 27.3},
+                ],
+            },
+            {"quarter_label": "2025Q3", "revenue_bn": 24.0, "geographies": []},
+            {
+                "quarter_label": "2025Q4",
+                "revenue_bn": 26.0,
+                "geographies": [
+                    {"name": "United States", "value_bn": 11.7, "share_pct": 45.0},
+                    {"name": "EMEA", "value_bn": 7.0, "share_pct": 26.9},
+                    {"name": "APAC", "value_bn": 7.3, "share_pct": 28.1},
+                ],
+            },
+        ]
+
+        enriched = reports_service._backfill_historical_geography_history(history)
+
+        self.assertFalse(enriched[0]["geographies"])
+        self.assertFalse(enriched[0].get("geographies_inferred"))
+        self.assertEqual(len(enriched[2]["geographies"]), 3)
+        self.assertTrue(enriched[2]["geographies_inferred"])
 
     def test_backfill_historical_core_metrics_fills_isolated_gap_from_adjacent_quarters(self) -> None:
         history = [
@@ -1199,6 +1352,11 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
                 {"name": "China", "value_bn": 10.0, "share_pct": 32.4},
                 {"name": "Taiwan", "value_bn": 8.0, "share_pct": 25.9},
             ],
+            "guidance": {
+                "mode": "official",
+                "revenue_low_bn": 31.0,
+                "revenue_high_bn": 31.8,
+            },
         }
 
         with patch("app.services.reports.HISTORICAL_OFFICIAL_QUARTER_CACHE_DIR", cache_dir):
@@ -1221,6 +1379,8 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         self.assertTrue(second[0]["segments"])
         self.assertTrue(second[0]["geographies"])
         self.assertAlmostEqual(second[0]["equity_bn"], 21.0)
+        cached_snapshot = reports_service._load_historical_official_quarter_cache("asml", "2025Q4")
+        self.assertAlmostEqual(cached_snapshot["guidance"]["revenue_low_bn"], 31.0, places=2)
 
     def test_enrich_history_with_official_structures_reuses_stale_cache_structures_without_overwriting_metrics(self) -> None:
         company = get_company("nvidia")
@@ -1425,6 +1585,35 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         self.assertFalse(harmonized[1]["segments"])
         self.assertTrue(harmonized[0]["geographies"])
         self.assertTrue(harmonized[1]["geographies"])
+
+    def test_promote_history_geographies_as_segments_skips_non_quarterly_geography_scopes(self) -> None:
+        history = [
+            {
+                "quarter_label": "2017Q2",
+                "revenue_bn": 23.3,
+                "segments": [],
+                "geographies": [
+                    {"name": "United States", "value_bn": 11.0, "scope": "annual_filing"},
+                    {"name": "Other countries", "value_bn": 12.3, "scope": "annual_filing"},
+                ],
+            },
+            {
+                "quarter_label": "2017Q3",
+                "revenue_bn": 24.5,
+                "segments": [],
+                "geographies": [
+                    {"name": "United States", "value_bn": 12.1, "scope": "quarterly_mapped_from_official_geography"},
+                    {"name": "Other countries", "value_bn": 12.4, "scope": "quarterly_mapped_from_official_geography"},
+                ],
+            },
+        ]
+
+        promoted = reports_service._promote_history_geographies_as_segments(history)
+
+        self.assertFalse(promoted[0]["segments"])
+        self.assertFalse(promoted[1]["segments"])
+        self.assertFalse(promoted[0].get("segments_inferred"))
+        self.assertFalse(promoted[1].get("segments_inferred"))
 
     def test_extract_table_metric_handles_sec_footnote_rows(self) -> None:
         sample = """
@@ -1671,6 +1860,14 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         self.assertAlmostEqual(cube[-1]["revenue_bn"], 143.756, places=3)
         self.assertEqual(cube[-1]["fiscal_label"], "Q1 FY2026")
 
+    def test_apple_history_cube_uses_true_fiscal_labels_for_weekend_period_ends(self) -> None:
+        cube = build_historical_quarter_cube("apple", "2017Q3", 4)
+        labels = {entry["calendar_quarter"]: entry["fiscal_label"] for entry in cube}
+        self.assertEqual(labels["2016Q4"], "Q1 FY2017")
+        self.assertEqual(labels["2017Q1"], "Q2 FY2017")
+        self.assertEqual(labels["2017Q2"], "Q3 FY2017")
+        self.assertEqual(labels["2017Q3"], "Q4 FY2017")
+
     def test_avgo_history_cube_falls_back_when_segments_missing(self) -> None:
         cube = build_historical_quarter_cube("avgo", "2025Q4", 12)
         self.assertEqual(len(cube), 12)
@@ -1759,6 +1956,108 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         self.assertAlmostEqual(enriched[0]["revenue_bn"], 3.63, places=2)
         self.assertAlmostEqual(enriched[0]["net_income_bn"], 1.6, places=2)
         self.assertLess(enriched[0]["net_margin_pct"], 50.0)
+
+    def test_enrich_history_with_official_structures_keeps_structured_quarter_revenue_when_cache_is_annual_only(self) -> None:
+        company = get_company("microsoft")
+        history = [
+            {
+                "quarter_label": "2017Q2",
+                "period_end": "2017-06-30",
+                "revenue_bn": 23.317,
+                "net_income_bn": 6.513,
+                "gross_margin_pct": None,
+                "revenue_yoy_pct": 12.9,
+                "net_income_yoy_pct": 28.0,
+                "segments": [],
+                "geographies": [],
+                "source_type": "structured_financial_series",
+                "source_url": "",
+            }
+        ]
+
+        cached_snapshot = {
+            "latest_kpis": {
+                "revenue_bn": 89.95,
+                "net_income_bn": 21.2,
+            },
+            "current_segments": [],
+            "current_geographies": [
+                {"name": "United States", "value_bn": 44.0, "scope": "annual_filing"},
+                {"name": "Other countries", "value_bn": 45.95, "scope": "annual_filing"},
+            ],
+            "source_url": "https://example.com/msft/2017q2-10k",
+            "source_date": "2017-08-02",
+            "source_context": {
+                "has_annual_filing": True,
+                "has_quarterly_filing": False,
+            },
+        }
+
+        with patch("app.services.reports._load_historical_official_quarter_cache", return_value=cached_snapshot):
+            with patch("app.services.reports.resolve_official_sources", side_effect=AssertionError("should use cache")):
+                with patch("app.services.reports.hydrate_source_materials", side_effect=AssertionError("should use cache")):
+                    with patch("app.services.reports.parse_official_materials", side_effect=AssertionError("should use cache")):
+                        enriched = _enrich_history_with_official_structures(company, history)
+
+        self.assertAlmostEqual(enriched[0]["revenue_bn"], 23.317, places=3)
+        self.assertFalse(enriched[0]["segments"])
+        self.assertTrue(enriched[0]["geographies"])
+
+    def test_enrich_history_with_official_structures_quarterizes_stale_annual_like_geographies_without_scope(self) -> None:
+        company = get_company("alphabet")
+        history = [
+            {
+                "quarter_label": "2017Q4",
+                "period_end": "2017-12-31",
+                "revenue_bn": 32.323,
+                "net_income_bn": 12.662,
+                "gross_margin_pct": None,
+                "revenue_yoy_pct": 24.0,
+                "net_income_yoy_pct": 28.0,
+                "segments": [],
+                "geographies": [],
+                "source_type": "structured_financial_series",
+                "source_url": "",
+            }
+        ]
+
+        cached_snapshot = {
+            "latest_kpis": {
+                "revenue_bn": 32.323,
+                "net_income_bn": 12.662,
+            },
+            "current_segments": [],
+            "current_geographies": [
+                {"name": "International", "value_bn": 16.895},
+                {"name": "United States", "value_bn": 15.428},
+                {"name": "EMEA", "value_bn": 10.313},
+                {"name": "Asia Pacific", "value_bn": 4.687},
+                {"name": "Americas Excluding U.S.", "value_bn": 1.895},
+            ],
+            "source_url": "",
+            "source_date": "",
+        }
+
+        with patch("app.services.reports._load_historical_official_quarter_cache", return_value=cached_snapshot):
+            with patch("app.services.reports.resolve_official_sources", side_effect=AssertionError("should use cache")):
+                with patch("app.services.reports.hydrate_source_materials", side_effect=AssertionError("should use cache")):
+                    with patch("app.services.reports.parse_official_materials", side_effect=AssertionError("should use cache")):
+                        enriched = _enrich_history_with_official_structures(company, history)
+
+        geographies = enriched[0]["geographies"]
+        self.assertEqual(
+            [item["name"] for item in geographies],
+            [
+                "United States",
+                "EMEA",
+                "Asia Pacific",
+                "Americas Excluding U.S.",
+            ],
+        )
+        self.assertAlmostEqual(sum(float(item["value_bn"]) for item in geographies), 32.323, places=3)
+        self.assertTrue(
+            all(str(item.get("scope") or "") == "quarterly_mapped_from_official_geography" for item in geographies)
+        )
 
     def test_companyfacts_series_maps_historical_quarter_metrics(self) -> None:
         payload = {
@@ -1866,6 +2165,36 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         )
 
         self.assertGreaterEqual(len(merged["qna_themes"]), 3)
+
+    def test_merge_parsed_payload_merges_current_segments_by_name_without_overwriting_primary_values(self) -> None:
+        merged = _merge_parsed_payload(
+            {
+                "current_segments": [
+                    {"name": "Productivity and Business Processes", "value_bn": 8.2, "yoy_pct": 28.0},
+                    {"name": "Intelligent Cloud", "value_bn": 6.9, "yoy_pct": 14.0},
+                ]
+            },
+            {
+                "current_segments": [
+                    {"name": "Productivity and Business Processes", "value_bn": 11.808, "yoy_pct": 16.9},
+                    {"name": "Intelligent Cloud", "value_bn": 10.156, "yoy_pct": 14.1},
+                    {"name": "More Personal Computing", "value_bn": 9.4, "yoy_pct": -1.0},
+                ]
+            },
+        )
+
+        segment_map = {item["name"]: item for item in merged["current_segments"]}
+        self.assertEqual(
+            [item["name"] for item in merged["current_segments"]],
+            [
+                "More Personal Computing",
+                "Productivity and Business Processes",
+                "Intelligent Cloud",
+            ],
+        )
+        self.assertAlmostEqual(segment_map["Productivity and Business Processes"]["value_bn"], 8.2, places=3)
+        self.assertAlmostEqual(segment_map["Intelligent Cloud"]["value_bn"], 6.9, places=3)
+        self.assertAlmostEqual(segment_map["More Personal Computing"]["value_bn"], 9.4, places=3)
 
     def test_historical_sec_cik_override_applies_for_alphabet_pre_reorg(self) -> None:
         source_config = dict(get_company("alphabet")["official_source"])
@@ -2165,6 +2494,47 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
             [item["name"] for item in parsed["current_geographies"][:4]],
         )
 
+    def test_normalize_segment_items_alphabet_drops_google_services_rollup_when_children_present(self) -> None:
+        normalized = _normalize_segment_items(
+            get_company("alphabet"),
+            [
+                {"name": "Google Services", "value_bn": 30.856},
+                {"name": "Google Search & other", "value_bn": 49.385},
+                {"name": "YouTube ads", "value_bn": 8.921},
+                {"name": "Google Network", "value_bn": 7.548},
+                {"name": "Google subscriptions, platforms, and devices", "value_bn": 10.656},
+                {"name": "Google Cloud", "value_bn": 11.353},
+                {"name": "Other Bets", "value_bn": 0.388},
+            ],
+        )
+
+        self.assertEqual(
+            [item["name"] for item in normalized],
+            [
+                "Google Search & other",
+                "YouTube ads",
+                "Google Network",
+                "Google subscriptions, platforms, and devices",
+                "Google Cloud",
+                "Other Bets",
+            ],
+        )
+
+    def test_normalize_segment_items_alphabet_keeps_google_other_old_taxonomy(self) -> None:
+        normalized = _normalize_segment_items(
+            get_company("alphabet"),
+            [
+                {"name": "Google Search & other", "value_bn": 42.6},
+                {"name": "Google other", "value_bn": 8.1},
+                {"name": "Google Cloud", "value_bn": 8.0},
+            ],
+        )
+
+        self.assertEqual(
+            [item["name"] for item in normalized],
+            ["Google Search & other", "Google other", "Google Cloud"],
+        )
+
     @patch("app.services.official_source_resolver._fetch_text")
     def test_discover_default_sitemap_urls_uses_robots_and_common_paths(self, mock_fetch_text: object) -> None:
         def fake_fetch(url: str) -> str:
@@ -2371,6 +2741,43 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
         )
 
         self.assertAlmostEqual(parsed["latest_kpis"]["ending_equity_bn"], 4_616.63, places=2)
+
+    def test_parse_official_materials_generic_release_extracts_cash_flow_reconciliation_metrics(self) -> None:
+        release_path = self._write_temp_text(
+            "generic-cashflow-release.txt",
+            (
+                "Example Corp reported revenue of $10.0 billion, up 11% year over year. "
+                "Net income was $2.5 billion. "
+                "Reconciliation from GAAP Net Cash Provided by Operating Activities to Non-GAAP Free Cash Flow "
+                "(in millions; unaudited): Quarter Ended December 31, 2024 "
+                "Net cash provided by operating activities $ 3,900 "
+                "Less: purchases of property and equipment (1,400) "
+                "Free cash flow $ 2,500."
+            ),
+        )
+
+        parsed = parse_official_materials(
+            {
+                "id": "example-generic",
+                "name": "Example Corp",
+                "english_name": "Example Corp",
+                "ticker": "EXM",
+                "money_symbol": "$",
+                "currency_code": "USD",
+            },
+            {"calendar_quarter": "2024Q4", "fiscal_label": "2024Q4", "coverage_notes": []},
+            [
+                {
+                    "label": "Example Corp earnings release",
+                    "kind": "official_release",
+                    "status": "cached",
+                    "text_path": release_path,
+                }
+            ],
+        )
+
+        self.assertAlmostEqual(parsed["latest_kpis"]["operating_cash_flow_bn"], 3.9, places=3)
+        self.assertAlmostEqual(parsed["latest_kpis"]["free_cash_flow_bn"], 2.5, places=3)
 
     def test_parse_official_materials_tsmc_legacy_application_mix_maps_to_platform_segments(self) -> None:
         presentation_path = self._write_temp_text(
@@ -2679,7 +3086,6 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
 
         self.assertEqual([item["name"] for item in preferred], [item["name"] for item in candidate])
 
-
 class OfficialSourceResolverUnitTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self._backup_root = Path(tempfile.mkdtemp(prefix="official-source-tests-"))
@@ -2693,6 +3099,8 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.addCleanup(self._restore_full_coverage_env)
         if DATA_DIR.exists():
             shutil.move(str(DATA_DIR), str(self._data_backup_path))
+        reports_service.REPORT_JOB_STATES.clear()
+        reports_service.REPORT_JOB_FUTURES.clear()
         init_db()
         self.client = TestClient(app)
 
@@ -2703,6 +3111,36 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         path = self._backup_root / filename
         path.write_text(content, encoding="utf-8")
         return str(path)
+
+    def _load_backup_official_material(self, company_id: str, calendar_quarter: str, filename: str) -> dict[str, object]:
+        bundled_path = Path(__file__).resolve().parents[1] / "app" / "data" / "cache" / "official-materials" / company_id / calendar_quarter / filename
+        path = self._data_backup_path / "cache" / "official-materials" / company_id / calendar_quarter / filename
+        if not path.exists():
+            path = DATA_DIR / "cache" / "official-materials" / company_id / calendar_quarter / filename
+        if not path.exists():
+            path = bundled_path
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        original_data_dir = DATA_DIR.resolve()
+        backup_data_dir = self._data_backup_path.resolve()
+        bundled_data_dir = (Path(__file__).resolve().parents[1] / "app" / "data").resolve()
+        loaded_from_bundled = path.resolve() == bundled_path.resolve()
+        for key in ("text_path", "raw_path"):
+            value = payload.get(key)
+            if not value:
+                continue
+            source_path = Path(str(value))
+            try:
+                relative = source_path.resolve().relative_to(original_data_dir)
+            except ValueError:
+                try:
+                    bundled_relative = source_path.resolve().relative_to(bundled_data_dir)
+                except ValueError:
+                    bundled_relative = None
+                if loaded_from_bundled and bundled_relative is not None:
+                    payload[key] = str(bundled_data_dir / bundled_relative)
+                continue
+            payload[key] = str((bundled_data_dir if loaded_from_bundled else backup_data_dir) / relative)
+        return payload
 
     def _restore_data_dir(self) -> None:
         if DATA_DIR.exists():
@@ -2769,6 +3207,38 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
             "text": "Broadcom Inc. Will Host First Quarter Fiscal Year 2026 Conference Call",
         }
         self.assertFalse(_ir_role_keywords_match(upcoming_call_link, "earnings_call"))
+
+    def test_page_links_extracts_custom_link_attribute_for_transcript_widgets(self) -> None:
+        links = _page_links(
+            "https://www.microsoft.com/en-us/investor/earnings/fy-2018-q1/press-release-webcast",
+            (
+                '<html><body>'
+                '<li slot="link-list-data" '
+                'link="https://view.officeapps.live.com/op/view.aspx?src=https://cdn-dynmedia-1.microsoft.com/is/content/microsoftcorp/TranscriptFY18Q1" '
+                'arialabel="View Earnings Call Transcript of FY18Q1 (opens in new window)">'
+                'Earnings Call Transcript'
+                '</li>'
+                "</body></html>"
+            ),
+        )
+
+        transcript_urls = [str(item.get("url") or "") for item in links]
+        self.assertIn(
+            "https://cdn-dynmedia-1.microsoft.com/is/content/microsoftcorp/TranscriptFY18Q1",
+            transcript_urls,
+        )
+
+    def test_documentish_page_link_rejects_asset_and_social_share_urls(self) -> None:
+        self.assertFalse(
+            _documentish_page_link(
+                "https://www.microsoft.com/onerfstatics/marketingsites-eas-prod/west-european/shell/_scrf/css/themes=default.device=uplevel_web_pc/foo"
+            )
+        )
+        self.assertFalse(
+            _documentish_page_link(
+                "https://www.linkedin.com/shareArticle?url=https://www.microsoft.com/en-us/investor/earnings/fy-2018-q1/press-release-webcast"
+            )
+        )
 
     @patch("app.services.official_source_resolver._fetch_text")
     def test_expand_related_ir_sources_recurses_into_event_page_script_links(self, mock_fetch_text: object) -> None:
@@ -2879,6 +3349,35 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         transcript_item = next(item for item in related if str(item.get("url") or "").endswith("q4-2025-transcript.pdf"))
         self.assertNotIn("events page", str(transcript_item.get("label") or "").lower())
 
+    @patch("app.services.official_source_resolver._fetch_json_response")
+    def test_discover_wayback_sources_prefers_temporally_aligned_transcript_urls(
+        self,
+        mock_fetch_json_response: object,
+    ) -> None:
+        transcript_url = "https://abc.xyz/assets/investor/static/pdf/2017_Q4_Earnings_Transcript.pdf"
+        generic_url = "https://abc.xyz/investor/"
+        wrong_year_url = "https://abc.xyz/assets/investor/static/pdf/2019_Q1_Earnings_Transcript.pdf"
+        mock_fetch_json_response.return_value = [
+            ["timestamp", "original", "statuscode", "mimetype"],
+            ["20240622055434", transcript_url, "200", "application/pdf"],
+            ["20240622055435", generic_url, "200", "text/html"],
+            ["20240622055436", wrong_year_url, "200", "application/pdf"],
+        ]
+
+        company = get_company("alphabet")
+        discovered = _discover_wayback_sources(
+            company,
+            "2017Q4",
+            "2017-12-31",
+            required_roles={"earnings_call"},
+        )
+
+        self.assertEqual(len(discovered), 1)
+        self.assertEqual(discovered[0]["role"], "earnings_call")
+        self.assertEqual(discovered[0]["kind"], "call_summary")
+        self.assertEqual(discovered[0]["url"], transcript_url)
+        self.assertIn("web.archive.org/web/20240622055434if_/", str(discovered[0].get("fetch_url") or ""))
+
     def test_material_text_quality_issue_accepts_short_real_release_excerpt(self) -> None:
         issue = official_materials._material_text_quality_issue(
             {
@@ -2894,6 +3393,85 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
             suffix=".txt",
         )
         self.assertEqual(issue, "")
+
+    def test_material_text_quality_issue_ignores_embedded_outage_phrase_in_long_sec_filing(self) -> None:
+        text = (
+            "Tesla Annual Report Form 10-K Risk factors discuss demand, revenue, cash flow, net income and operating margin. "
+            "The following table presents revenues by geographic area based on the sales location of our products (in millions): "
+            "United States 11111 10101 China 6789 6123 Other international 7000 6555. "
+            "Government incentives in certain areas were cancelled or temporarily unavailable in prior periods, "
+            "which may have negatively impacted sales, but this filing still contains the official geographic revenue table."
+        )
+        issue = official_materials._material_text_quality_issue(
+            {
+                "kind": "sec_filing",
+                "role": "sec_filing",
+            },
+            title="Tesla Form 10-K",
+            text=text,
+            content_type="text/html",
+            suffix=".htm",
+        )
+        self.assertEqual(issue, "")
+
+    def test_hydrate_source_materials_reclassifies_false_positive_sec_filing_cache(self) -> None:
+        source = {
+            "label": "Tesla Form 10-K",
+            "url": "https://www.sec.gov/Archives/edgar/data/1318605/000162828026003952/tsla-20251231.htm",
+            "kind": "sec_filing",
+            "role": "sec_filing",
+            "date": "2026-01-29",
+        }
+        cache_root = self._backup_root / "official-materials" / "tsla" / "2025Q4"
+        cache_root.mkdir(parents=True, exist_ok=True)
+        key = official_materials._source_key(source)
+        raw_path = cache_root / f"{key}.htm"
+        text_path = cache_root / f"{key}.txt"
+        meta_path = cache_root / f"{key}.json"
+        raw_path.write_text("<html><body>stub</body></html>", encoding="utf-8")
+        filing_text = (
+            "Tesla Annual Report Form 10-K. "
+            "The following table presents revenues by geographic area based on the sales location of our products (in millions): "
+            "United States 11111 10101 China 6789 6123 Other international 7000 6555. "
+            "Government incentives in certain areas were cancelled or temporarily unavailable in prior periods."
+        )
+        text_path.write_text(filing_text, encoding="utf-8")
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "label": source["label"],
+                    "url": source["url"],
+                    "fetch_url": "",
+                    "kind": source["kind"],
+                    "role": source["role"],
+                    "date": source["date"],
+                    "status": "error",
+                    "from_cache": False,
+                    "content_type": "text/html",
+                    "title": "Tesla Form 10-K",
+                    "excerpt": filing_text[:160],
+                    "text_length": len(filing_text),
+                    "raw_path": str(raw_path),
+                    "text_path": str(text_path),
+                    "fetched_at": datetime.now(timezone.utc).isoformat(),
+                    "error": "unusable source page: temporarily unavailable",
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        official_materials.HYDRATED_MATERIALS_MEMORY_CACHE.clear()
+        with patch("app.services.official_materials._source_cache_dir", return_value=cache_root):
+            materials = official_materials.hydrate_source_materials("tsla", "2025Q4", [source], refresh=False)
+
+        self.assertEqual(len(materials), 1)
+        self.assertEqual(materials[0]["status"], "cached")
+        self.assertEqual(materials[0]["error"], "")
+        updated_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        self.assertEqual(updated_meta["status"], "cached")
+        self.assertEqual(updated_meta["error"], "")
 
     def test_extract_generic_guidance_supports_currency_prefix_and_plus_minus_percent(self) -> None:
         guidance = _extract_generic_guidance(
@@ -2914,6 +3492,1135 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertEqual(tolerance_guidance["mode"], "official")
         self.assertAlmostEqual(tolerance_guidance["revenue_bn"], 43.0, places=2)
         self.assertIn("±2%", tolerance_guidance["commentary"])
+
+    @patch.dict(os.environ, {"EARNINGS_DIGEST_DISABLE_SOURCE_FETCH": "0"})
+    @patch("app.services.official_materials.httpx.Client")
+    def test_hydrate_source_materials_falls_back_to_wayback_snapshot_after_challenge_page(
+        self,
+        mock_client: object,
+    ) -> None:
+        source_url = "https://example.com/investor/q4-2017-earnings-call.html"
+        snapshot_url = f"https://web.archive.org/web/20240622055434if_/{source_url}"
+
+        class _FakeResponse:
+            def __init__(self, status_code: int, content: bytes, *, content_type: str) -> None:
+                self.status_code = status_code
+                self.content = content
+                self.headers = {"content-type": content_type}
+                self.text = content.decode("utf-8", errors="ignore")
+
+            def raise_for_status(self) -> None:
+                if self.status_code >= 400:
+                    raise httpx.HTTPStatusError(
+                        f"HTTP {self.status_code}",
+                        request=httpx.Request("GET", "https://example.com"),
+                        response=httpx.Response(self.status_code),
+                    )
+
+            def json(self) -> object:
+                return json.loads(self.text)
+
+        class _FakeClient:
+            def __enter__(self) -> "_FakeClient":
+                return self
+
+            def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+                return False
+
+            def get(self, url: str, params: object = None) -> _FakeResponse:
+                if url == source_url:
+                    return _FakeResponse(
+                        403,
+                        b"<!doctype html><html><head><title>Just a moment...</title></head><body>Performing security verification</body></html>",
+                        content_type="text/html; charset=utf-8",
+                    )
+                if url == "https://web.archive.org/cdx/search/cdx":
+                    payload = json.dumps(
+                        [
+                            ["timestamp", "original", "statuscode", "mimetype"],
+                            ["20240622055434", source_url, "200", "text/html"],
+                        ]
+                    ).encode("utf-8")
+                    return _FakeResponse(200, payload, content_type="application/json")
+                if url == snapshot_url:
+                    return _FakeResponse(
+                        200,
+                        (
+                            "<html><body>"
+                            "<h1>Alphabet Q4 2017 Earnings Call Transcript</h1>"
+                            "<p>Revenue was $32.3 billion. Management provided conference call commentary and forward-looking remarks.</p>"
+                            "</body></html>"
+                        ).encode("utf-8"),
+                        content_type="text/html; charset=utf-8",
+                    )
+                raise AssertionError(f"unexpected url: {url}")
+
+        mock_client.return_value = _FakeClient()
+
+        materials = official_materials.hydrate_source_materials(
+            "alphabet",
+            "2017Q4",
+            [
+                {
+                    "label": "Alphabet earnings call",
+                    "url": source_url,
+                    "kind": "call_summary",
+                    "role": "earnings_call",
+                    "date": "2018-02-01",
+                }
+            ],
+            refresh=True,
+        )
+
+        self.assertEqual(len(materials), 1)
+        self.assertEqual(materials[0]["status"], "fetched")
+        self.assertEqual(materials[0]["url"], source_url)
+        self.assertEqual(materials[0].get("fetch_url"), snapshot_url)
+        extracted_text = Path(str(materials[0]["text_path"])).read_text(encoding="utf-8")
+        self.assertIn("Earnings Call Transcript", extracted_text)
+        self.assertIn("Revenue was $32.3 billion", extracted_text)
+
+    def test_extract_generic_guidance_aggregates_segment_level_ranges(self) -> None:
+        guidance = _extract_generic_guidance(
+            {
+                "flat_text": (
+                    "For the next quarter, we expect revenue in Productivity and Business Processes to be between $29.7 billion and $30.0 billion, "
+                    "revenue in Intelligent Cloud to be between $28.95 billion and $29.25 billion, "
+                    "and revenue in More Personal Computing to be between $12.35 billion and $12.85 billion."
+                ),
+            }
+        )
+        self.assertEqual(guidance["mode"], "official")
+        self.assertAlmostEqual(guidance["revenue_low_bn"], 71.0, places=2)
+        self.assertAlmostEqual(guidance["revenue_high_bn"], 72.1, places=2)
+        self.assertAlmostEqual(guidance["revenue_bn"], 71.55, places=2)
+        self.assertIn("分部加总", guidance["comparison_label"])
+
+    def test_extract_generic_guidance_handles_microsoft_segment_outlook_and_ignores_capital_return_amount(self) -> None:
+        guidance = _extract_generic_guidance(
+            {
+                "flat_text": (
+                    "This quarter, we returned $4.8 billion to shareholders through dividends and share repurchases. "
+                    "Now let's turn to the Q2 outlook. "
+                    "In Productivity and Business Processes, we expect revenue between $8.75 and $8.95 billion. "
+                    "In Intelligent Cloud, we expect revenue between $7.35 and $7.55 billion. "
+                    "In More Personal Computing, we expect revenue between $11.7 to $12.1 billion."
+                ),
+            }
+        )
+
+        self.assertEqual(guidance["mode"], "official")
+        self.assertAlmostEqual(guidance["revenue_low_bn"], 27.8, places=2)
+        self.assertAlmostEqual(guidance["revenue_high_bn"], 28.6, places=2)
+        self.assertAlmostEqual(guidance["revenue_bn"], 28.2, places=2)
+        self.assertIn("分部加总", guidance["commentary"])
+
+    def test_extract_generic_guidance_aggregates_segment_scoped_revenue_of_ranges(self) -> None:
+        guidance = _extract_generic_guidance(
+            {
+                "flat_text": (
+                    "Now let's turn to the Q3 outlook. "
+                    "In Productivity and Business Processes we expect revenue of $34.25 to $34.55 billion. "
+                    "For Intelligent Cloud, we expect revenue of $34.1 to $34.4 billion. "
+                    "In More Personal Computing, we expect revenue to be $12.3 to $12.8 billion."
+                ),
+            }
+        )
+
+        self.assertEqual(guidance["mode"], "official")
+        self.assertAlmostEqual(guidance["revenue_low_bn"], 80.65, places=2)
+        self.assertAlmostEqual(guidance["revenue_high_bn"], 81.75, places=2)
+        self.assertAlmostEqual(guidance["revenue_bn"], 81.2, places=2)
+        self.assertIn("分部加总", guidance["commentary"])
+
+    def test_extract_segment_level_generic_guidance_normalizes_microsoft_outlook_labels(self) -> None:
+        matches = _extract_segment_level_generic_guidance(
+            (
+                "This quarter, we returned $4.8 billion to shareholders through dividends and share repurchases. "
+                "Now let's turn to the Q2 outlook. "
+                "In Productivity and Business Processes, we expect revenue between $8.75 and $8.95 billion. "
+                "In Intelligent Cloud, we expect revenue between $7.35 and $7.55 billion. "
+                "In More Personal Computing, we expect revenue between $11.7 to $12.1 billion."
+            )
+        )
+
+        self.assertEqual(
+            [item["label"] for item in matches],
+            [
+                "Productivity and Business Processes",
+                "Intelligent Cloud",
+                "More Personal Computing",
+            ],
+        )
+        self.assertEqual(
+            [(round(item["low_bn"], 2), round(item["high_bn"], 2)) for item in matches],
+            [(8.75, 8.95), (7.35, 7.55), (11.7, 12.1)],
+        )
+
+    def test_extract_segment_level_generic_guidance_dedupes_full_microsoft_transcript_excerpt(self) -> None:
+        matches = _extract_segment_level_generic_guidance(
+            (
+                "We expect approximately $1.2 billion of LinkedIn revenue reflecting continued strong sales execution by the team. "
+                "In Intelligent Cloud, we expect revenue between $7.35 and $7.55 billion, with another quarter of double-digit revenue growth across our server products and cloud services. "
+                "As a reminder, starting in Q2 of last year, the launch of Windows Server 2016 drove strong on-premises performance. "
+                "We expect Enterprise Services revenue growth to be similar to last quarter. "
+                "In More Personal Computing, we expect revenue between $11.7 to $12.1 billion. "
+                "Earlier in the outlook, In Productivity and Business Processes, we expect revenue between $8.75 and $8.95 billion."
+            )
+        )
+
+        self.assertEqual(
+            [item["label"] for item in matches],
+            [
+                "Intelligent Cloud",
+                "More Personal Computing",
+                "Productivity and Business Processes",
+            ],
+        )
+
+    def test_extract_segment_level_generic_guidance_handles_large_microsoft_10q_quickly(self) -> None:
+        flat_text = (
+            (
+                "Productivity and Business Processes revenue was driven by Office 365 and LinkedIn. "
+                "Intelligent Cloud revenue was driven by Azure and server products. "
+                "More Personal Computing revenue reflected Windows OEM, Surface, and gaming trends. "
+            )
+            * 600
+        )
+
+        if not hasattr(signal, "setitimer"):
+            self.skipTest("platform does not support setitimer")
+
+        previous_handler = signal.getsignal(signal.SIGALRM)
+
+        def _timeout_handler(_signum: int, _frame: object) -> None:
+            raise TimeoutError("segment guidance extraction took too long on cached Microsoft 10-Q text")
+
+        signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.setitimer(signal.ITIMER_REAL, 3.0)
+        try:
+            matches = _extract_segment_level_generic_guidance(flat_text)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+
+        self.assertEqual(matches, [])
+
+    def test_label_candidate_text_returns_local_window_for_single_line_document(self) -> None:
+        text = (
+            "Lead-in " * 240
+            + "Revenue from unrelated licensing was $14.969 billion and restructuring charges were $2.5 billion. "
+            + "Later the filing introduces Productivity and Business Processes as a future reporting segment. "
+            + "Trailing appendix " * 260
+        )
+
+        narrowed = _label_candidate_text(text, "Productivity and Business Processes")
+
+        self.assertIn("Productivity and Business Processes", narrowed)
+        self.assertLess(len(narrowed), 1600)
+        self.assertNotIn("$14.969 billion", narrowed)
+
+    def test_extract_company_segments_microsoft_legacy_annual_materials_do_not_fabricate_modern_segments(self) -> None:
+        annual_like_text = (
+            "Microsoft recorded $14.969 billion of Productivity and Business Processes deferred revenue balances, "
+            "$2.5 billion of Intelligent Cloud goodwill, "
+            "and $0.38 billion of More Personal Computing restructuring charges. "
+            "These disclosures describe balance sheet and special-item context rather than quarterly segment revenue."
+        )
+
+        segments = _extract_company_segments(
+            "microsoft",
+            [
+                {
+                    "label": "Microsoft annual release",
+                    "kind": "official_release",
+                    "status": "cached",
+                    "raw_text": annual_like_text,
+                    "flat_text": _flatten_text(annual_like_text),
+                },
+                {
+                    "label": "Microsoft Form 10-K annual report",
+                    "kind": "sec_filing",
+                    "status": "cached",
+                    "raw_text": annual_like_text,
+                    "flat_text": _flatten_text(annual_like_text),
+                },
+            ],
+            revenue_bn=22.2,
+            target_calendar_quarter="2015Q2",
+        )
+
+        self.assertEqual(segments, [])
+
+    def test_extract_company_segments_microsoft_legacy_subsegment_aliases_do_not_roll_up_to_modern_segments(self) -> None:
+        legacy_release_text = (
+            "Office Commercial revenue decreased $823 million or 18%. "
+            "Server products and services revenue grew 4%. "
+            "Windows OEM revenue decreased $683 million or 22%. "
+            "Computing and Gaming Hardware, including Xbox and Surface, delivered nearly $2 billion in revenue. "
+            "These lines describe legacy product buckets rather than the later modern reporting segments."
+        )
+
+        segments = _extract_company_segments(
+            "microsoft",
+            [
+                {
+                    "label": "Microsoft legacy quarterly release",
+                    "kind": "official_release",
+                    "status": "cached",
+                    "raw_text": legacy_release_text,
+                    "flat_text": _flatten_text(legacy_release_text),
+                }
+            ],
+            revenue_bn=22.2,
+            target_calendar_quarter="2015Q2",
+        )
+
+        self.assertEqual(segments, [])
+
+    def test_extract_company_segments_ignores_annual_sec_generic_table_noise(self) -> None:
+        annual_noise_text = (
+            "Our annual report on Form 10-K discusses business groups and product support context. \n"
+            "Segment revenue 2015 2014 \n"
+            "Our annual report on Form 10-K 10,000 10,000 \n"
+            "product support and consulting services, 8,000 7,500 \n"
+        )
+
+        segments = _extract_company_segments(
+            "microsoft",
+            [
+                {
+                    "label": "Microsoft Form 10-K annual report",
+                    "kind": "sec_filing",
+                    "status": "cached",
+                    "raw_text": annual_noise_text,
+                    "flat_text": _flatten_text(annual_noise_text),
+                }
+            ],
+            revenue_bn=22.2,
+            target_calendar_quarter="2015Q2",
+        )
+
+        self.assertEqual(segments, [])
+
+    def test_extract_company_segments_ignores_fragmentary_generic_text_table_rows(self) -> None:
+        fragmentary_text = (
+            "business segment revenue 2015 2014 \n"
+            "Surface revenue increased 888 409 \n"
+            "Xbox Platform revenue increased 86 69 \n"
+            "million or 300 200 \n"
+        )
+
+        segments = _extract_company_segments(
+            "microsoft",
+            [
+                {
+                    "label": "Microsoft noisy release",
+                    "kind": "official_release",
+                    "status": "cached",
+                    "raw_text": fragmentary_text,
+                    "flat_text": _flatten_text(fragmentary_text),
+                }
+            ],
+            revenue_bn=3.2,
+            target_calendar_quarter="2015Q2",
+        )
+
+        self.assertEqual(segments, [])
+
+    def test_extract_generic_guidance_ignores_noisy_microsoft_style_sec_filing_context(self) -> None:
+        flat_text = (
+            "Recent Accounting Guidance Recently Adopted Accounting Guidance Leases. "
+            "The Company reviews business outlook for the investee and expected credit loss factors. "
+            + (
+                "Productivity and Business Processes revenue was driven by Office 365 and LinkedIn. "
+                "Intelligent Cloud revenue was driven by Azure and server products. "
+                "More Personal Computing revenue reflected Windows OEM, Surface, and gaming trends. "
+            )
+            * 600
+        )
+
+        if not hasattr(signal, "setitimer"):
+            self.skipTest("platform does not support setitimer")
+
+        previous_handler = signal.getsignal(signal.SIGALRM)
+
+        def _timeout_handler(_signum: int, _frame: object) -> None:
+            raise TimeoutError("generic guidance extraction took too long on noisy Microsoft-style 10-Q text")
+
+        signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.setitimer(signal.ITIMER_REAL, 8.0)
+        try:
+            guidance = _extract_generic_guidance({"flat_text": flat_text})
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+
+        self.assertEqual(guidance, {})
+
+    def test_extract_generic_guidance_ignores_foreign_exchange_hedge_context(self) -> None:
+        guidance = _extract_generic_guidance(
+            {
+                "flat_text": (
+                    "We enter into foreign exchange contracts to hedge our forecasted revenues in the fourth quarter of 2016. "
+                    "We expect that other income (expense), net, will fluctuate in dollar amount in future periods as exchange rates change."
+                )
+            }
+        )
+
+        self.assertEqual(guidance, {})
+
+    def test_guidance_excerpt_has_signal_rejects_release_level_business_outlook_boilerplate(self) -> None:
+        self.assertFalse(
+            _guidance_excerpt_has_signal(
+                "Business Outlook Microsoft will provide forward-looking guidance in connection with this quarterly earnings announcement on its earnings conference call and webcast."
+            )
+        )
+
+    def test_guidance_excerpt_has_signal_rejects_repurchase_and_stock_settlement_context(self) -> None:
+        self.assertFalse(
+            _guidance_excerpt_has_signal(
+                "The repurchase is expected to be executed from time to time, subject to general business and market conditions and other investment opportunities, through open market purchases or privately negotiated transactions, including through Rule 10b5-1 plans."
+            )
+        )
+        self.assertFalse(
+            _guidance_excerpt_has_signal(
+                "We expect to settle these awards in Alphabet stock."
+            )
+        )
+
+    def test_guidance_excerpt_has_signal_rejects_forward_looking_risk_factor_disclaimer(self) -> None:
+        self.assertFalse(
+            _guidance_excerpt_has_signal(
+                "These statements involve a number of risks and uncertainties that could cause actual results to differ materially. "
+                "For more information, please refer to the risk factors discussed in our Form 10-K. "
+                "We have invested and expect to continue to invest in new businesses, products, services, and technologies."
+            )
+        )
+
+    def test_extract_generic_guidance_ignores_release_level_business_outlook_boilerplate(self) -> None:
+        guidance = _extract_generic_guidance(
+            {
+                "flat_text": (
+                    "Revenue was $24.5 billion and increased 12%. "
+                    "Business Outlook Microsoft will provide forward-looking guidance in connection with this quarterly earnings announcement on its earnings conference call and webcast."
+                )
+            }
+        )
+        self.assertEqual(guidance, {})
+
+    def test_extract_generic_guidance_skips_safe_harbor_excerpt_and_keeps_scanning_outlook(self) -> None:
+        guidance = _extract_generic_guidance(
+            {
+                "flat_text": (
+                    "Our comments today will include forward-looking statements about the expected performance of our businesses "
+                    "and our expected level of capital expenditures. "
+                    "I will then conclude with our outlook. "
+                    "While we expect Sites TAC to continue to increase as a percentage of Sites revenue, "
+                    "we anticipate that the pace of year-over-year growth in Sites TAC will slow after the first quarter of 2018. "
+                    "For 2018, we remain excited about the investments ahead."
+                )
+            }
+        )
+
+        self.assertEqual(guidance["mode"], "official_context")
+        self.assertIn("Sites TAC", guidance["commentary"])
+        self.assertIn("first quarter of 2018", guidance["commentary"])
+
+    def test_extract_generic_guidance_keeps_non_revenue_operating_outlook_as_official_context(self) -> None:
+        guidance = _extract_generic_guidance(
+            {
+                "flat_text": (
+                    "I will then conclude with our outlook. "
+                    "For 2018, we remain excited about the investments ahead. "
+                    "You'll see us continue to support our priority areas with increased headcount. "
+                    "Our biannual grant to SVPs will also occur in the first quarter. "
+                    "For our Other Bets, in 2018 we will continue to calibrate the magnitude and pace of investment."
+                )
+            }
+        )
+
+        self.assertEqual(guidance["mode"], "official_context")
+        self.assertIn("increased headcount", guidance["commentary"])
+        self.assertIn("Other Bets", guidance["commentary"])
+
+    def test_extract_generic_guidance_real_alphabet_transcript_does_not_stop_at_outline_sentence(self) -> None:
+        guidance = _extract_generic_guidance(
+            {
+                "flat_text": (
+                    "You can see the components in our earnings press release. "
+                    "Second, I will review results for Google, and then Other Bets. "
+                    "I will then conclude with our outlook. "
+                    "Sundar will then discuss business and product highlights, after which we will take your questions. "
+                    "Let me close with some observations on our priorities and longer-term outlook. "
+                    "Our 23% revenue growth in 2017 was powered in particular by the ongoing extraordinary performance of our Sites business. "
+                    "While we expect Sites TAC to continue to increase as a percentage of Sites revenue reflecting ongoing strength in mobile search, "
+                    "we anticipate that the pace of year-over-year growth in Sites TAC as a percentage of Sites Revenue will slow after the first quarter of 2018. "
+                    "Within opex, we are keenly focused on prioritization in order to optimize the resources we are investing for longer-term growth. "
+                    "You'll see us continue to support our priority areas with increased headcount."
+                )
+            }
+        )
+
+        self.assertEqual(guidance["mode"], "official_context")
+        self.assertIn("Sites TAC", guidance["commentary"])
+        self.assertIn("increased headcount", guidance["commentary"])
+
+    def test_extract_generic_guidance_normalizes_pdf_ligatures_in_near_term_guidance(self) -> None:
+        guidance = _extract_generic_guidance(
+            {
+                "flat_text": (
+                    "Within cost of revenues, the biggest component is traffic acquisition costs reflecting our strong "
+                    "revenue growth in mobile search and the fact that mobile search carries higher TAC than our desktop business. "
+                    "While we expect Sites TAC to continue to increase as a percentage of Sites revenue reflecting ongoing strength "
+                    "in mobile search, we anticipate that the pace of year-over-year growth in Sites TAC as a percentage of Sites Revenue "
+                    "will slow after the ﬁrst quarter of 2018. "
+                    "For 2018, we remain excited about the investments we are making to drive the next phase of growth in Cloud, Hardware and YouTube."
+                )
+            }
+        )
+
+        self.assertEqual(guidance["mode"], "official_context")
+        self.assertIn("Sites TAC", guidance["commentary"])
+        self.assertIn("first quarter of 2018", _flatten_text(guidance["commentary"]).lower())
+
+    def test_guidance_excerpt_signal_score_prefers_near_term_quarter_anchor_over_generic_full_year_language(self) -> None:
+        generic_full_year = (
+            "For 2018, we remain excited about the investments we are making to drive the next phase of growth "
+            "in our big bets in Google in Cloud, Hardware and YouTube and our machine learning efforts."
+        )
+        near_term_quarter = (
+            "While we expect Sites TAC to continue to increase as a percentage of Sites revenue reflecting ongoing strength "
+            "in mobile search, we anticipate that the pace of year-over-year growth in Sites TAC as a percentage of Sites Revenue "
+            "will slow after the first quarter of 2018."
+        )
+
+        self.assertGreater(
+            _guidance_excerpt_signal_score(near_term_quarter),
+            _guidance_excerpt_signal_score(generic_full_year),
+        )
+
+    def test_parse_official_materials_microsoft_2017q3_finishes_with_cached_materials(self) -> None:
+        cache_dir = Path(__file__).resolve().parents[1] / "data" / "cache" / "official-materials" / "microsoft" / "2017Q3"
+        if not cache_dir.exists():
+            self.skipTest("cached Microsoft 2017Q3 official materials are not available in this environment")
+        filenames = [
+            "official-release-microsoft-d483053dex991-htm-https-www-sec-gov-archives-edgar-data-789019-000119.json",
+            "sec-filing-microsoft-form-10-q-https-www-sec-gov-archives-edgar-data-789019-000156459017020171-m.json",
+            "structured-financials-microsoft-quarterly-financials-https-stockanalysis-com-stocks-msft-financi.json",
+        ]
+        materials = []
+        for filename in filenames:
+            payload = json.loads((cache_dir / filename).read_text(encoding="utf-8"))
+            for key in ("text_path", "raw_path"):
+                value = payload.get(key)
+                if not value:
+                    continue
+                source_path = Path(str(value))
+                if source_path.exists():
+                    continue
+                repo_path = cache_dir / source_path.name
+                if repo_path.exists():
+                    payload[key] = str(repo_path)
+            materials.append(payload)
+
+        if not hasattr(signal, "setitimer"):
+            self.skipTest("platform does not support setitimer")
+
+        previous_handler = signal.getsignal(signal.SIGALRM)
+
+        def _timeout_handler(_signum: int, _frame: object) -> None:
+            raise TimeoutError("parse_official_materials took too long on cached Microsoft 2017Q3 materials")
+
+        signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.setitimer(signal.ITIMER_REAL, 30.0)
+        try:
+            parsed = parse_official_materials(
+                get_company("microsoft"),
+                {"fiscal_label": "Q1 FY2018", "calendar_quarter": "2017Q3", "coverage_notes": []},
+                materials,
+            )
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+
+        latest_kpis = dict(parsed["latest_kpis"])
+        self.assertAlmostEqual(latest_kpis["revenue_bn"], 24.538, places=3)
+        self.assertAlmostEqual(latest_kpis["capital_return_bn"], 4.8, places=1)
+        self.assertEqual(
+            [item["name"] for item in parsed["current_segments"]],
+            [
+                "More Personal Computing",
+                "Productivity and Business Processes",
+                "Intelligent Cloud",
+            ],
+        )
+        segment_map = {item["name"]: item for item in parsed["current_segments"]}
+        self.assertAlmostEqual(segment_map["More Personal Computing"]["value_bn"], 9.4, places=3)
+        self.assertAlmostEqual(segment_map["Productivity and Business Processes"]["value_bn"], 8.2, places=3)
+        self.assertAlmostEqual(segment_map["Intelligent Cloud"]["value_bn"], 6.9, places=3)
+        self.assertEqual(parsed["guidance"]["mode"], "official_context")
+        self.assertNotIn("revenue_bn", parsed["guidance"])
+
+    def test_merge_parsed_payload_prefers_stronger_generic_guidance(self) -> None:
+        merged = _merge_parsed_payload(
+            {
+                "guidance": {
+                    "mode": "official_context",
+                    "commentary": "管理层提到 outlook 会在电话会中提供。",
+                }
+            },
+            {
+                "guidance": {
+                    "mode": "official",
+                    "revenue_low_bn": 71.0,
+                    "revenue_high_bn": 72.1,
+                    "commentary": "下一季收入指引区间已由分部口径加总得到。",
+                }
+            },
+        )
+        self.assertEqual(merged["guidance"]["mode"], "official")
+        self.assertAlmostEqual(merged["guidance"]["revenue_low_bn"], 71.0, places=2)
+        self.assertAlmostEqual(merged["guidance"]["revenue_high_bn"], 72.1, places=2)
+
+    def test_merge_guidance_payload_prefers_stronger_commentary_at_same_quality(self) -> None:
+        merged = _merge_guidance_payload(
+            {
+                "mode": "official_context",
+                "commentary": "We expect general and administrative expenses will increase due to the growth of the business.",
+            },
+            {
+                "mode": "official_context",
+                "commentary": "Sites TAC as a percentage of Sites revenues should be slightly down from Q4 into the first quarter of 2018.",
+            },
+        )
+        self.assertEqual(merged["mode"], "official_context")
+        self.assertIn("first quarter of 2018", merged["commentary"])
+
+    @patch("app.services.reports._load_or_parse_historical_official_quarter_payload")
+    @patch("app.services.reports.get_quarter_fixture")
+    def test_build_expectation_reset_snapshot_uses_dynamic_previous_guidance_when_fixture_is_blank(
+        self,
+        mock_get_quarter_fixture: object,
+        mock_load_historical_payload: object,
+    ) -> None:
+        mock_get_quarter_fixture.side_effect = (
+            lambda company_id, quarter: {"fiscal_label": "Q1 FY2026", "guidance": {}, "period_end": "2025-09-30"}
+            if company_id == "microsoft" and quarter == "2025Q3"
+            else None
+        )
+        mock_load_historical_payload.return_value = {
+            "guidance": {
+                "mode": "official",
+                "revenue_low_bn": 71.0,
+                "revenue_high_bn": 72.1,
+            }
+        }
+
+        snapshot = _build_expectation_reset_snapshot(
+            "microsoft",
+            "2025Q4",
+            {
+                "fiscal_label": "Q2 FY2026",
+                "guidance": {
+                    "mode": "official",
+                    "revenue_low_bn": 74.7,
+                    "revenue_high_bn": 75.8,
+                },
+                "latest_kpis": {
+                    "revenue_bn": 75.0,
+                    "revenue_yoy_pct": 12.0,
+                },
+            },
+            [
+                {
+                    "quarter_label": "2025Q3",
+                    "calendar_quarter": "2025Q3",
+                    "fiscal_label": "Q1 FY2026",
+                    "period_end": "2025-09-30",
+                },
+                {
+                    "quarter_label": "2025Q4",
+                    "calendar_quarter": "2025Q4",
+                    "fiscal_label": "Q2 FY2026",
+                    "revenue_bn": 75.0,
+                    "revenue_yoy_pct": 12.0,
+                },
+            ],
+            "$",
+        )
+
+        self.assertAlmostEqual(snapshot["previous_guidance_bn"], 71.55, places=2)
+        self.assertEqual(snapshot["cards"][0]["note"], "官方数值指引")
+
+    @patch("app.services.reports._load_or_parse_historical_official_quarter_payload")
+    @patch("app.services.reports.get_quarter_fixture")
+    def test_build_expectation_reset_snapshot_falls_back_to_proxy_baseline_when_previous_guidance_missing(
+        self,
+        mock_get_quarter_fixture: object,
+        mock_load_historical_payload: object,
+    ) -> None:
+        mock_get_quarter_fixture.side_effect = (
+            lambda company_id, quarter: {"fiscal_label": "Q1 FY2026", "guidance": {}, "period_end": "2025-09-27"}
+            if company_id == "apple" and quarter == "2025Q3"
+            else None
+        )
+        mock_load_historical_payload.return_value = {"guidance": {}}
+
+        history = [
+            {"quarter_label": "2024Q4", "calendar_quarter": "2024Q4", "fiscal_label": "Q2 FY2025", "revenue_bn": 80.0, "revenue_yoy_pct": 4.0},
+            {"quarter_label": "2025Q1", "calendar_quarter": "2025Q1", "fiscal_label": "Q3 FY2025", "revenue_bn": 85.0, "revenue_yoy_pct": 5.0},
+            {"quarter_label": "2025Q2", "calendar_quarter": "2025Q2", "fiscal_label": "Q4 FY2025", "revenue_bn": 90.0, "revenue_yoy_pct": 6.0},
+            {"quarter_label": "2025Q3", "calendar_quarter": "2025Q3", "fiscal_label": "Q1 FY2026", "revenue_bn": 95.0, "revenue_yoy_pct": 7.0},
+            {"quarter_label": "2025Q4", "calendar_quarter": "2025Q4", "fiscal_label": "Q2 FY2026", "revenue_bn": 143.8, "revenue_yoy_pct": 16.0},
+        ]
+
+        snapshot = _build_expectation_reset_snapshot(
+            "apple",
+            "2025Q4",
+            {
+                "fiscal_label": "Q2 FY2026",
+                "guidance": {
+                    "mode": "official_context",
+                    "revenue_bn": 108.90425,
+                    "revenue_derived_from_baseline": True,
+                    "commentary": "公司未给出数值收入指引，管理层强调 installed base 与 Services 仍是后续主线。",
+                },
+                "latest_kpis": {
+                    "revenue_bn": 143.8,
+                    "revenue_yoy_pct": 16.0,
+                },
+            },
+            history,
+            "$",
+        )
+
+        self.assertAlmostEqual(snapshot["previous_guidance_bn"], 87.5, places=1)
+        self.assertEqual(snapshot["cards"][0]["value"], "$87.5B")
+        self.assertIn("非官方数值指引", snapshot["cards"][0]["note"])
+        self.assertEqual(snapshot["cards"][2]["value"], "$108.9B")
+        self.assertIn("非官方数值指引", snapshot["cards"][2]["note"])
+        self.assertNotIn("未披露", snapshot["cards"][0]["value"])
+
+    @patch("app.services.reports._load_or_parse_historical_official_quarter_payload")
+    @patch("app.services.reports._load_historical_official_quarter_cache")
+    @patch("app.services.reports.get_company")
+    @patch("app.services.reports.get_quarter_fixture")
+    def test_build_guidance_change_panel_skips_expensive_previous_guidance_parse_when_disabled(
+        self,
+        mock_get_quarter_fixture: object,
+        mock_get_company: object,
+        mock_load_historical_cache: object,
+        mock_load_historical_payload: object,
+    ) -> None:
+        mock_get_quarter_fixture.side_effect = (
+            lambda company_id, quarter: {"fiscal_label": "Q1 FY2026", "guidance": {}, "period_end": "2025-09-27"}
+            if company_id == "apple" and quarter == "2025Q3"
+            else None
+        )
+        mock_get_company.return_value = {"id": "apple", "official_source": {"sec_cik": "320193"}}
+        mock_load_historical_cache.return_value = None
+        mock_load_historical_payload.side_effect = AssertionError("lightweight visuals path should not trigger reparse")
+
+        history = [
+            {"quarter_label": "2025Q3", "calendar_quarter": "2025Q3", "fiscal_label": "Q1 FY2026", "revenue_bn": 95.0, "revenue_yoy_pct": 7.0},
+            {"quarter_label": "2025Q4", "calendar_quarter": "2025Q4", "fiscal_label": "Q2 FY2026", "revenue_bn": 143.8, "revenue_yoy_pct": 16.0},
+        ]
+
+        panel = reports_service._build_guidance_change_panel(
+            "apple",
+            "2025Q4",
+            {
+                "fiscal_label": "Q2 FY2026",
+                "guidance": {
+                    "mode": "official_context",
+                    "commentary": "公司未给出数值收入指引，管理层强调 installed base 与 Services 仍是后续主线。",
+                },
+                "latest_kpis": {
+                    "revenue_bn": 143.8,
+                    "revenue_yoy_pct": 16.0,
+                },
+            },
+            history,
+            "$",
+            allow_expensive_parse=False,
+        )
+
+        self.assertEqual(mock_load_historical_payload.call_count, 0)
+        self.assertIn("Q1 FY2026", panel["source_anchor"])
+        self.assertTrue(panel["bullets"])
+
+    @patch("app.services.reports._load_or_parse_historical_official_quarter_payload")
+    @patch("app.services.reports._load_historical_official_quarter_cache")
+    @patch("app.services.reports.get_company")
+    @patch("app.services.reports.get_quarter_fixture")
+    def test_build_expectation_reset_snapshot_skips_expensive_previous_guidance_parse_when_disabled(
+        self,
+        mock_get_quarter_fixture: object,
+        mock_get_company: object,
+        mock_load_historical_cache: object,
+        mock_load_historical_payload: object,
+    ) -> None:
+        mock_get_quarter_fixture.side_effect = (
+            lambda company_id, quarter: {"fiscal_label": "Q1 FY2026", "guidance": {}, "period_end": "2025-09-30"}
+            if company_id == "microsoft" and quarter == "2025Q3"
+            else None
+        )
+        mock_get_company.return_value = {"id": "microsoft", "official_source": {"sec_cik": "789019"}}
+        mock_load_historical_cache.return_value = None
+        mock_load_historical_payload.side_effect = AssertionError("lightweight visuals path should not trigger reparse")
+
+        snapshot = reports_service._build_expectation_reset_snapshot(
+            "microsoft",
+            "2025Q4",
+            {
+                "fiscal_label": "Q2 FY2026",
+                "guidance": {
+                    "mode": "official",
+                    "revenue_low_bn": 74.7,
+                    "revenue_high_bn": 75.8,
+                },
+                "latest_kpis": {
+                    "revenue_bn": 75.0,
+                    "revenue_yoy_pct": 12.0,
+                },
+                "guidance_change_panel": {
+                    "bullets": ["现有缓存不足时，这页应该优先退化而不是触发慢解析。"],
+                    "source_anchor": "缓存优先",
+                },
+            },
+            [
+                {
+                    "quarter_label": "2025Q3",
+                    "calendar_quarter": "2025Q3",
+                    "fiscal_label": "Q1 FY2026",
+                    "period_end": "2025-09-30",
+                },
+                {
+                    "quarter_label": "2025Q4",
+                    "calendar_quarter": "2025Q4",
+                    "fiscal_label": "Q2 FY2026",
+                    "revenue_bn": 75.0,
+                    "revenue_yoy_pct": 12.0,
+                },
+            ],
+            "$",
+            allow_expensive_parse=False,
+        )
+
+        self.assertEqual(mock_load_historical_payload.call_count, 0)
+        self.assertIsNone(snapshot["previous_guidance_bn"])
+        self.assertEqual(snapshot["cards"][0]["value"], "未披露")
+        self.assertEqual(snapshot["source_anchor"], "缓存优先")
+
+    @patch("app.services.reports.hydrate_source_materials")
+    @patch("app.services.reports.resolve_official_sources")
+    @patch("app.services.reports.get_quarter_fixture")
+    @patch("app.services.reports.parse_official_materials")
+    def test_load_or_parse_historical_official_quarter_payload_allows_ir_sources_when_guidance_required(
+        self,
+        mock_parse_materials: object,
+        mock_get_quarter_fixture: object,
+        mock_resolve_sources: object,
+        mock_hydrate: object,
+    ) -> None:
+        company = get_company("apple")
+        mock_get_quarter_fixture.return_value = {"guidance": {}, "period_end": "2025-09-27", "sources": []}
+        mock_resolve_sources.return_value = [{"url": "https://www.apple.com/newsroom/q4", "kind": "official_release", "role": "earnings_release", "date": "2025-10-30"}]
+        mock_hydrate.return_value = []
+        mock_parse_materials.return_value = {"guidance": {"mode": "official_context", "commentary": "管理层未给出收入数值指引。"}}
+
+        reports_service.HISTORICAL_OFFICIAL_QUARTER_MEMORY_CACHE.clear()
+        payload = reports_service._load_or_parse_historical_official_quarter_payload(
+            company,
+            "2025Q3",
+            require_guidance=True,
+        )
+
+        self.assertEqual(payload["guidance"]["mode"], "official_context")
+        self.assertFalse(mock_resolve_sources.call_args.kwargs["prefer_sec_only"])
+
+    @patch("app.services.reports._store_historical_official_quarter_cache")
+    @patch("app.services.reports._extract_company_geographies")
+    @patch("app.services.reports._extract_company_segments")
+    @patch("app.services.reports._load_materials")
+    @patch("app.services.reports.parse_official_materials")
+    @patch("app.services.reports.hydrate_source_materials")
+    @patch("app.services.reports._discover_cached_material_sources")
+    @patch("app.services.reports.resolve_official_sources")
+    @patch("app.services.reports.get_quarter_fixture")
+    @patch("app.services.reports._load_historical_official_quarter_cache")
+    def test_load_or_parse_historical_official_quarter_payload_reparses_when_cached_guidance_is_boilerplate(
+        self,
+        mock_load_cache: object,
+        mock_get_quarter_fixture: object,
+        mock_resolve_sources: object,
+        mock_discover_cached_material_sources: object,
+        mock_hydrate: object,
+        mock_parse_materials: object,
+        mock_store_cache: object,
+    ) -> None:
+        company = get_company("microsoft")
+        mock_load_cache.return_value = {
+            "guidance": {
+                "mode": "official_context",
+                "commentary": "Microsoft will provide forward-looking guidance in connection with this quarterly earnings announcement on its earnings conference call and webcast.",
+            }
+        }
+        mock_get_quarter_fixture.return_value = {"guidance": {}, "period_end": "2017-09-30", "sources": []}
+        mock_discover_cached_material_sources.return_value = []
+        mock_resolve_sources.return_value = [
+            {"url": "https://example.com/msft-q3-release", "kind": "official_release", "role": "earnings_release", "date": "2017-10-26"}
+        ]
+        mock_hydrate.return_value = [{"label": "Microsoft release", "kind": "official_release", "status": "cached"}]
+        mock_parse_materials.return_value = {
+            "guidance": {
+                "mode": "official",
+                "revenue_low_bn": 28.8,
+                "revenue_high_bn": 29.6,
+                "revenue_bn": 29.2,
+            }
+        }
+
+        payload = reports_service._load_or_parse_historical_official_quarter_payload(
+            company,
+            "2017Q3",
+            require_guidance=True,
+        )
+
+        self.assertAlmostEqual(payload["guidance"]["revenue_bn"], 29.2, places=2)
+        self.assertEqual(mock_parse_materials.call_count, 1)
+        self.assertEqual(mock_resolve_sources.call_count, 1)
+        self.assertFalse(mock_resolve_sources.call_args.kwargs["prefer_sec_only"])
+        mock_store_cache.assert_called_once()
+
+    @patch("app.services.reports._store_historical_official_quarter_cache")
+    @patch("app.services.reports.parse_official_materials")
+    @patch("app.services.reports.hydrate_source_materials")
+    @patch("app.services.reports._discover_cached_material_sources")
+    @patch("app.services.reports.resolve_official_sources")
+    @patch("app.services.reports.get_quarter_fixture")
+    @patch("app.services.reports._load_historical_official_quarter_cache")
+    def test_load_or_parse_historical_official_quarter_payload_reuses_cached_material_sources_before_online_discovery(
+        self,
+        mock_load_cache: object,
+        mock_get_quarter_fixture: object,
+        mock_resolve_sources: object,
+        mock_discover_cached_material_sources: object,
+        mock_hydrate: object,
+        mock_parse_materials: object,
+        mock_store_cache: object,
+    ) -> None:
+        company = get_company("alphabet")
+        mock_load_cache.return_value = {
+            "guidance": {
+                "mode": "official_context",
+                "commentary": "We expect general and administrative expenses will increase in dollar amount and may fluctuate as a percentage of revenues in future periods.",
+            }
+        }
+        mock_get_quarter_fixture.return_value = {"guidance": {}, "period_end": "2017-09-30", "sources": []}
+        mock_discover_cached_material_sources.return_value = [
+            {
+                "url": "https://example.com/alphabet-q3-call",
+                "kind": "call_summary",
+                "role": "earnings_call",
+                "date": "2017-10-26",
+            }
+        ]
+        mock_hydrate.return_value = [{"label": "Alphabet call", "kind": "call_summary", "status": "cached"}]
+        mock_parse_materials.return_value = {
+            "guidance": {
+                "mode": "official_context",
+                "commentary": "While we expect Sites TAC as a percentage of Sites revenues to continue to increase, the rate of growth will slow after the first quarter of 2018.",
+            }
+        }
+        mock_resolve_sources.side_effect = AssertionError("online source discovery should not run")
+
+        payload = reports_service._load_or_parse_historical_official_quarter_payload(
+            company,
+            "2017Q3",
+            require_guidance=True,
+        )
+
+        self.assertIn("first quarter of 2018", payload["guidance"]["commentary"])
+        mock_parse_materials.assert_called_once()
+        mock_store_cache.assert_called_once()
+
+    @patch("app.services.reports._store_historical_official_quarter_cache")
+    @patch("app.services.reports._extract_company_geographies")
+    @patch("app.services.reports._extract_company_segments")
+    @patch("app.services.reports._load_materials")
+    @patch("app.services.reports.parse_official_materials")
+    @patch("app.services.reports.hydrate_source_materials")
+    @patch("app.services.reports._discover_cached_material_sources")
+    @patch("app.services.reports.resolve_official_sources")
+    @patch("app.services.reports.get_quarter_fixture")
+    @patch("app.services.reports._load_historical_official_quarter_cache")
+    def test_load_or_parse_historical_official_quarter_payload_uses_lightweight_structure_extraction_from_cached_materials_before_full_parse(
+        self,
+        mock_load_cache: object,
+        mock_get_quarter_fixture: object,
+        mock_resolve_sources: object,
+        mock_discover_cached_material_sources: object,
+        mock_hydrate: object,
+        mock_parse_materials: object,
+        mock_load_materials: object,
+        mock_extract_segments: object,
+        mock_extract_geographies: object,
+        mock_store_cache: object,
+    ) -> None:
+        company = get_company("alphabet")
+        mock_load_cache.return_value = None
+        mock_get_quarter_fixture.return_value = {
+            "guidance": {},
+            "period_end": "2017-12-31",
+            "sources": [],
+            "coverage_notes": [],
+        }
+        mock_discover_cached_material_sources.return_value = [
+            {
+                "url": "https://example.com/alphabet-q4-release",
+                "kind": "official_release",
+                "role": "earnings_release",
+                "date": "2018-02-01",
+                "label": "Alphabet Q4 2017 release",
+            }
+        ]
+        mock_hydrate.return_value = [{"label": "Alphabet Q4 2017 release", "kind": "official_release", "status": "cached"}]
+        mock_load_materials.return_value = [{"label": "Alphabet Q4 2017 release", "kind": "official_release", "flat_text": "loaded"}]
+        mock_extract_segments.return_value = [
+            {"name": "Google", "value_bn": 31.9, "yoy_pct": 24.0},
+            {"name": "Other Bets", "value_bn": 0.4, "yoy_pct": 9.0},
+        ]
+        mock_extract_geographies.return_value = [
+            {"name": "United States", "value_bn": 15.0, "yoy_pct": 26.0},
+            {"name": "EMEA", "value_bn": 10.0, "yoy_pct": 23.0},
+        ]
+        mock_resolve_sources.side_effect = AssertionError("online source discovery should not run")
+        mock_parse_materials.side_effect = AssertionError("full parse should not run")
+
+        payload = reports_service._load_or_parse_historical_official_quarter_payload(
+            company,
+            "2017Q4",
+            entry={
+                "quarter_label": "2017Q4",
+                "calendar_quarter": "2017Q4",
+                "fiscal_label": "Q4 2017",
+                "period_end": "2017-12-31",
+                "revenue_bn": 32.323,
+                "net_income_bn": 9.421,
+            },
+            require_guidance=False,
+            prefer_lightweight_structure=True,
+        )
+
+        self.assertIsNotNone(payload)
+        self.assertAlmostEqual(payload["latest_kpis"]["revenue_bn"], 32.323, places=3)
+        self.assertAlmostEqual(payload["latest_kpis"]["net_income_bn"], 9.421, places=3)
+        self.assertEqual(payload["current_segments"][0]["name"], "Google")
+        self.assertEqual(payload["current_geographies"][0]["name"], "United States")
+        mock_store_cache.assert_called_once()
+
+    @patch("app.services.reports._load_or_parse_historical_official_quarter_payload")
+    @patch("app.services.reports.get_quarter_fixture")
+    def test_resolve_quarter_guidance_snapshot_retains_commentary_only_guidance_when_retry_finds_no_stronger_signal(
+        self,
+        mock_get_quarter_fixture: object,
+        mock_load_historical_payload: object,
+    ) -> None:
+        mock_get_quarter_fixture.return_value = {"fiscal_label": "Q3 FY2017", "guidance": {}}
+        mock_load_historical_payload.return_value = {
+            "guidance": {
+                "mode": "official_context",
+                "commentary": "For next quarter, management expects Azure and commercial cloud demand to remain strong.",
+            }
+        }
+
+        snapshot = reports_service._resolve_quarter_guidance_snapshot(
+            "microsoft",
+            "2017Q3",
+            [{"calendar_quarter": "2017Q3", "quarter_label": "2017Q3", "fiscal_label": "Q3 FY2017"}],
+        )
+
+        self.assertEqual(snapshot["guidance"]["mode"], "official_context")
+        self.assertIn("Azure", snapshot["guidance"]["commentary"])
+        self.assertEqual(mock_load_historical_payload.call_count, 2)
+        self.assertFalse(mock_load_historical_payload.call_args_list[0].kwargs["require_guidance"])
+        self.assertTrue(mock_load_historical_payload.call_args_list[1].kwargs["require_guidance"])
+
+    @patch("app.services.reports._load_or_parse_historical_official_quarter_payload")
+    @patch("app.services.reports.get_quarter_fixture")
+    def test_resolve_quarter_guidance_snapshot_reparses_when_cache_guidance_is_only_boilerplate(
+        self,
+        mock_get_quarter_fixture: object,
+        mock_load_historical_payload: object,
+    ) -> None:
+        mock_get_quarter_fixture.return_value = {"fiscal_label": "Q3 FY2017", "guidance": {}}
+        mock_load_historical_payload.side_effect = [
+            {
+                "guidance": {
+                    "mode": "official_context",
+                    "commentary": "Microsoft will provide forward-looking guidance in connection with this quarterly earnings announcement on its earnings conference call and webcast.",
+                }
+            },
+            {
+                "guidance": {
+                    "mode": "official",
+                    "revenue_low_bn": 28.8,
+                    "revenue_high_bn": 29.6,
+                    "revenue_bn": 29.2,
+                }
+            },
+        ]
+
+        snapshot = reports_service._resolve_quarter_guidance_snapshot(
+            "microsoft",
+            "2017Q3",
+            [{"calendar_quarter": "2017Q3", "quarter_label": "2017Q3", "fiscal_label": "Q3 FY2017"}],
+        )
+
+        self.assertEqual(snapshot["guidance"]["mode"], "official")
+        self.assertAlmostEqual(snapshot["guidance"]["revenue_bn"], 29.2, places=2)
+        self.assertEqual(mock_load_historical_payload.call_count, 2)
+        first_call = mock_load_historical_payload.call_args_list[0]
+        second_call = mock_load_historical_payload.call_args_list[1]
+        self.assertFalse(first_call.kwargs["require_guidance"])
+        self.assertTrue(second_call.kwargs["require_guidance"])
+
+    @patch("app.services.reports._load_or_parse_historical_official_quarter_payload")
+    @patch("app.services.reports.get_quarter_fixture")
+    def test_resolve_quarter_guidance_snapshot_prefers_stronger_context_commentary_at_same_rank(
+        self,
+        mock_get_quarter_fixture: object,
+        mock_load_historical_payload: object,
+    ) -> None:
+        mock_get_quarter_fixture.return_value = {"fiscal_label": "Q4 2017", "guidance": {}}
+        mock_load_historical_payload.side_effect = [
+            {
+                "guidance": {
+                    "mode": "official_context",
+                    "commentary": "For next quarter, management expects advertising demand to remain solid.",
+                }
+            },
+            {
+                "guidance": {
+                    "mode": "official_context",
+                    "commentary": "For next quarter, management expects advertising and cloud demand to continue improving, while capital expenditures and hiring will remain elevated.",
+                }
+            },
+        ]
+
+        snapshot = reports_service._resolve_quarter_guidance_snapshot(
+            "alphabet",
+            "2017Q4",
+            [{"calendar_quarter": "2017Q4", "quarter_label": "2017Q4", "fiscal_label": "Q4 2017"}],
+        )
+
+        self.assertEqual(snapshot["guidance"]["mode"], "official_context")
+        self.assertIn("capital expenditures", snapshot["guidance"]["commentary"])
+        self.assertEqual(mock_load_historical_payload.call_count, 2)
+        self.assertFalse(mock_load_historical_payload.call_args_list[0].kwargs["require_guidance"])
+        self.assertTrue(mock_load_historical_payload.call_args_list[1].kwargs["require_guidance"])
 
     def test_extract_quote_cards_accepts_noted_and_filters_operator(self) -> None:
         cards = _extract_quote_cards(
@@ -3041,6 +4748,30 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         )
         self.assertTrue(Path(material["text_path"]).exists())
 
+    def test_extract_text_reads_docx_transcript_content(self) -> None:
+        xml_payload = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            "<w:body>"
+            "<w:p><w:r><w:t>Now let's turn to the Q2 outlook.</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>In Intelligent Cloud, we expect revenue between $7.35 and $7.55 billion.</w:t></w:r></w:p>"
+            "</w:body>"
+            "</w:document>"
+        ).encode("utf-8")
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("word/document.xml", xml_payload)
+
+        title, text = official_materials._extract_text(
+            buffer.getvalue(),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".docx",
+        )
+
+        self.assertEqual(title, "")
+        self.assertIn("Q2 outlook", text)
+        self.assertIn("$7.35 and $7.55 billion", text)
+
     @patch("app.services.official_source_resolver._attachment_rows")
     @patch("app.services.official_source_resolver._fetch_text")
     @patch("app.services.official_source_resolver._directory_attachment_rows")
@@ -3098,6 +4829,171 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
             "payload": {
                 "payload_schema_version": REPORT_PAYLOAD_SCHEMA_VERSION - 1,
                 "release_date": "2020-01-31",
+            },
+        }
+        with patch("app.services.reports.REPORT_CACHE_DEPENDENCIES", [dependency]):
+            self.assertFalse(_report_cache_is_fresh(record))
+
+    def test_report_cache_invalidates_internally_inconsistent_financial_payload(self) -> None:
+        dependency = self._backup_root / "dep-financial-mismatch.txt"
+        dependency.write_text("dep", encoding="utf-8")
+        timestamp = time.time() - 60
+        os.utime(dependency, (timestamp, timestamp))
+        record = {
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "payload": {
+                "payload_schema_version": REPORT_PAYLOAD_SCHEMA_VERSION,
+                "release_date": "2026-01-29",
+                "latest_kpis": {
+                    "revenue_bn": 0.144,
+                    "net_income_bn": 42.097,
+                },
+                "current_segments": [
+                    {"name": "iPhone", "value_bn": 85.269},
+                    {"name": "Services", "value_bn": 30.013},
+                    {"name": "Wearables, Home and Accessories", "value_bn": 11.493},
+                    {"name": "iPad", "value_bn": 8.595},
+                    {"name": "Mac", "value_bn": 8.386},
+                ],
+                "income_statement": {
+                    "revenue_bn": 0.144,
+                },
+                "historical_cube": [
+                    {
+                        "calendar_quarter": "2025Q4",
+                        "quarter_label": "2025Q4",
+                        "revenue_bn": 143.756,
+                        "net_income_bn": 42.097,
+                        "gross_margin_pct": 48.2,
+                    }
+                ],
+            },
+        }
+        with patch("app.services.reports.REPORT_CACHE_DEPENDENCIES", [dependency]):
+            self.assertFalse(_report_cache_is_fresh(record))
+
+    def test_report_cache_invalidates_placeholder_topic_cards(self) -> None:
+        dependency = self._backup_root / "dep-placeholder-topics.txt"
+        dependency.write_text("dep", encoding="utf-8")
+        timestamp = time.time() - 60
+        os.utime(dependency, (timestamp, timestamp))
+        record = {
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "payload": {
+                "payload_schema_version": REPORT_PAYLOAD_SCHEMA_VERSION,
+                "release_date": "2020-01-31",
+                "latest_kpis": {
+                    "revenue_bn": 10.0,
+                    "net_income_bn": 2.0,
+                },
+                "current_segments": [
+                    {"name": "Data Center", "value_bn": 7.0},
+                    {"name": "Gaming", "value_bn": 3.0},
+                ],
+                "current_geographies": [
+                    {"name": "United States", "value_bn": 4.0},
+                    {"name": "Taiwan", "value_bn": 3.0},
+                ],
+                "historical_cube": [
+                    {"revenue_bn": 8.0, "net_income_bn": 1.5},
+                    {"revenue_bn": 10.0, "net_income_bn": 2.0},
+                ],
+                "qna_themes": [
+                    {"label": "AI 需求", "score": 100, "note": "来自自动抓取的官方电话会材料关键词聚类。"},
+                    {"label": "指引与订单", "score": 100, "note": "来自自动抓取的官方电话会材料关键词聚类。"},
+                ],
+                "management_themes": [
+                    {"label": "推理需求成为第二增长曲线", "score": 90, "note": "推理侧 token 成本下降后，客户部署节奏明显加快。"},
+                    {"label": "Blackwell 量产与系统级交付", "score": 96, "note": "从芯片走向整机与机柜交付，单客户价值量继续提升。"},
+                ],
+                "evidence_cards": [
+                    {"title": "订单可见度", "text": "管理层反复强调需求仍高于供给。"},
+                    {"title": "利润兑现", "text": "新品放量与系统交付决定利润率兑现。"},
+                ],
+            },
+        }
+        with patch("app.services.reports.REPORT_CACHE_DEPENDENCIES", [dependency]):
+            self.assertFalse(_report_cache_is_fresh(record))
+
+    def test_report_cache_invalidates_structure_growth_mismatch(self) -> None:
+        dependency = self._backup_root / "dep-structure-growth-mismatch.txt"
+        dependency.write_text("dep", encoding="utf-8")
+        timestamp = time.time() - 60
+        os.utime(dependency, (timestamp, timestamp))
+        record = {
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "payload": {
+                "payload_schema_version": REPORT_PAYLOAD_SCHEMA_VERSION,
+                "release_date": "2026-02-25",
+                "company": get_company("nvidia"),
+                "latest_kpis": {
+                    "revenue_bn": 68.127,
+                    "net_income_bn": 42.96,
+                    "revenue_yoy_pct": 73.21451272533115,
+                },
+                "current_segments": [
+                    {"name": "Data Center", "value_bn": 62.314, "yoy_pct": 21.7},
+                    {"name": "Gaming", "value_bn": 3.727, "yoy_pct": -12.6},
+                    {"name": "Professional Visualization", "value_bn": 1.321, "yoy_pct": 73.8},
+                    {"name": "Automotive", "value_bn": 0.604, "yoy_pct": 2.0},
+                    {"name": "OEM and Other", "value_bn": 0.161, "yoy_pct": -7.5},
+                ],
+                "historical_cube": [
+                    {
+                        "calendar_quarter": "2024Q4",
+                        "quarter_label": "2024Q4",
+                        "revenue_bn": 39.331,
+                        "net_income_bn": 22.091,
+                        "segments": [
+                            {"name": "Data Center", "value_bn": 35.58, "share_pct": 90.46},
+                            {"name": "Gaming", "value_bn": 2.544, "share_pct": 6.47},
+                            {"name": "Professional Visualization", "value_bn": 0.511, "share_pct": 1.30},
+                            {"name": "Automotive", "value_bn": 0.57, "share_pct": 1.45},
+                            {"name": "OEM and Other", "value_bn": 0.126, "share_pct": 0.32},
+                        ],
+                        "structure_basis": "segment",
+                    },
+                    {
+                        "calendar_quarter": "2025Q1",
+                        "quarter_label": "2025Q1",
+                        "revenue_bn": 44.062,
+                        "net_income_bn": 18.775,
+                    },
+                    {
+                        "calendar_quarter": "2025Q2",
+                        "quarter_label": "2025Q2",
+                        "revenue_bn": 46.743,
+                        "net_income_bn": 26.422,
+                    },
+                    {
+                        "calendar_quarter": "2025Q3",
+                        "quarter_label": "2025Q3",
+                        "revenue_bn": 57.006,
+                        "net_income_bn": 31.91,
+                        "segments": [
+                            {"name": "Data Center", "value_bn": 51.215, "share_pct": 89.84},
+                            {"name": "Gaming", "value_bn": 4.265, "share_pct": 7.48},
+                            {"name": "Professional Visualization", "value_bn": 0.76, "share_pct": 1.33},
+                            {"name": "Automotive", "value_bn": 0.592, "share_pct": 1.04},
+                            {"name": "OEM and Other", "value_bn": 0.174, "share_pct": 0.31},
+                        ],
+                        "structure_basis": "segment",
+                    },
+                    {
+                        "calendar_quarter": "2025Q4",
+                        "quarter_label": "2025Q4",
+                        "revenue_bn": 68.127,
+                        "net_income_bn": 42.96,
+                        "segments": [
+                            {"name": "Data Center", "value_bn": 62.314, "share_pct": 91.47, "yoy_pct": 21.7},
+                            {"name": "Gaming", "value_bn": 3.727, "share_pct": 5.47, "yoy_pct": -12.6},
+                            {"name": "Professional Visualization", "value_bn": 1.321, "share_pct": 1.94, "yoy_pct": 73.8},
+                            {"name": "Automotive", "value_bn": 0.604, "share_pct": 0.89, "yoy_pct": 2.0},
+                            {"name": "OEM and Other", "value_bn": 0.161, "share_pct": 0.24, "yoy_pct": -7.5},
+                        ],
+                        "structure_basis": "segment",
+                    },
+                ],
             },
         }
         with patch("app.services.reports.REPORT_CACHE_DEPENDENCIES", [dependency]):
@@ -3220,7 +5116,10 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertEqual(payload["ticker"], "NVDA")
         self.assertEqual(payload["calendar_quarter"], "2025Q4")
         self.assertIn("/reports/", payload["preview_url"])
+        self.assertIn("/reports/", payload["html_download_url"])
         self.assertIn("/reports/", payload["pdf_download_url"])
+        self.assertTrue(Path(payload["html_path"]).exists())
+        self.assertEqual(payload["pdf_path"], "/tmp/nvidia-2025q4.pdf")
         self.assertIsNone(payload["pdf_error"])
         self.assertIsInstance(payload["diagnostics"], list)
 
@@ -3287,7 +5186,7 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertIsNone(payload["pdf_download_url"])
         self.assertEqual(payload["diagnostics"], [])
 
-    @patch("app.main.update_report_pdf")
+    @patch("app.main.update_report_artifacts")
     @patch("app.main.export_html_to_pdf")
     @patch("app.main.render_report_html")
     @patch("app.main.get_report")
@@ -3298,7 +5197,7 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         mock_get_report: object,
         mock_render_report_html: object,
         mock_export_pdf: object,
-        mock_update_report_pdf: object,
+        mock_update_report_artifacts: object,
     ) -> None:
         mock_get_report_job.return_value = {
             "job_id": "job-456",
@@ -3318,6 +5217,7 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
             "id": "report-456",
             "company_id": "nvidia",
             "calendar_quarter": "2025Q4",
+            "html_path": "",
             "pdf_path": "",
             "payload": {"company_id": "nvidia", "calendar_quarter": "2025Q4"},
         }
@@ -3328,10 +5228,14 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["html_download_url"], "/reports/report-456/download.html")
         self.assertEqual(payload["pdf_download_url"], "/reports/report-456/download.pdf")
         self.assertIsNone(payload["pdf_error"])
         self.assertIsInstance(payload["diagnostics"], list)
-        mock_update_report_pdf.assert_called_once_with("report-456", "/tmp/report-456.pdf")
+        mock_update_report_artifacts.assert_called_once()
+        self.assertEqual(mock_update_report_artifacts.call_args.args[0], "report-456")
+        self.assertTrue(str(mock_update_report_artifacts.call_args.kwargs["html_path"]).endswith(".html"))
+        self.assertEqual(mock_update_report_artifacts.call_args.kwargs["pdf_path"], "/tmp/report-456.pdf")
 
     def test_curated_report_api_round_trip(self) -> None:
         response = self.client.post(
@@ -3342,6 +5246,7 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["structure_dimension_used"], "segment")
         self.assertIn("/reports/", payload["preview_url"])
+        self.assertIn("/reports/", payload["html_download_url"])
         self.assertEqual(payload["payload"]["historical_cube"][-1]["quarter_label"], "2025Q4")
         self.assertTrue(payload["payload"]["income_statement"]["opex_breakdown"])
 
@@ -3349,6 +5254,11 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertEqual(preview.status_code, 200)
         self.assertIn("近 12 季成长总览", preview.text)
         self.assertIn("财报科目中文直译", preview.text)
+
+        html_download = self.client.get(payload["html_download_url"])
+        self.assertEqual(html_download.status_code, 200)
+        self.assertIn("近 12 季成长总览", html_download.text)
+        self.assertTrue((DATA_DIR / "exports" / "nvidia-2025q4-deep-report.html").exists())
 
     def test_curated_report_preview_uses_dynamic_history_window_title(self) -> None:
         response = self.client.post(
@@ -3387,6 +5297,70 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertEqual(terminal["stage"], "completed")
         self.assertGreaterEqual(terminal["progress"], 1.0)
         self.assertIn("/reports/", terminal["preview_url"])
+
+    @patch.object(reports_service.REPORT_JOB_EXECUTOR, "submit", return_value=Mock())
+    def test_report_job_endpoint_recovers_when_runtime_job_row_is_missing(
+        self,
+        _mock_submit: object,
+    ) -> None:
+        response = self.client.post(
+            "/report-jobs",
+            json={"company_id": "amazon", "calendar_quarter": "2025Q4", "history_window": 12, "force_refresh": True},
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        job_id = str(payload["job_id"])
+
+        with reports_service.get_connection() as connection:
+            connection.execute("DELETE FROM report_jobs WHERE id = ?", (job_id,))
+
+        recovered = self.client.get(f"/report-jobs/{job_id}")
+        self.assertEqual(recovered.status_code, 200)
+        recovered_payload = recovered.json()
+        self.assertEqual(recovered_payload["job_id"], job_id)
+        self.assertEqual(recovered_payload["company_id"], "amazon")
+        self.assertEqual(recovered_payload["calendar_quarter"], "2025Q4")
+        self.assertEqual(recovered_payload["status"], "queued")
+        with reports_service.get_connection() as connection:
+            restored_row = connection.execute("SELECT id, status FROM report_jobs WHERE id = ?", (job_id,)).fetchone()
+        self.assertIsNotNone(restored_row)
+        self.assertEqual(restored_row["status"], "queued")
+
+    @patch.object(
+        reports_service.REPORT_JOB_EXECUTOR,
+        "submit",
+        side_effect=lambda *args, **kwargs: Mock(**{"done.return_value": False}),
+    )
+    def test_report_job_endpoint_recovers_across_runtime_db_reset_and_process_restart(
+        self,
+        mock_submit: Mock,
+    ) -> None:
+        response = self.client.post(
+            "/report-jobs",
+            json={"company_id": "amazon", "calendar_quarter": "2025Q4", "history_window": 12, "force_refresh": True},
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        job_id = str(payload["job_id"])
+
+        db_path = DATA_DIR / "earnings_digest.sqlite3"
+        if db_path.exists():
+            db_path.unlink()
+        reports_service.REPORT_JOB_STATES.clear()
+        reports_service.REPORT_JOB_FUTURES.clear()
+
+        recovered = self.client.get(f"/report-jobs/{job_id}")
+        self.assertEqual(recovered.status_code, 200)
+        recovered_payload = recovered.json()
+        self.assertEqual(recovered_payload["job_id"], job_id)
+        self.assertEqual(recovered_payload["company_id"], "amazon")
+        self.assertEqual(recovered_payload["calendar_quarter"], "2025Q4")
+        self.assertEqual(recovered_payload["status"], "queued")
+        self.assertEqual(mock_submit.call_count, 2)
+        with reports_service.get_connection() as connection:
+            restored_row = connection.execute("SELECT id, status FROM report_jobs WHERE id = ?", (job_id,)).fetchone()
+        self.assertIsNotNone(restored_row)
+        self.assertEqual(restored_row["status"], "queued")
 
     def test_generic_local_company_report_uses_deep_template(self) -> None:
         response = self.client.post(
@@ -3588,6 +5562,242 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertEqual(payload["call_panel"]["title"], "管理层接下来最可能被追问什么")
         self.assertIn("电话会原文不完整时", payload["section_meta"]["management_qna"]["note"])
 
+    @patch.object(reports_service, "build_report_payload")
+    def test_create_report_allows_quality_issues_when_verified_numeric_sections_are_complete(self, mock_build_report_payload: object) -> None:
+        mock_build_report_payload.return_value = {
+            "company_id": "nvidia",
+            "calendar_quarter": "2025Q4",
+            "structure_dimension_used": "segment",
+            "coverage_warnings": [],
+            "full_coverage_required": True,
+            "latest_kpis": {
+                "revenue_bn": 68.127,
+                "net_income_bn": 42.96,
+                "operating_cash_flow_bn": 36.19,
+                "free_cash_flow_bn": 34.902,
+                "capital_expenditures_bn": 1.288,
+            },
+            "guidance": {"mode": "official", "revenue_bn": 78.0},
+            "expectation_reset": {
+                "cards": [
+                    {"title": "上一季可比口径", "value": "$65.0B", "note": "经营基线对照（非官方数值指引）"},
+                    {"title": "本季实际收入", "value": "$68.1B", "note": "同比 +73.0%"},
+                    {"title": "当前阶段口径", "value": "$78.0B", "note": "官方数值指引"},
+                ],
+                "previous_guidance_bn": 65.0,
+                "current_actual_bn": 68.127,
+                "current_guidance_bn": 78.0,
+            },
+            "quality_report": {
+                "status": "fail",
+                "issues": [{"message": "问答主题里仍有 3 条占位/模板化摘要。"}],
+            },
+        }
+
+        record = create_report("nvidia", "2025Q4", 12, None, True)
+
+        self.assertEqual(record["company_id"], "nvidia")
+        self.assertEqual(record["payload"]["quality_report"]["status"], "fail")
+        self.assertEqual(record["payload"]["accuracy_report"]["status"], "pass")
+
+    @patch.object(reports_service, "build_report_payload")
+    def test_create_report_blocks_when_verified_numeric_sections_are_incomplete(self, mock_build_report_payload: object) -> None:
+        mock_build_report_payload.return_value = {
+            "company_id": "apple",
+            "calendar_quarter": "2025Q4",
+            "structure_dimension_used": "segment",
+            "coverage_warnings": [],
+            "full_coverage_required": True,
+            "latest_kpis": {
+                "revenue_bn": 143.756,
+                "net_income_bn": 42.097,
+                "operating_cash_flow_bn": 53.925,
+            },
+            "guidance": {"mode": "official_context", "commentary": "公司未给出数值收入指引。"},
+            "expectation_reset": {
+                "cards": [
+                    {"title": "上一季可比口径", "value": "未披露", "note": "上一季口径未命中缓存"},
+                    {"title": "本季实际收入", "value": "$143.8B", "note": "同比 +16.1%"},
+                    {"title": "当前阶段口径", "value": "官方展望", "note": "官方展望语境"},
+                ],
+                "previous_guidance_bn": None,
+                "current_actual_bn": 143.756,
+                "current_guidance_bn": None,
+            },
+            "quality_report": {"status": "pass", "issues": []},
+        }
+
+        with self.assertRaisesRegex(ValueError, "Verified numeric gate failed"):
+            create_report("apple", "2025Q4", 12, None, True)
+
+    def test_stabilize_topic_cards_replaces_placeholder_notes_with_readable_fallbacks(self) -> None:
+        topics = _stabilize_topic_cards(
+            [
+                {"label": "AI 需求", "score": 100, "note": "来自自动抓取的官方电话会材料关键词聚类。"},
+                {"label": "Gaming", "score": 84, "note": "Gaming 收入..., 同比-。"},
+            ],
+            [
+                {"label": "AI 需求", "score": 88, "note": "管理层反复强调推理需求延续，下一步要继续看客户扩容是否兑现。"},
+                {"label": "供给与交付", "score": 82, "note": "Blackwell 交付节奏和良率改善，决定下季收入兑现速度。"},
+                {"label": "利润率", "score": 76, "note": "毛利率能否随着新品放量重新抬升，是这季最关键的兑现指标。"},
+            ],
+            minimum=3,
+        )
+
+        self.assertEqual(len(topics), 3)
+        self.assertEqual(topics[0]["label"], "AI 需求")
+        self.assertNotIn("关键词聚类", topics[0]["note"])
+        self.assertTrue(all("关键词聚类" not in str(item.get("note") or "") for item in topics))
+        self.assertTrue(all("同比-" not in str(item.get("note") or "") for item in topics))
+
+    def test_report_quality_flags_placeholder_topic_notes(self) -> None:
+        quality = evaluate_report_payload(
+            {
+                "latest_kpis": {"revenue_bn": 10.0, "net_income_bn": 2.0},
+                "historical_cube": [{"revenue_bn": 10.0, "net_income_bn": 2.0}],
+                "current_segments": [{"name": "Cloud", "value_bn": 6.0}, {"name": "Ads", "value_bn": 4.0}],
+                "current_geographies": [{"name": "United States", "value_bn": 7.0}, {"name": "EMEA", "value_bn": 3.0}],
+                "qna_themes": [
+                    {"label": "AI 需求", "score": 100, "note": "来自自动抓取的官方电话会材料关键词聚类。"},
+                    {"label": "利润率", "score": 88, "note": "来自自动抓取的官方电话会材料关键词聚类。"},
+                ],
+                "management_themes": [
+                    {"label": "AI 商业化", "score": 90, "note": "云业务和 AI 套餐渗透同步抬升。"},
+                    {"label": "资本开支", "score": 82, "note": "基础设施投入节奏仍然高位。"},
+                ],
+                "evidence_cards": [
+                    {"title": "需求", "text": "订单和部署节奏继续上行。"},
+                    {"title": "利润", "text": "毛利率与费用纪律仍需持续观察。"},
+                ],
+            }
+        )
+
+        self.assertTrue(any(item["code"] == "qna_placeholder_topics" for item in quality["issues"]))
+
+    def test_ensure_report_payload_defaults_rebuilds_management_qna_visual_for_placeholder_topics(self) -> None:
+        company = get_company("nvidia")
+        normalized = ensure_report_payload_defaults(
+            {
+                "company": company,
+                "company_id": "nvidia",
+                "calendar_quarter": "2025Q4",
+                "fiscal_label": "Q4 FY2026",
+                "report_style": {"quarterly_label": "Q4 FY2026"},
+                "latest_kpis": {"revenue_bn": 39.3, "net_income_bn": 22.1},
+                "historical_cube": [
+                    {"revenue_bn": 22.1, "net_income_bn": 12.3, "segments": [], "geographies": []},
+                    {"revenue_bn": 39.3, "net_income_bn": 22.1, "segments": [], "geographies": []},
+                ],
+                "current_segments": [
+                    {"name": "Data Center", "value_bn": 35.6},
+                    {"name": "Gaming", "value_bn": 2.9},
+                ],
+                "current_geographies": [
+                    {"name": "United States", "value_bn": 19.7},
+                    {"name": "Taiwan", "value_bn": 8.1},
+                ],
+                "qna_themes": [
+                    {"label": "AI 需求", "score": 100, "note": "来自自动抓取的官方电话会材料关键词聚类。"},
+                    {"label": "指引与订单", "score": 100, "note": "来自自动抓取的官方电话会材料关键词聚类。"},
+                ],
+                "management_themes": [
+                    {"label": "Blackwell 量产与系统级交付", "score": 96, "note": "从芯片走向整机与机柜交付，单客户价值量继续提升。"},
+                    {"label": "推理需求成为第二增长曲线", "score": 90, "note": "推理侧 token 成本下降后，客户部署节奏明显加快。"},
+                ],
+                "risks": [
+                    {"label": "产能与交付爬坡", "score": 74, "note": "供应链爬坡速度决定下季兑现节奏。"},
+                ],
+                "catalysts": [
+                    {"label": "系统级 ASP 抬升", "score": 76, "note": "整机与机柜交付放大单客户价值量。"},
+                ],
+                "narrative_provenance": {
+                    "qna_chart_title": "电话会里最重要的问题",
+                    "qna_chart_subtitle": "直接按电话会原文整理",
+                    "management_chart_subtitle": "按管理层原文和财报披露整理",
+                },
+                "visuals": {
+                    "management_qna": "来自自动抓取的官方电话会材料关键词聚类。",
+                },
+            }
+        )
+
+        self.assertTrue(normalized["qna_themes"])
+        self.assertTrue(all("关键词聚类" not in str(item.get("note") or "") for item in normalized["qna_themes"]))
+        self.assertIn("Blackwell 量产与系统级交付", normalized["visuals"]["management_qna"])
+        self.assertNotIn("来自自动抓取的官方电话会材料关键词聚类。", normalized["visuals"]["management_qna"])
+
+    @patch("app.services.reports._load_or_parse_historical_official_quarter_payload")
+    def test_ensure_report_payload_defaults_refreshes_placeholder_topics_from_cached_official_parse(
+        self,
+        mock_load_historical_payload: object,
+    ) -> None:
+        company = get_company("nvidia")
+        mock_load_historical_payload.return_value = {
+            "management_themes": [
+                {"label": "Blackwell 量产与系统级交付", "score": 96, "note": "系统级交付正在抬高单客户价值量，兑现确定性也在提升。"},
+                {"label": "中国假设与需求外溢", "score": 82, "note": "管理层明确把中国假设写进展望，市场会持续追问需求迁移。"},
+            ],
+            "qna_themes": [
+                {"label": "AI 需求", "score": 88, "note": "推理需求扩散是否继续支撑高位增长，是后续问答核心。"},
+                {"label": "供给与交付", "score": 84, "note": "Blackwell 量产推进，系统交付提速，决定下季兑现速度。"},
+            ],
+        }
+
+        normalized = ensure_report_payload_defaults(
+            {
+                "company": company,
+                "company_id": "nvidia",
+                "calendar_quarter": "2025Q4",
+                "fiscal_label": "Q4 FY2026",
+                "report_style": {"quarterly_label": "Q4 FY2026"},
+                "latest_kpis": {"revenue_bn": 68.1, "net_income_bn": 43.0},
+                "historical_cube": [
+                    {"calendar_quarter": "2025Q3", "revenue_bn": 60.0, "net_income_bn": 32.0, "segments": [], "geographies": []},
+                    {"calendar_quarter": "2025Q4", "revenue_bn": 68.1, "net_income_bn": 43.0, "segments": [], "geographies": []},
+                ],
+                "current_segments": [
+                    {"name": "Data Center", "value_bn": 62.3},
+                    {"name": "Gaming", "value_bn": 3.7},
+                ],
+                "qna_themes": [
+                    {"label": "AI 需求", "score": 100, "note": "来自自动抓取的官方电话会材料关键词聚类。"},
+                ],
+                "management_themes": [
+                    {"label": "Gaming 仍是最大收入平台", "score": 84, "note": "Gaming 收入 -, 同比 -。"},
+                ],
+                "risks": [],
+                "catalysts": [],
+            }
+        )
+
+        self.assertEqual(normalized["management_themes"][0]["label"], "Blackwell 量产与系统级交付")
+        self.assertEqual(normalized["qna_themes"][0]["label"], "AI 需求")
+        self.assertIn("Blackwell 量产与系统级交付", normalized["visuals"]["management_qna"])
+
+    def test_sanitize_fixture_payload_clears_implausible_cash_flow_metrics(self) -> None:
+        company = get_company("visa")
+        sanitized = _sanitize_fixture_payload(
+            company,
+            {
+                "latest_kpis": {
+                    "revenue_bn": 10.7,
+                    "operating_cash_flow_bn": 136.2,
+                    "free_cash_flow_bn": 71.6,
+                    "capital_expenditures_bn": 64.6,
+                },
+                "management_themes": [],
+                "qna_themes": [],
+                "risks": [],
+                "catalysts": [],
+            },
+            {"revenue_bn": 10.7, "gross_margin_pct": 68.0},
+        )
+
+        latest_kpis = dict(sanitized.get("latest_kpis") or {})
+        self.assertIsNone(latest_kpis.get("operating_cash_flow_bn"))
+        self.assertIsNone(latest_kpis.get("free_cash_flow_bn"))
+        self.assertIsNone(latest_kpis.get("capital_expenditures_bn"))
+
     def test_structure_transition_chart_normalizes_each_quarter_to_ratio_view(self) -> None:
         svg = render_structure_transition_svg(
             [
@@ -3612,6 +5822,76 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
             "#2563EB",
         )
         self.assertIn("头部业务分部占比：A 60.0% → A 55.0%", svg)
+
+    def test_structure_transition_chart_keeps_partial_history_without_fabricating_missing_quarters(self) -> None:
+        svg = render_structure_transition_svg(
+            [
+                {
+                    "quarter_label": "2024Q1",
+                    "segments": [],
+                    "structure_basis": None,
+                },
+                {
+                    "quarter_label": "2024Q2",
+                    "segments": [
+                        {"name": "A", "value_bn": 60.0, "share_pct": 60.0},
+                        {"name": "B", "value_bn": 40.0, "share_pct": 40.0},
+                    ],
+                    "structure_basis": "segment",
+                },
+                {
+                    "quarter_label": "2024Q3",
+                    "segments": [
+                        {"name": "A", "value_bn": 55.0, "share_pct": 55.0},
+                        {"name": "B", "value_bn": 45.0, "share_pct": 45.0},
+                    ],
+                    "structure_basis": "segment",
+                },
+            ],
+            {"A": "#111827", "B": "#2563EB"},
+            "#2563EB",
+        )
+
+        self.assertNotIn("结构数据自动降级", svg)
+        self.assertIn("空心柱表示当季结构不足", svg)
+        self.assertIn("2024Q1", svg)
+        self.assertIn("2024Q2", svg)
+        self.assertIn("2024Q3", svg)
+
+    def test_growth_overview_chart_leaves_edge_quarters_as_solid_bars_without_fake_structure(self) -> None:
+        svg = render_growth_overview_svg(
+            [
+                {
+                    "quarter_label": "2024Q1",
+                    "revenue_bn": 80.0,
+                    "segments": [],
+                    "structure_basis": None,
+                },
+                {
+                    "quarter_label": "2024Q2",
+                    "revenue_bn": 82.0,
+                    "segments": [
+                        {"name": "Search", "value_bn": 50.0, "share_pct": 60.98},
+                        {"name": "Cloud", "value_bn": 32.0, "share_pct": 39.02},
+                    ],
+                    "structure_basis": "segment",
+                },
+                {
+                    "quarter_label": "2024Q3",
+                    "revenue_bn": 84.0,
+                    "segments": [
+                        {"name": "Search", "value_bn": 49.0, "share_pct": 58.33},
+                        {"name": "Cloud", "value_bn": 35.0, "share_pct": 41.67},
+                    ],
+                    "structure_basis": "segment",
+                },
+            ],
+            {"Search": "#2563EB", "Cloud": "#7C3AED"},
+            "#2563EB",
+        )
+
+        self.assertIn("纯色柱表示该季度暂无可靠结构", svg)
+        self.assertNotIn("2024Q1*", svg)
 
     @patch("app.services.institutional_views._fetch_rss")
     def test_institutional_views_extract_head_firms(self, mock_fetch_rss: object) -> None:
@@ -3686,8 +5966,90 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertAlmostEqual(parsed["latest_kpis"]["gaap_gross_margin_pct"], 48.2, places=1)
         self.assertEqual(parsed["current_segments"][0]["name"], "iPhone")
         self.assertEqual(parsed["current_geographies"][0]["name"], "Americas")
-        self.assertEqual(parsed["guidance"]["mode"], "official_context")
         self.assertGreaterEqual(len(parsed["call_quote_cards"]), 2)
+
+    def test_official_parser_recovers_apple_html_statement_revenue_when_html_scale_is_ambiguous(self) -> None:
+        release_html_path = self._write_temp_text(
+            "apple-release-q1fy26.html",
+            (
+                "<html><body><table>"
+                "<tr><th>Three Months Ended</th></tr>"
+                "<tr><th>December 27, 2025</th><th>December 28, 2024</th></tr>"
+                "<tr><td>Net sales:</td></tr>"
+                "<tr><td>Products</td><td>$</td><td>113,743</td><td>$</td><td>97,960</td></tr>"
+                "<tr><td>Services</td><td>30,013</td><td>26,340</td></tr>"
+                "<tr><td>Total net sales (1)</td><td>143,756</td><td>124,300</td></tr>"
+                "<tr><td>Gross margin</td><td>69,231</td><td>58,275</td></tr>"
+                "<tr><td>Research and development</td><td>10,887</td><td>8,268</td></tr>"
+                "<tr><td>Selling, general and administrative</td><td>7,492</td><td>7,175</td></tr>"
+                "<tr><td>Total operating expenses</td><td>18,379</td><td>15,443</td></tr>"
+                "<tr><td>Operating income</td><td>50,852</td><td>42,832</td></tr>"
+                "<tr><td>Net income</td><td>42,097</td><td>36,330</td></tr>"
+                "</table></body></html>"
+            ),
+        )
+        sec_path = self._write_temp_text(
+            "apple-sec-scale-guard.txt",
+            (
+                "Products and Services Performance "
+                "iPhone $ 85,269 $ 69,138 23 % "
+                "Mac 8,386 8,987 (7) % "
+                "iPad 8,595 8,088 6 % "
+                "Wearables, Home and Accessories 11,493 11,747 (2) % "
+                "Services 30,013 26,340 14 % "
+                "Total net sales $ 143,756 $ 124,300 16 % "
+                "Americas $ 58,877 $ 50,430 17 % "
+                "Europe 33,908 30,397 12 % "
+                "Greater China 18,513 20,819 (11) % "
+                "Japan 8,987 7,767 16 % "
+                "Rest of Asia Pacific 23,471 14,887 58 % "
+            ),
+        )
+        parsed = parse_official_materials(
+            get_company("apple"),
+            get_quarter_fixture("apple", "2025Q4"),
+            [
+                {
+                    "label": "Apple release html",
+                    "kind": "official_release",
+                    "status": "cached",
+                    "text_path": release_html_path,
+                    "raw_path": release_html_path,
+                },
+                {"label": "Apple 10-Q", "kind": "sec_filing", "status": "cached", "text_path": sec_path},
+            ],
+        )
+
+        self.assertAlmostEqual(parsed["latest_kpis"]["revenue_bn"], 143.756, places=3)
+        self.assertAlmostEqual(parsed["latest_kpis"]["gaap_gross_margin_pct"], 48.2, places=1)
+        income_sources = {item["name"]: item["value_bn"] for item in parsed["income_statement"]["sources"]}
+        self.assertAlmostEqual(income_sources["Products"], 113.743, places=3)
+        self.assertAlmostEqual(income_sources["Services"], 30.013, places=3)
+
+    def test_sanitize_fixture_payload_recovers_revenue_when_segments_show_html_scale_shrink(self) -> None:
+        sanitized = _sanitize_fixture_payload(
+            get_company("apple"),
+            {
+                "latest_kpis": {
+                    "revenue_bn": 0.144,
+                    "gaap_gross_margin_pct": 48077.0,
+                },
+                "current_segments": [
+                    {"name": "iPhone", "value_bn": 85.269},
+                    {"name": "Services", "value_bn": 30.013},
+                    {"name": "Mac", "value_bn": 8.386},
+                    {"name": "Wearables, Home and Accessories", "value_bn": 11.493},
+                    {"name": "iPad", "value_bn": 8.595},
+                ],
+            },
+            {
+                "revenue_bn": 143.756,
+                "gross_margin_pct": 48.2,
+            },
+        )
+
+        self.assertAlmostEqual(sanitized["latest_kpis"]["revenue_bn"], 143.756, places=3)
+        self.assertAlmostEqual(sanitized["latest_kpis"]["gaap_gross_margin_pct"], 48.2, places=1)
 
     def test_apple_legacy_parser_uses_sec_tables_without_fake_guidance(self) -> None:
         sec_path = self._write_temp_text(
@@ -3767,11 +6129,165 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertEqual(parsed["current_segments"][0]["name"], "iPhone")
         self.assertNotEqual(parsed["current_segments"][0]["value_bn"], 142.381)
 
+    def test_parse_microsoft_annual_filing_does_not_write_annual_total_revenue_into_quarter_payload(self) -> None:
+        parsed = _parse_microsoft(
+            get_company("microsoft"),
+            {"calendar_quarter": "2017Q2", "fiscal_label": "Q4 FY2017", "coverage_notes": []},
+            [
+                {
+                    "label": "Microsoft Form 10-K",
+                    "kind": "sec_filing",
+                    "form": "10-K",
+                    "raw_text": (
+                        "Income Statements Revenue: Product $37,964 $34,579 Service and other $51,986 $47,215 "
+                        "Total revenue $89,950 $81,794 Cost of revenue: Product $12,355 $11,000 Service and other $17,472 $15,818 "
+                        "Total cost of revenue $29,827 $26,818 Gross margin $60,123 $54,976 Operating income $29,331 $24,120"
+                    ),
+                    "flat_text": (
+                        "Income Statements Revenue: Product 37,964 34,579 Service and other 51,986 47,215 "
+                        "Total revenue 89,950 81,794 Cost of revenue: Product 12,355 11,000 Service and other 17,472 15,818 "
+                        "Total cost of revenue 29,827 26,818 Gross margin 60,123 54,976 Operating income 29,331 24,120"
+                    ),
+                }
+            ],
+        )
+
+        self.assertNotIn("revenue_bn", parsed["latest_kpis"])
+
+    def test_parse_generic_prefers_quarterly_html_statement_over_full_year_narrative_metric(self) -> None:
+        raw_html_path = self._write_temp_text(
+            "generic-quarter-and-full-year-release.html",
+            (
+                "<html><body><table>"
+                "<tr><th></th><th>Three months ended December 31, 2017</th><th>Three months ended December 31, 2016</th></tr>"
+                "<tr><th>(In millions)</th><th></th><th></th></tr>"
+                "<tr><td>Total revenue</td><td>32,323</td><td>26,064</td></tr>"
+                "<tr><td>Operating income</td><td>8,546</td><td>6,639</td></tr>"
+                "<tr><td>Net income</td><td>9,421</td><td>5,333</td></tr>"
+                "</table></body></html>"
+            ),
+        )
+
+        parsed = _parse_generic(
+            {
+                "id": "genericco",
+                "ticker": "GEN",
+                "english_name": "GenericCo",
+                "money_symbol": "$",
+                "historical_profit_label": "净利润",
+            },
+            {"calendar_quarter": "2017Q4", "fiscal_label": "2017Q4", "coverage_notes": []},
+            [
+                {
+                    "label": "GenericCo earnings release",
+                    "kind": "official_release",
+                    "role": "earnings_release",
+                    "status": "cached",
+                    "raw_text": (
+                        "GenericCo today announced financial results for the quarter and fiscal year ended December 31, 2017. "
+                        "Our business delivered strong momentum, with 2017 revenues of $110.9 billion, up 23% year on year, "
+                        "and fourth quarter revenues of $32.3 billion, up 24% year on year."
+                    ),
+                    "flat_text": (
+                        "GenericCo today announced financial results for the quarter and fiscal year ended December 31, 2017. "
+                        "Our business delivered strong momentum, with 2017 revenues of $110.9 billion, up 23% year on year, "
+                        "and fourth quarter revenues of $32.3 billion, up 24% year on year."
+                    ),
+                    "raw_path": raw_html_path,
+                }
+            ],
+        )
+
+        self.assertAlmostEqual(parsed["latest_kpis"]["revenue_bn"], 32.323, places=3)
+        self.assertAlmostEqual(parsed["latest_kpis"]["operating_income_bn"], 8.546, places=3)
+        self.assertAlmostEqual(parsed["latest_kpis"]["net_income_bn"], 9.421, places=3)
+
+    def test_extract_html_statement_metric_from_rows_aligns_multi_row_quarter_headers_before_full_year_columns(self) -> None:
+        rows = [
+            ["Three Months Ended", "Twelve Months Ended"],
+            ["December 31,", "December 31,"],
+            ["2016", "2017", "2016", "2017"],
+            ["(unaudited)", "(unaudited)"],
+            ["Revenues", "$", "26,064", "$", "32,323", "$", "90,272", "$", "110,855"],
+            ["Operating income", "$", "6,639", "$", "7,664", "$", "23,716", "$", "26,146"],
+        ]
+
+        current_bn, prior_bn, yoy_pct = _extract_html_statement_metric_from_rows(
+            rows,
+            ["Revenue", "Revenues", "Total revenue", "Total revenues"],
+            "2017Q4",
+        )
+
+        self.assertAlmostEqual(current_bn, 32.323, places=3)
+        self.assertAlmostEqual(prior_bn, 26.064, places=3)
+        self.assertAlmostEqual(yoy_pct, 24.013965623081646, places=6)
+
+    def test_parse_microsoft_release_extracts_gaap_quarter_revenue_when_non_gaap_value_is_also_present(self) -> None:
+        parsed = _parse_microsoft(
+            get_company("microsoft"),
+            {"calendar_quarter": "2016Q2", "fiscal_label": "Q4 FY2016", "coverage_notes": []},
+            [
+                {
+                    "label": "Microsoft earnings release",
+                    "kind": "official_release",
+                    "raw_text": (
+                        "Microsoft Corp. today announced the following results for the quarter ended June 30, 2016. "
+                        "Revenue was $20.6 billion GAAP, and $22.6 billion non-GAAP. "
+                        "Net income on a GAAP basis was $3.1 billion and increased 2%, and on a non-GAAP basis was $5.5 billion and increased 8%."
+                    ),
+                    "flat_text": (
+                        "Microsoft Corp. today announced the following results for the quarter ended June 30, 2016. "
+                        "Revenue was $20.6 billion GAAP, and $22.6 billion non-GAAP. "
+                        "Net income on a GAAP basis was $3.1 billion and increased 2%, and on a non-GAAP basis was $5.5 billion and increased 8%."
+                    ),
+                }
+            ],
+        )
+
+        self.assertAlmostEqual(parsed["latest_kpis"]["revenue_bn"], 20.6, places=3)
+
+    def test_extract_company_level_narrative_metric_prefers_quarter_headline_over_deferrals_and_local_product_revenue(self) -> None:
+        revenue_bn, _revenue_yoy_pct = _extract_company_level_narrative_metric(
+            (
+                "Xbox Platform revenue increased $86 million or 24%. "
+                "Results for the quarter ended June 30, 2017. Revenue was $23.3 billion GAAP, and $24.7 billion non-GAAP. "
+                "This included net revenue deferrals of $1.4 billion associated with Windows 10."
+            ),
+            r"(?:revenue|net revenue|total revenue)",
+        )
+
+        self.assertAlmostEqual(revenue_bn or 0.0, 23.3, places=3)
+
+    def test_parse_official_materials_microsoft_historical_release_does_not_backfill_local_revenue_noise(self) -> None:
+        release_path = self._write_temp_text(
+            "microsoft-historical-release.txt",
+            (
+                "Microsoft Corp. announced results for the quarter ended June 30, 2015. "
+                "Revenues for the quarter ended June 30, 2015 were $22.2 billion. "
+                "Xbox Platform revenue increased $86 million. "
+                "The company recorded net revenue deferrals of $2.0 billion."
+            ),
+        )
+        parsed = parse_official_materials(
+            get_company("microsoft"),
+            {"calendar_quarter": "2015Q2", "fiscal_label": "Q4 FY2015", "coverage_notes": []},
+            [
+                {
+                    "label": "Microsoft earnings release",
+                    "kind": "official_release",
+                    "status": "cached",
+                    "text_path": release_path,
+                }
+            ],
+        )
+
+        self.assertAlmostEqual(parsed["latest_kpis"]["revenue_bn"], 22.2, places=3)
+
     @patch("app.services.reports.get_institutional_views")
     @patch("app.services.reports.parse_official_materials")
     @patch("app.services.reports.hydrate_source_materials")
     @patch("app.services.reports.resolve_official_sources")
-    def test_build_report_payload_sanitizes_outlier_dynamic_parse(
+    def test_build_report_payload_only_strips_impossible_eps_and_unreasonable_structure(
         self,
         mock_resolve_sources: object,
         mock_hydrate: object,
@@ -3796,7 +6312,8 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
 
         payload = build_report_payload("apple", "2007Q4", 12, refresh_source_materials=False)
 
-        self.assertAlmostEqual(payload["latest_kpis"]["revenue_bn"], 6.62475, places=4)
+        self.assertAlmostEqual(payload["latest_kpis"]["revenue_bn"], 0.022, places=4)
+        self.assertAlmostEqual(payload["latest_kpis"]["net_income_bn"], 1.581, places=3)
         self.assertIsNone(payload["latest_kpis"]["gaap_eps"])
         self.assertFalse(payload["current_segments"])
 
@@ -3848,6 +6365,490 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertEqual(payload["current_geographies"][0]["name"], "United States")
         self.assertEqual(payload["call_quote_cards"][0]["speaker"], "Satya Nadella")
         self.assertTrue(any("动态解析" in item for item in payload["coverage_warnings"]))
+
+    @patch("app.services.reports.hydrate_source_materials")
+    @patch("app.services.reports.resolve_official_sources")
+    @patch("app.services.reports.get_quarter_fixture")
+    def test_load_or_parse_historical_official_quarter_payload_prefers_release_quarterly_apple_structure(
+        self,
+        mock_get_quarter_fixture: object,
+        mock_resolve_sources: object,
+        mock_hydrate: object,
+    ) -> None:
+        release_path = self._write_temp_text(
+            "apple-2017q3-release.txt",
+            (
+                "Net sales by category iPhone 28,846 22,084 31 % "
+                "Services 8,501 6,325 34 % "
+                "Mac 7,170 5,915 21 % "
+                "iPad 5,889 4,255 38 % "
+                "Other Products 3,231 2,373 36 % "
+                "Total net sales 52,579 46,852 12 % "
+                "Operating income 15,344 13,261 16 % "
+                "Net income 10,714 9,014 19 % "
+                "Diluted earnings per share 2.07 1.67 "
+                "Cash flow from operations was very strong at $28.3 billion, and we returned $14.5 billion to investors through our capital return program. "
+                "Apple paid dividends and dividend equivalents of $3.3 billion and repurchased $11.2 billion of common stock during the quarter. "
+            ),
+        )
+        sec_path = self._write_temp_text(
+            "apple-2017-10k.txt",
+            (
+                "iPhone 141,319 136,700 3 % "
+                "Services 29,980 24,348 23 % "
+                "Mac 25,850 22,831 13 % "
+                "iPad 19,222 20,628 (7) % "
+                "Other Products 12,863 10,902 18 % "
+                "Total net sales 229,234 215,639 6 % "
+                "Operating income 61,344 60,024 2 % "
+                "Net income 48,351 45,687 6 % "
+            ),
+        )
+        mock_get_quarter_fixture.return_value = {
+            "guidance": {},
+            "period_end": "2017-09-30",
+            "sources": [],
+            "coverage_notes": [],
+            "fiscal_label": "Q4 FY2017",
+        }
+        mock_resolve_sources.return_value = [
+            {"url": "https://example.com/apple-q4-2017-release", "kind": "official_release", "date": "2017-11-02"},
+            {"url": "https://example.com/apple-q4-2017-10k", "kind": "sec_filing", "date": "2017-11-03"},
+        ]
+        mock_hydrate.return_value = [
+            {"label": "Apple Q4 2017 release", "kind": "official_release", "status": "cached", "text_path": release_path},
+            {"label": "Apple 2017 10-K", "kind": "sec_filing", "status": "cached", "text_path": sec_path},
+        ]
+
+        reports_service.HISTORICAL_OFFICIAL_QUARTER_MEMORY_CACHE.clear()
+        payload = reports_service._load_or_parse_historical_official_quarter_payload(
+            get_company("apple"),
+            "2017Q3",
+            entry={
+                "quarter_label": "2017Q3",
+                "calendar_quarter": "2017Q3",
+                "fiscal_label": "Q4 FY2017",
+                "period_end": "2017-09-30",
+            },
+        )
+
+        self.assertIsNotNone(payload)
+        latest_kpis = dict(payload["latest_kpis"])
+        self.assertAlmostEqual(latest_kpis["revenue_bn"], 52.579, places=3)
+        self.assertAlmostEqual(latest_kpis["operating_cash_flow_bn"], 28.3, places=3)
+        self.assertAlmostEqual(latest_kpis["capital_return_bn"], 14.5, places=3)
+        self.assertAlmostEqual(latest_kpis["dividends_bn"], 3.3, places=3)
+        self.assertAlmostEqual(latest_kpis["share_repurchases_bn"], 11.2, places=3)
+        segments = {item["name"]: item["value_bn"] for item in payload["current_segments"]}
+        self.assertAlmostEqual(segments["iPhone"], 28.846, places=3)
+        self.assertAlmostEqual(segments["Services"], 8.501, places=3)
+        self.assertLess(segments["Services"], 10.0)
+
+    def test_extract_company_segments_real_apple_2025q3_prefers_quarter_release_over_annual_10k(self) -> None:
+        release_path = self._write_temp_text(
+            "apple-2025q3-quarter-release.txt",
+            (
+                "Net sales by reportable segment Products 73,716 69,958 5 % "
+                "iPhone 49,025 46,222 6 % "
+                "Mac 8,726 7,744 13 % "
+                "iPad 6,952 7,162 (3) % "
+                "Wearables, Home and Accessories 9,013 9,042 0 % "
+                "Services 28,750 24,972 15 % "
+                "Total net sales 102,466 94,930 8 % "
+            ),
+        )
+        annual_path = self._write_temp_text(
+            "apple-2025-10k.txt",
+            (
+                "Net sales by reportable segment iPhone 210 201 4.5 % "
+                "Mac 33,708 29,984 12.4 % "
+                "iPad 28,023 26,694 5.0 % "
+                "Wearables, Home and Accessories 35,686 37,005 (3.6) % "
+                "Services 109,240 96,169 13.5 % "
+                "Total net sales 416,161 391,035 6.4 % "
+            ),
+        )
+        loaded_materials = reports_service._load_materials(
+            [
+                {
+                    "label": "Apple Q4 FY2025 release",
+                    "kind": "official_release",
+                    "status": "cached",
+                    "text_path": release_path,
+                },
+                {
+                    "label": "Apple Form 10-K",
+                    "kind": "sec_filing",
+                    "status": "cached",
+                    "text_path": annual_path,
+                },
+            ]
+        )
+
+        segments = _extract_company_segments(
+            "apple",
+            loaded_materials,
+            revenue_bn=102.466,
+            target_calendar_quarter="2025Q3",
+        )
+        segment_map = {item["name"]: item["value_bn"] for item in segments}
+
+        self.assertEqual(
+            {item["name"] for item in segments},
+            {"iPhone", "Mac", "iPad", "Wearables, Home and Accessories", "Services"},
+        )
+        self.assertAlmostEqual(segment_map["iPhone"], 49.025, places=3)
+        self.assertAlmostEqual(segment_map["Mac"], 8.726, places=3)
+        self.assertAlmostEqual(segment_map["iPad"], 6.952, places=3)
+        self.assertAlmostEqual(segment_map["Wearables, Home and Accessories"], 9.013, places=3)
+        self.assertAlmostEqual(segment_map["Services"], 28.75, places=3)
+
+    @patch("app.services.reports.hydrate_source_materials")
+    def test_extract_historical_official_quarter_payload_from_cached_materials_lightweight_drops_microsoft_annual_segments(
+        self,
+        mock_hydrate: object,
+    ) -> None:
+        sec_path = self._write_temp_text(
+            "microsoft-2025q2-annual-10k.txt",
+            (
+                "Unearned revenue by segment was as follows Productivity and Business Processes 50,567 43,608 "
+                "Intelligent Cloud 14,022 13,680 More Personal Computing 2,676 2,902 Total 67,265 60,190 "
+                "Revenue, classified by the major geographic areas in which our customers were located, was as follows: "
+                "United States 144,546 124,758 Other countries 137,178 120,399 Total 281,724 245,157 "
+            ),
+        )
+        source = {
+            "label": "Microsoft Form 10-K",
+            "kind": "sec_filing",
+            "role": "sec_filing",
+            "status": "cached",
+            "text_path": sec_path,
+            "url": "https://example.com/microsoft-10k",
+        }
+        mock_hydrate.return_value = [source]
+
+        payload = reports_service._extract_historical_official_quarter_payload_from_cached_materials_lightweight(
+            get_company("microsoft"),
+            "2025Q2",
+            {
+                "quarter_label": "2025Q2",
+                "calendar_quarter": "2025Q2",
+                "fiscal_label": "Q4 FY2025",
+                "period_end": "2025-06-30",
+                "revenue_bn": 70.066,
+                "net_income_bn": 25.824,
+            },
+            [source],
+            require_guidance=False,
+        )
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["current_segments"], [])
+        self.assertEqual(len(payload["current_geographies"]), 2)
+        self.assertIn(payload["current_geographies"][0]["name"], {"United States", "U.S."})
+        self.assertIn(payload["current_geographies"][1]["name"], {"International", "Other countries"})
+        self.assertTrue(all(item.get("scope") == "annual_filing" for item in payload["current_geographies"]))
+
+    def test_parse_official_materials_apple_2017q3_uses_real_quarter_values_from_cached_materials(self) -> None:
+        materials = [
+            self._load_backup_official_material(
+                "apple",
+                "2017Q3",
+                "official-release-apple-a8-kexhibit991q420179302017-htm-https-www-sec-gov-archives-edgar-data-320.json",
+            ),
+            self._load_backup_official_material(
+                "apple",
+                "2017Q3",
+                "call-summary-apple-a8-kexhibit992q420179302017-htm-https-www-sec-gov-archives-edgar-data-320193-.json",
+            ),
+            self._load_backup_official_material(
+                "apple",
+                "2017Q3",
+                "sec-filing-apple-form-10-k-https-www-sec-gov-archives-edgar-data-320193-000032019317000070-a10-k.json",
+            ),
+        ]
+
+        parsed = parse_official_materials(
+            get_company("apple"),
+            {"fiscal_label": "Q4 FY2017", "calendar_quarter": "2017Q3", "coverage_notes": []},
+            materials,
+        )
+
+        latest_kpis = dict(parsed["latest_kpis"])
+        self.assertAlmostEqual(latest_kpis["revenue_bn"], 52.579, places=3)
+        self.assertAlmostEqual(latest_kpis["gaap_eps"], 2.07, places=2)
+        self.assertAlmostEqual(latest_kpis["operating_cash_flow_bn"], 15.7, places=3)
+        self.assertAlmostEqual(latest_kpis["capital_return_bn"], 11.0, places=3)
+        self.assertAlmostEqual(latest_kpis["dividends_bn"], 3.252, places=3)
+        self.assertAlmostEqual(latest_kpis["share_repurchases_bn"], 4.5, places=3)
+        self.assertIsNone(latest_kpis.get("free_cash_flow_bn"))
+        self.assertIsNone(latest_kpis.get("capital_expenditures_bn"))
+
+        segments = {item["name"]: item["value_bn"] for item in parsed["current_segments"]}
+        self.assertAlmostEqual(segments["iPhone"], 28.846, places=3)
+        self.assertAlmostEqual(segments["Services"], 8.501, places=3)
+
+        geographies = {item["name"]: item["value_bn"] for item in parsed["current_geographies"]}
+        self.assertAlmostEqual(geographies["Americas"], 23.099, places=3)
+        self.assertAlmostEqual(geographies["Greater China"], 9.801, places=3)
+
+    @patch("app.services.reports.get_institutional_views")
+    @patch("app.services.reports._enrich_history_with_official_structures")
+    @patch("app.services.reports.hydrate_source_materials")
+    @patch("app.services.reports.resolve_official_sources")
+    @patch("app.services.reports.get_quarter_fixture")
+    def test_build_report_payload_apple_2017q3_preserves_structured_shareholder_return_breakdown(
+        self,
+        mock_get_quarter_fixture: object,
+        mock_resolve_sources: object,
+        mock_hydrate_materials: object,
+        mock_enrich_history: object,
+        mock_get_institutional_views: object,
+    ) -> None:
+        mock_get_quarter_fixture.return_value = None
+        mock_enrich_history.side_effect = lambda company, history, progress_callback=None: history
+        mock_get_institutional_views.return_value = []
+        mock_resolve_sources.return_value = [
+            {"url": "https://www.sec.gov/Archives/edgar/data/320193/000032019317000067/a8-kexhibit991q420179302017.htm", "kind": "official_release", "date": "2017-11-02"},
+            {"url": "https://www.sec.gov/Archives/edgar/data/320193/000032019317000067/a8-kexhibit992q420179302017.htm", "kind": "call_summary", "date": "2017-11-02"},
+            {"url": "https://www.sec.gov/Archives/edgar/data/320193/000032019317000070/a10-k20179302017.htm", "kind": "sec_filing", "date": "2017-11-03"},
+        ]
+        mock_hydrate_materials.return_value = [
+            self._load_backup_official_material(
+                "apple",
+                "2017Q3",
+                "official-release-apple-a8-kexhibit991q420179302017-htm-https-www-sec-gov-archives-edgar-data-320.json",
+            ),
+            self._load_backup_official_material(
+                "apple",
+                "2017Q3",
+                "call-summary-apple-a8-kexhibit992q420179302017-htm-https-www-sec-gov-archives-edgar-data-320193-.json",
+            ),
+            self._load_backup_official_material(
+                "apple",
+                "2017Q3",
+                "sec-filing-apple-form-10-k-https-www-sec-gov-archives-edgar-data-320193-000032019317000070-a10-k.json",
+            ),
+        ]
+
+        payload = build_report_payload("apple", "2017Q3", 12, refresh_source_materials=False)
+
+        latest_kpis = dict(payload["latest_kpis"])
+        self.assertAlmostEqual(latest_kpis["operating_cash_flow_bn"], 15.7, places=3)
+        self.assertAlmostEqual(latest_kpis["capital_return_bn"], 11.0, places=3)
+        self.assertAlmostEqual(latest_kpis["dividends_bn"], 3.252, places=3)
+        self.assertAlmostEqual(latest_kpis["share_repurchases_bn"], 4.5, places=3)
+
+        capital_allocation = dict(payload["capital_allocation"])
+        shareholder_signal = next(
+            signal for signal in capital_allocation["signals"] if signal.get("kind") == "shareholder_return"
+        )
+        self.assertIn("回购", shareholder_signal["summary"])
+        self.assertIn("分红", shareholder_signal["summary"])
+
+    def test_parse_official_materials_extracts_shareholder_return_metrics_from_release_narrative(self) -> None:
+        release_path = self._write_temp_text(
+            "apple-capital-return-release.txt",
+            (
+                "Total net sales 52,579 46,852 12 % "
+                "Net income 10,714 9,014 19 % "
+                "Cash flow from operations was very strong at $28.3 billion, and we returned $14.5 billion to investors through our capital return program. "
+                "Apple paid dividends and dividend equivalents of $3.3 billion and repurchased $11.2 billion of common stock during the quarter. "
+            ),
+        )
+        sec_path = self._write_temp_text(
+            "apple-capital-return-sec.txt",
+            "Total net sales 229,234 215,639 6 % Net income 48,351 45,687 6 %",
+        )
+
+        parsed = parse_official_materials(
+            get_company("apple"),
+            {"fiscal_label": "Q4 FY2017", "calendar_quarter": "2017Q3", "coverage_notes": []},
+            [
+                {"label": "Apple Q4 2017 release", "kind": "official_release", "status": "cached", "text_path": release_path},
+                {"label": "Apple 2017 10-K", "kind": "sec_filing", "status": "cached", "text_path": sec_path},
+            ],
+        )
+
+        latest_kpis = dict(parsed["latest_kpis"])
+        self.assertAlmostEqual(latest_kpis["operating_cash_flow_bn"], 28.3, places=3)
+        self.assertAlmostEqual(latest_kpis["capital_return_bn"], 14.5, places=3)
+        self.assertAlmostEqual(latest_kpis["dividends_bn"], 3.3, places=3)
+        self.assertAlmostEqual(latest_kpis["share_repurchases_bn"], 11.2, places=3)
+
+    def test_extract_cash_flow_metrics_handles_amount_before_operating_cash_flow_label(self) -> None:
+        metrics = _extract_cash_flow_metrics_from_materials(
+            [
+                {
+                    "kind": "official_release",
+                    "flat_text": (
+                        "Our outstanding business performance resulted in a new all-time record for earnings per share, "
+                        "and over $27 billion in operating cash flow. "
+                    ),
+                },
+                {
+                    "kind": "sec_filing",
+                    "flat_text": "The Company's capital expenditures were $2.1 billion during the first quarter of 2017.",
+                },
+            ]
+        )
+
+        self.assertAlmostEqual(metrics["operating_cash_flow_bn"], 27.0, places=3)
+        self.assertAlmostEqual(metrics["capital_expenditures_bn"], 2.1, places=3)
+        self.assertAlmostEqual(metrics["free_cash_flow_bn"], 24.9, places=3)
+
+    def test_extract_cash_flow_metrics_reads_statement_table_rows(self) -> None:
+        html_path = self._write_temp_text(
+            "cash-flow-table.html",
+            """
+            <html><body>
+            <table>
+              <tr>
+                <th></th>
+                <th>Three Months Ended March 31, 2017</th>
+                <th>Three Months Ended March 31, 2016</th>
+                <th>Nine Months Ended March 31, 2017</th>
+                <th>Nine Months Ended March 31, 2016</th>
+              </tr>
+              <tr>
+                <td>Net cash from operations</td>
+                <td>12,440</td>
+                <td>10,525</td>
+                <td>33,267</td>
+                <td>28,901</td>
+              </tr>
+              <tr>
+                <td>Additions to property and equipment</td>
+                <td>(2,132)</td>
+                <td>(2,503)</td>
+                <td>(5,944)</td>
+                <td>(6,816)</td>
+              </tr>
+            </table>
+            </body></html>
+            """,
+        )
+
+        metrics = _extract_cash_flow_metrics_from_materials(
+            [
+                {
+                    "kind": "official_release",
+                    "raw_path": html_path,
+                }
+            ]
+        )
+
+        self.assertAlmostEqual(metrics["operating_cash_flow_bn"], 12.44, places=3)
+        self.assertAlmostEqual(metrics["capital_expenditures_bn"], 2.132, places=3)
+        self.assertAlmostEqual(metrics["free_cash_flow_bn"], 10.308, places=3)
+
+    def test_extract_cash_flow_metrics_supports_apple_ppe_acquisition_label(self) -> None:
+        metrics = _extract_cash_flow_metrics_from_materials(
+            [
+                {
+                    "kind": "official_release",
+                    "flat_text": (
+                        "Operating cash flow was $54.0 billion during the quarter. "
+                        "Payments for acquisition of property, plant and equipment were $3.1 billion during the quarter."
+                    ),
+                }
+            ]
+        )
+
+        self.assertAlmostEqual(metrics["operating_cash_flow_bn"], 54.0, places=3)
+        self.assertAlmostEqual(metrics["capital_expenditures_bn"], 3.1, places=3)
+        self.assertAlmostEqual(metrics["free_cash_flow_bn"], 50.9, places=3)
+
+    def test_extract_cash_flow_metrics_ignores_annual_statement_totals_for_single_quarter(self) -> None:
+        html_path = self._write_temp_text(
+            "visa-annual-cash-flow-table.html",
+            """
+            <html><body>
+            <table>
+              <tr>
+                <th></th>
+                <th>Twelve Months Ended September 30, 2025</th>
+                <th>Twelve Months Ended September 30, 2024</th>
+              </tr>
+              <tr>
+                <td>Net cash from operations</td>
+                <td>136,200</td>
+                <td>120,400</td>
+              </tr>
+              <tr>
+                <td>Capital expenditures</td>
+                <td>(64,600)</td>
+                <td>(58,200)</td>
+              </tr>
+            </table>
+            </body></html>
+            """,
+        )
+
+        metrics = _extract_cash_flow_metrics_from_materials(
+            [
+                {
+                    "label": "Visa 2025 10-K",
+                    "kind": "sec_filing",
+                    "raw_path": html_path,
+                }
+            ]
+        )
+
+        self.assertIsNone(metrics["operating_cash_flow_bn"])
+        self.assertIsNone(metrics["capital_expenditures_bn"])
+        self.assertIsNone(metrics["free_cash_flow_bn"])
+
+    def test_extract_shareholder_return_metrics_prefers_quarter_value_over_cumulative_program_total(self) -> None:
+        metrics = _extract_shareholder_return_metrics_from_materials(
+            [
+                {
+                    "kind": "official_release",
+                    "flat_text": (
+                        "We returned nearly $15 billion to investors through share repurchases and dividends during the quarter, "
+                        "bringing cumulative payments through our capital return program to over $200 billion."
+                    ),
+                }
+            ]
+        )
+
+        self.assertAlmostEqual(metrics["capital_return_bn"], 15.0, places=3)
+
+    def test_build_capital_allocation_snapshot_uses_structured_signals_and_svg_prefers_summary(self) -> None:
+        company = get_company("apple")
+        history = [
+            {
+                "quarter_label": "2017Q3",
+                "revenue_bn": 52.579,
+                "net_income_bn": 10.714,
+                "net_margin_pct": 20.4,
+            }
+        ]
+        report_data = {
+            "latest_kpis": {
+                "revenue_bn": 52.579,
+                "net_income_bn": 10.714,
+                "operating_cash_flow_bn": 28.3,
+                "free_cash_flow_bn": 24.7,
+                "capital_expenditures_bn": 3.6,
+                "capital_return_bn": 14.5,
+                "share_repurchases_bn": 11.2,
+                "dividends_bn": 3.3,
+            },
+            "guidance": {},
+            "coverage_notes": [],
+        }
+
+        snapshot = _build_capital_allocation_snapshot(company, report_data, history, "$")
+
+        self.assertEqual([item["kind"] for item in snapshot["signals"]], ["cash_generation", "capital_intensity", "shareholder_return"])
+        self.assertIn("28.3", snapshot["signals"][0]["summary"])
+        self.assertIn("11.2", snapshot["signals"][2]["summary"])
+        self.assertTrue(snapshot["signals"][0]["metrics"])
+
+        svg = render_capital_allocation_svg(snapshot, "#0F172A", "#16A34A", "$")
+        self.assertIn(snapshot["signals"][0]["summary"], svg)
+        self.assertNotIn(snapshot["signals"][0]["note"], svg)
 
     @patch.dict(os.environ, {"EARNINGS_DIGEST_DISABLE_SOURCE_FETCH": ""}, clear=False)
     @patch("app.services.official_source_resolver._fetch_json")
@@ -3970,6 +6971,370 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertEqual(release["kind"], "official_release")
         self.assertEqual(commentary["kind"], "presentation")
         self.assertEqual(annual["kind"], "sec_filing")
+
+    def test_resolve_official_sources_keeps_ir_discovery_for_historical_quarter_when_call_materials_are_missing(
+        self,
+    ) -> None:
+        with patch("app.services.official_source_resolver._load_submissions") as mock_load_submissions, patch(
+            "app.services.official_source_resolver._select_filing"
+        ) as mock_select_filing, patch(
+            "app.services.official_source_resolver._attachment_profiles"
+        ) as mock_attachment_profiles, patch(
+            "app.services.official_source_resolver._discover_attachment_url"
+        ) as mock_discover_attachment_url, patch(
+            "app.services.official_source_resolver._discover_default_sitemap_urls"
+        ) as mock_discover_default_sitemap_urls, patch(
+            "app.services.official_source_resolver._discover_sitemap_sources"
+        ) as mock_discover_sitemap_sources, patch(
+            "app.services.official_source_resolver._expand_related_ir_sources"
+        ) as mock_expand_related_ir_sources, patch(
+            "app.services.official_source_resolver._discover_ir_sources"
+        ) as mock_discover_ir_sources:
+            mock_load_submissions.return_value = {"filings": {"recent": {"form": []}}}
+            mock_select_filing.side_effect = [
+                {
+                    "accessionNumber": "0001193125-17-134327",
+                    "primaryDocument": "d373368d8k.htm",
+                    "filingDate": "2017-04-27",
+                    "form": "8-K",
+                },
+                {
+                    "accessionNumber": "0001564590-17-007233",
+                    "primaryDocument": "msft-10q.htm",
+                    "filingDate": "2017-04-27",
+                    "form": "10-Q",
+                },
+            ]
+            mock_attachment_profiles.return_value = [
+                {
+                    "role": "earnings_release",
+                    "kind": "official_release",
+                    "hints": ("99.1", "earnings release"),
+                    "excludes": (),
+                }
+            ]
+            mock_discover_attachment_url.return_value = (
+                "https://www.sec.gov/Archives/edgar/data/789019/000119312517134327/d373368dex991.htm",
+                "Microsoft earnings release",
+            )
+
+            mock_discover_default_sitemap_urls.return_value = ["https://www.microsoft.com/sitemap.xml"]
+            mock_discover_sitemap_sources.return_value = [
+                {
+                    "label": "Microsoft FY2017 Q4 press release webcast",
+                    "url": "https://www.microsoft.com/en-us/Investor/earnings/FY-2017-Q4/press-release-webcast",
+                    "kind": "official_release",
+                    "role": "earnings_release",
+                    "date": "2017-07-20",
+                }
+            ]
+            mock_expand_related_ir_sources.return_value = [
+                {
+                    "label": "Microsoft FY2017 Q4 transcript",
+                    "url": "https://www.microsoft.com/en-us/Investor/earnings/FY-2017-Q4/transcript",
+                    "kind": "call_summary",
+                    "role": "earnings_call",
+                    "date": "2017-07-20",
+                }
+            ]
+            mock_discover_ir_sources.return_value = []
+
+            company = get_company("microsoft")
+            with patch.dict(os.environ, {"EARNINGS_DIGEST_DISABLE_SOURCE_FETCH": "0"}, clear=False):
+                sources = resolve_official_sources(company, "2017Q3", "2017-03-31", [], refresh=True)
+
+        self.assertTrue(any(str(item.get("role") or "") == "earnings_release" for item in sources))
+        self.assertTrue(any(str(item.get("role") or "") == "sec_filing" for item in sources))
+        self.assertTrue(any(str(item.get("role") or "") == "earnings_call" for item in sources))
+        mock_discover_default_sitemap_urls.assert_called_once()
+        mock_discover_sitemap_sources.assert_called_once()
+        mock_expand_related_ir_sources.assert_called()
+        mock_discover_ir_sources.assert_called_once()
+
+    @patch("app.services.official_source_resolver._fetch_text")
+    def test_discover_ir_sources_can_infer_historical_earnings_page_from_current_template(
+        self,
+        mock_fetch_text: object,
+    ) -> None:
+        company = get_company("microsoft")
+        cache_path = self._backup_root / "microsoft-ir-discovery.json"
+        home_html = (
+            '<html><body>'
+            '<a href="/en-us/Investor/earnings/FY-2026-Q2/press-release-webcast">FY 2026 Q2 press release webcast</a>'
+            "</body></html>"
+        )
+        historical_html = (
+            '<html><body>'
+            '<a href="/en-us/Investor/earnings/FY-2017-Q4/transcript">Transcript</a>'
+            '<a href="/en-us/Investor/earnings/FY-2017-Q4/earnings-presentation.pdf">Presentation</a>'
+            "</body></html>"
+        )
+
+        def fetch_side_effect(url: str) -> str:
+            normalized = str(url)
+            if normalized == company["ir_url"]:
+                return home_html
+            if normalized.endswith("/en-us/Investor/earnings/FY-2017-Q4/press-release-webcast"):
+                return historical_html
+            return "<html></html>"
+
+        mock_fetch_text.side_effect = fetch_side_effect
+
+        with patch("app.services.official_source_resolver._ir_cache_path", return_value=cache_path):
+            discovered = source_resolver._discover_ir_sources(
+                company,
+                "2017Q2",
+                "2017-06-30",
+                refresh=True,
+                required_roles={"earnings_release", "earnings_call", "earnings_presentation"},
+            )
+
+        urls = {str(item.get("url") or "") for item in discovered}
+        self.assertIn("https://www.microsoft.com/en-us/Investor/earnings/FY-2017-Q4/press-release-webcast", urls)
+        self.assertIn("https://www.microsoft.com/en-us/Investor/earnings/FY-2017-Q4/transcript", urls)
+        self.assertIn("https://www.microsoft.com/en-us/Investor/earnings/FY-2017-Q4/earnings-presentation.pdf", urls)
+
+    @patch("app.services.official_source_resolver._fetch_text")
+    def test_discover_ir_sources_ignores_outdated_cache_version(
+        self,
+        mock_fetch_text: object,
+    ) -> None:
+        company = get_company("microsoft")
+        cache_path = self._backup_root / "microsoft-ir-discovery-versioned.json"
+        cache_path.write_text(
+            json.dumps(
+                {
+                    "cache_version": source_resolver.IR_DISCOVERY_CACHE_VERSION - 1,
+                    "company_id": company["id"],
+                    "calendar_quarter": "2017Q2",
+                    "period_end": "2017-06-30",
+                    "sources": [
+                        {
+                            "label": "stale source",
+                            "url": "https://www.microsoft.com/en-us/Investor/events/fy-2026-q2",
+                            "kind": "call_summary",
+                            "role": "earnings_call",
+                            "date": "",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        home_html = (
+            '<html><body>'
+            '<a href="/en-us/Investor/earnings/FY-2026-Q2/press-release-webcast">FY 2026 Q2 press release webcast</a>'
+            "</body></html>"
+        )
+        historical_html = (
+            '<html><body>'
+            '<a href="/en-us/Investor/earnings/FY-2017-Q4/transcript">Transcript</a>'
+            "</body></html>"
+        )
+
+        def fetch_side_effect(url: str) -> str:
+            normalized = str(url)
+            if normalized == company["ir_url"]:
+                return home_html
+            if normalized.endswith("/en-us/Investor/earnings/FY-2017-Q4/press-release-webcast"):
+                return historical_html
+            return "<html></html>"
+
+        mock_fetch_text.side_effect = fetch_side_effect
+
+        with patch("app.services.official_source_resolver._ir_cache_path", return_value=cache_path):
+            discovered = source_resolver._discover_ir_sources(
+                company,
+                "2017Q2",
+                "2017-06-30",
+                refresh=False,
+                required_roles={"earnings_release", "earnings_call"},
+            )
+
+        urls = {str(item.get("url") or "") for item in discovered}
+        self.assertIn("https://www.microsoft.com/en-us/Investor/earnings/FY-2017-Q4/press-release-webcast", urls)
+        self.assertIn("https://www.microsoft.com/en-us/Investor/earnings/FY-2017-Q4/transcript", urls)
+        self.assertNotIn("https://www.microsoft.com/en-us/Investor/events/fy-2026-q2", urls)
+
+        rewritten_cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        self.assertEqual(rewritten_cache["cache_version"], source_resolver.IR_DISCOVERY_CACHE_VERSION)
+
+    @patch("app.services.official_source_resolver._fetch_json_response")
+    def test_q4_public_feed_links_extracts_financial_report_documents(
+        self,
+        mock_fetch_json_response: object,
+    ) -> None:
+        mock_fetch_json_response.return_value = {
+            "GetFinancialReportListResult": [
+                {
+                    "ReportTitle": "Fourth Quarter 2025",
+                    "Documents": [
+                        {
+                            "DocumentCategory": "news",
+                            "DocumentTitle": "Earnings Release",
+                            "DocumentPath": "https://cdn.example.com/2025q4-release.pdf",
+                        },
+                        {
+                            "DocumentCategory": "webcast",
+                            "DocumentTitle": "Webcast & Transcript",
+                            "DocumentPath": "/investor/events/event-details/2026/2025-q4-earnings-call/default.aspx",
+                        },
+                        {
+                            "DocumentCategory": "presentation",
+                            "DocumentTitle": "Earnings Slides",
+                            "DocumentPath": "https://cdn.example.com/2025q4-slides.pdf",
+                        },
+                        {
+                            "DocumentCategory": "annual",
+                            "DocumentTitle": "Annual Report (PDF)",
+                            "DocumentPath": "https://cdn.example.com/annual-report.pdf",
+                        },
+                    ],
+                }
+            ]
+        }
+
+        links = source_resolver._q4_public_feed_links(
+            "https://abc.xyz/investor/Earnings/default.aspx",
+            '<html><script>q4Financials({"moduleId":"financials"});</script></html>',
+        )
+
+        urls = {str(item.get("url") or "") for item in links}
+        self.assertIn("https://cdn.example.com/2025q4-release.pdf", urls)
+        self.assertIn("https://abc.xyz/investor/events/event-details/2026/2025-q4-earnings-call/default.aspx", urls)
+        self.assertIn("https://cdn.example.com/2025q4-slides.pdf", urls)
+        self.assertIn("https://cdn.example.com/annual-report.pdf", urls)
+
+    @patch("app.services.official_source_resolver._discover_wayback_sources")
+    @patch("app.services.official_source_resolver._discover_ir_sources")
+    @patch("app.services.official_source_resolver._discover_default_sitemap_urls")
+    @patch("app.services.official_source_resolver._load_submissions")
+    def test_resolve_official_sources_reuses_cached_official_material_sources_when_live_discovery_misses_historical_call(
+        self,
+        mock_load_submissions: object,
+        mock_discover_default_sitemap_urls: object,
+        mock_discover_ir_sources: object,
+        mock_discover_wayback_sources: object,
+    ) -> None:
+        mock_load_submissions.return_value = {"filings": {"recent": {"form": []}}}
+        mock_discover_default_sitemap_urls.return_value = []
+        mock_discover_ir_sources.return_value = []
+        mock_discover_wayback_sources.return_value = []
+
+        cache_root = self._backup_root / "official-materials"
+        cache_dir = cache_root / "alphabet" / "2017Q4"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        text_path = cache_dir / "alphabet-2017q4-transcript.txt"
+        text_path.write_text("Alphabet Q4 2017 Earnings Call transcript", encoding="utf-8")
+        (cache_dir / "call-summary-alphabet-2017q4.json").write_text(
+            json.dumps(
+                {
+                    "label": "Alphabet 2017 Q4 Earnings Transcript.pdf",
+                    "url": "https://abc.xyz/assets/investor/static/pdf/2017_Q4_Earnings_Transcript.pdf",
+                    "fetch_url": "https://web.archive.org/web/20250709122811if_/https://abc.xyz/assets/investor/static/pdf/2017_Q4_Earnings_Transcript.pdf",
+                    "kind": "call_summary",
+                    "role": "earnings_call",
+                    "date": "2025-07-09",
+                    "status": "fetched",
+                    "text_path": str(text_path),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        company = get_company("alphabet")
+        with patch.dict(os.environ, {"EARNINGS_DIGEST_DISABLE_SOURCE_FETCH": "0"}, clear=False), patch.object(
+            source_resolver,
+            "OFFICIAL_MATERIALS_DIR",
+            cache_root,
+        ):
+            sources = resolve_official_sources(company, "2017Q4", "2017-12-31", [], refresh=True)
+
+        recovered = next(item for item in sources if str(item.get("role") or "") == "earnings_call")
+        self.assertEqual(
+            recovered["url"],
+            "https://abc.xyz/assets/investor/static/pdf/2017_Q4_Earnings_Transcript.pdf",
+        )
+        self.assertEqual(
+            recovered["fetch_url"],
+            "https://web.archive.org/web/20250709122811if_/https://abc.xyz/assets/investor/static/pdf/2017_Q4_Earnings_Transcript.pdf",
+        )
+
+    @patch("app.services.official_source_resolver._discover_wayback_sources")
+    @patch("app.services.official_source_resolver._discover_ir_sources")
+    @patch("app.services.official_source_resolver._discover_sitemap_sources")
+    @patch("app.services.official_source_resolver._discover_default_sitemap_urls")
+    @patch("app.services.official_source_resolver._load_submissions")
+    def test_resolve_official_sources_prefers_cached_material_sources_before_live_discovery_when_roles_are_satisfied(
+        self,
+        mock_load_submissions: object,
+        mock_discover_default_sitemap_urls: object,
+        mock_discover_sitemap_sources: object,
+        mock_discover_ir_sources: object,
+        mock_discover_wayback_sources: object,
+    ) -> None:
+        mock_load_submissions.return_value = {"filings": {"recent": {"form": []}}}
+        mock_discover_default_sitemap_urls.side_effect = AssertionError("should not scan sitemap when cached materials are sufficient")
+        mock_discover_sitemap_sources.side_effect = AssertionError("should not discover sitemap sources when cached materials are sufficient")
+        mock_discover_ir_sources.side_effect = AssertionError("should not discover ir sources when cached materials are sufficient")
+        mock_discover_wayback_sources.side_effect = AssertionError("should not hit wayback when cached materials are sufficient")
+
+        cache_root = self._backup_root / "official-materials"
+        cache_dir = cache_root / "alphabet" / "2017Q4"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cached_files = [
+            (
+                "official-release-alphabet-2017q4.json",
+                "Alphabet Q4 2017 release",
+                "https://abc.xyz/investor/static/pdf/2017Q4_alphabet_earnings_release.pdf",
+                "official_release",
+                "earnings_release",
+            ),
+            (
+                "call-summary-alphabet-2017q4.json",
+                "Alphabet Q4 2017 transcript",
+                "https://abc.xyz/investor/static/pdf/2017_Q4_Earnings_Transcript.pdf",
+                "call_summary",
+                "earnings_call",
+            ),
+            (
+                "presentation-alphabet-2017q4.json",
+                "Alphabet Q4 2017 quarterly financials",
+                "https://abc.xyz/investor/static/pdf/2017Q4_quarterly_financials.pdf",
+                "presentation",
+                "earnings_presentation",
+            ),
+        ]
+        for filename, label, url, kind, role in cached_files:
+            text_path = cache_dir / f"{Path(filename).stem}.txt"
+            text_path.write_text(label, encoding="utf-8")
+            (cache_dir / filename).write_text(
+                json.dumps(
+                    {
+                        "label": label,
+                        "url": url,
+                        "kind": kind,
+                        "role": role,
+                        "date": "2018-02-01",
+                        "status": "cached",
+                        "text_path": str(text_path),
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+        company = get_company("alphabet")
+        with patch.dict(os.environ, {"EARNINGS_DIGEST_DISABLE_SOURCE_FETCH": "0"}, clear=False), patch.object(
+            source_resolver,
+            "OFFICIAL_MATERIALS_DIR",
+            cache_root,
+        ):
+            sources = resolve_official_sources(company, "2017Q4", "2017-12-31", [], refresh=True)
+
+        roles = {str(item.get("role") or "") for item in sources}
+        self.assertTrue({"earnings_release", "earnings_call", "earnings_presentation"}.issubset(roles))
 
     def test_visa_parser_extracts_quarter_segments_and_annual_geographies(self) -> None:
         release_path = self._write_temp_text(
@@ -4220,6 +7585,53 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertAlmostEqual(segments["Data Center"]["value_bn"], 0.606, places=3)
         self.assertAlmostEqual(segments["Data Center"]["yoy_pct"], 105.0, places=1)
         self.assertTrue(any("CFO commentary" in note for note in parsed["coverage_notes"]))
+
+    def test_nvidia_modern_commentary_does_not_force_legacy_parser(self) -> None:
+        release_path = self._write_temp_text(
+            "nvidia-modern-release.txt",
+            (
+                "NVIDIA Announces Financial Results for Fourth Quarter and Fiscal 2026 "
+                "Revenue $68,127 $57,006 $39,331 20 % 73 % "
+                "Operating income $44,299 $36,010 $24,034 23 % 84 % "
+                "Net income $42,960 $31,910 $22,091 35 % 94 % "
+                "Gross margin 75.0 % 73.4 % 73.0 % 1.6 pts 2.0 pts "
+                "Diluted earnings per share $1.76 $1.30 $0.89 35 % 98 % "
+                "Net cash provided by operating activities 36,190 32,100 27,400 22,900 "
+                "Free cash flow $34,902 $30,200 $25,600 $21,400 "
+                "Revenue is expected to be $78.0 billion, plus or minus 2%. "
+                "GAAP and non-GAAP gross margins are expected to be 74.9% and 75.0%. "
+                "Data Center Fourth-quarter revenue was a record $62.3 billion, up 22% from the previous quarter and up 75% from a year ago, driven by the major platform shifts - accelerated computing and AI. "
+                "Gaming and AI PC Fourth-quarter Gaming revenue was $3.7 billion, up 47% from a year ago, driven by strong Blackwell demand, and down 13% from the previous quarter. "
+                "Professional Visualization Fourth-quarter revenue was $1.3 billion, up 74% from the previous quarter and up 159% from a year ago. "
+                "Automotive and Robotics Fourth-quarter Automotive revenue was $604 million, up 2% from the previous quarter and up 6% from a year ago. "
+            ),
+        )
+        commentary_path = self._write_temp_text(
+            "nvidia-modern-commentary.txt",
+            (
+                "Revenue by Market Platform ($ in millions) "
+                "Q4 FY26 Q3 FY26 Q4 FY25 Q/Q Y/Y "
+                "Data Center $62,314 $51,215 $35,580 22 % 75 % "
+                "Gaming $3,727 $4,265 $2,544 (13) % 47 % "
+                "Professional Visualization $1,321 $760 $511 74 % 159 % "
+                "Automotive $604 $592 $570 2 % 6 % "
+                "OEM and Other $161 $174 $126 (7) % 28 % "
+            ),
+        )
+
+        parsed = parse_official_materials(
+            get_company("nvidia"),
+            {"fiscal_label": "2025Q4", "coverage_notes": []},
+            [
+                {"label": "NVIDIA earnings release", "kind": "official_release", "status": "cached", "text_path": release_path},
+                {"label": "NVIDIA q4fy26cfocommentary.htm", "kind": "presentation", "status": "cached", "text_path": commentary_path},
+            ],
+        )
+
+        self.assertTrue(parsed["management_themes"])
+        self.assertEqual(parsed["management_themes"][0]["label"], "Data Center 继续绝对主导")
+        self.assertIn("$62.3B", parsed["management_themes"][0]["note"])
+        self.assertTrue(all("同比 -" not in str(item.get("note") or "") for item in parsed["management_themes"]))
 
     def test_generic_parser_can_use_commentary_role_without_full_release(self) -> None:
         commentary_path = self._write_temp_text(
@@ -5168,6 +8580,61 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
         self.assertAlmostEqual(segment_map["International Operated Markets"], 3.538, places=3)
         self.assertAlmostEqual(segment_map["International Developmental Licensed Markets & Corporate"], 0.613, places=3)
 
+    def test_extract_company_segments_merges_missing_profiled_segment_without_overwriting_release_values(self) -> None:
+        raw_html_path = self._write_temp_text(
+            "microsoft-segments-partial-release-vs-sec.html",
+            (
+                "<html><body><table>"
+                "<tr><th>Revenue</th><th>Three Months Ended March 31, 2017</th><th>Three Months Ended March 31, 2016</th></tr>"
+                "<tr><td>Productivity and Business Processes</td><td>11,808</td><td>10,101</td></tr>"
+                "<tr><td>Intelligent Cloud</td><td>10,156</td><td>8,900</td></tr>"
+                "<tr><td>More Personal Computing</td><td>9,400</td><td>9,494</td></tr>"
+                "</table></body></html>"
+            ),
+        )
+
+        segments = _extract_company_segments(
+            "microsoft",
+            [
+                {
+                    "label": "Microsoft earnings release",
+                    "kind": "official_release",
+                    "status": "cached",
+                    "raw_text": (
+                        "Revenue in Productivity and Business Processes was $8.2 billion and increased 28%. "
+                        "Revenue in Intelligent Cloud was $6.9 billion and increased 14%."
+                    ),
+                    "flat_text": (
+                        "Revenue in Productivity and Business Processes was $8.2 billion and increased 28%. "
+                        "Revenue in Intelligent Cloud was $6.9 billion and increased 14%."
+                    ),
+                },
+                {
+                    "label": "Microsoft Form 10-Q",
+                    "kind": "sec_filing",
+                    "status": "cached",
+                    "raw_text": "Segment note table.",
+                    "flat_text": "Segment note table.",
+                    "raw_path": raw_html_path,
+                },
+            ],
+            revenue_bn=24.538,
+            target_calendar_quarter="2017Q3",
+        )
+
+        segment_map = {item["name"]: item for item in segments}
+        self.assertEqual(
+            [item["name"] for item in segments],
+            [
+                "More Personal Computing",
+                "Productivity and Business Processes",
+                "Intelligent Cloud",
+            ],
+        )
+        self.assertAlmostEqual(segment_map["Productivity and Business Processes"]["value_bn"], 8.2, places=3)
+        self.assertAlmostEqual(segment_map["Intelligent Cloud"]["value_bn"], 6.9, places=3)
+        self.assertAlmostEqual(segment_map["More Personal Computing"]["value_bn"], 9.4, places=3)
+
     def test_extract_company_segments_collects_single_segment_html_tables_from_headers(self) -> None:
         raw_html_path = self._write_temp_text(
             "starbucks-segment-header-tables.html",
@@ -5784,6 +9251,36 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
             ["iPhone", "Mac", "iPad", "Services"],
         )
 
+    def test_normalize_historical_segments_keeps_legacy_subsegment_names_distinct_from_modern_taxonomy(self) -> None:
+        company = get_company("microsoft")
+        legacy_segments = [
+            {"name": "Office Commercial", "value_bn": 0.823},
+            {"name": "Server products and cloud services", "value_bn": 5.475},
+            {"name": "Windows OEM", "value_bn": 2.311},
+        ]
+
+        normalized = _normalize_historical_segments(company, legacy_segments, revenue_bn=8.609)
+
+        self.assertEqual(
+            [item["name"] for item in normalized],
+            ["Office Commercial", "Server products and cloud services", "Windows OEM"],
+        )
+
+    def test_normalize_historical_segments_still_canonicalizes_direct_name_variants(self) -> None:
+        company = get_company("microsoft")
+        modern_variant_segments = [
+            {"name": "Productivity & Business Processes", "value_bn": 8.2},
+            {"name": "Intelligent cloud", "value_bn": 6.9},
+            {"name": "More personal computing", "value_bn": 9.4},
+        ]
+
+        normalized = _normalize_historical_segments(company, modern_variant_segments, revenue_bn=24.5)
+
+        self.assertEqual(
+            [item["name"] for item in normalized],
+            ["Productivity and Business Processes", "Intelligent Cloud", "More Personal Computing"],
+        )
+
     def test_quarter_reference_terms_use_fiscal_quarter_for_non_calendar_year_companies(self) -> None:
         company = get_company("apple")
 
@@ -5894,6 +9391,1186 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
             self.assertIn(expected, income_svg)
             self.assertIn(expected, translation_svg)
         self.assertIn("Other Bets", income_svg)
+
+    def test_compact_category_label_marks_google_other_as_legacy_taxonomy(self) -> None:
+        self.assertEqual(_compact_category_label("Google other"), "Google other（旧口径）")
+
+    def test_render_income_statement_svg_microsoft_uses_default_business_mix_cards(self) -> None:
+        statement = {
+            "company_id": "microsoft",
+            "fiscal_label": "Q4 FY2025",
+            "period_end": "2025-06-30",
+            "revenue_bn": 81.3,
+            "revenue_yoy_pct": 17.0,
+            "gross_profit_bn": 55.3,
+            "gross_margin_pct": 68.0,
+            "cost_of_revenue_bn": 26.0,
+            "operating_profit_bn": 37.0,
+            "operating_margin_pct": 45.5,
+            "operating_expenses_bn": 18.3,
+            "net_profit_bn": 28.1,
+            "net_margin_pct": 34.6,
+            "business_groups": [
+                {"name": "Productivity and Business Processes", "value_bn": 34.1, "yoy_pct": 16.0},
+                {"name": "Intelligent Cloud", "value_bn": 32.9, "yoy_pct": 29.0},
+                {"name": "More Personal Computing", "value_bn": 14.3, "yoy_pct": -3.0},
+            ],
+            "opex_breakdown": [
+                {"name": "Research and development", "value_bn": 9.5, "pct_of_revenue": 11.7, "color": "#E11D48"},
+                {"name": "Sales and marketing", "value_bn": 6.3, "pct_of_revenue": 7.7, "color": "#FB7185"},
+                {"name": "General and administrative", "value_bn": 2.5, "pct_of_revenue": 3.1, "color": "#F97316"},
+            ],
+            "below_operating_items": [{"name": "Tax & other", "value_bn": 8.9, "color": "#D92D20"}],
+        }
+        colors = {
+            "Productivity and Business Processes": "#2796D4",
+            "Intelligent Cloud": "#FFBE0B",
+            "More Personal Computing": "#7A7A7A",
+        }
+
+        income_svg = render_income_statement_svg(statement, colors, "#2563EB")
+
+        self.assertIn("OFFICIAL EARNINGS BRIDGE", income_svg)
+        self.assertIn("Productivity &amp; Biz", income_svg)
+        self.assertNotIn(">WORK<", income_svg)
+        self.assertNotIn(">CLOUD<", income_svg)
+        self.assertNotIn(">PERSONAL<", income_svg)
+
+    def test_render_validation_checklist_svg_wraps_long_copy_without_clipping(self) -> None:
+        snapshot = {
+            "negative_items": [
+                {
+                    "label": "Productivity and Business Processes 承压需要继续确认企业席位扩张与单价提升是否同步放缓",
+                    "trigger": "如果 Productivity and Business Processes 占收入约 42.0% 的主业务出现需求或供给节奏变化，会直接放大到整体收入与利润率端。",
+                    "verify": "下季度继续核对是否真正落到收入、利润率、现金流或指引端，并确认管理层原文与业务结构是否同步转弱。",
+                },
+                {
+                    "label": "More Personal Computing 承压",
+                    "trigger": "若下一个阶段收入落到 34.5B 下方，或同比继续放缓，需要重新评估设备需求恢复强度。",
+                    "verify": "重点看收入同比、环比、业务业务增速与需求相关原文表述。".replace("业务业务", "头部业务"),
+                },
+            ],
+            "positive_items": [
+                {
+                    "label": "Azure 保持高增并带动整体云业务质量改善",
+                    "trigger": "若下一阶段云收入高于 34.5B，且主线业务继续提速，就说明 AI 需求仍在兑现。",
+                    "verify": "重点看收入增速、头部业务体量与 TTM 趋势是否同步上修，并确认管理层措辞是否继续强化。",
+                }
+            ],
+        }
+
+        svg = render_validation_checklist_svg(snapshot, "#F97316", "#147DF5")
+        plain_text = re.sub(r"<[^>]+>", "", svg)
+        height_match = re.search(r'viewBox="0 0 1180 ([0-9]+)"', svg)
+
+        self.assertIsNotNone(height_match)
+        self.assertGreater(int(height_match.group(1)), 372)
+        self.assertIn("Productivity and Business Processes", plain_text)
+        self.assertIn("会直接放大到整体收入与利润率端。", plain_text)
+        self.assertIn("并确认管理层原文与业务结构是否同步转弱。", plain_text)
+        self.assertIn("Azure 保持高增并带动整体云业务质量改善", plain_text)
+
+    def test_render_validation_checklist_svg_wraps_mixed_language_copy_conservatively(self) -> None:
+        snapshot = {
+            "negative_items": [
+                {
+                    "label": "Google Search & other 集中度风险",
+                    "trigger": "Google Search & other 占收入约 55.4%，一旦需求或供给节奏变化，会直接放大对整体收入与利润的影响，需要同时核对 CPC、流量获取成本、广告主预算与搜索份额是否共振转弱。",
+                    "verify": "下季度继续核对是否真正落到收入、利润率、现金流指引端，并确认管理层原文与业务结构是否同步转弱。",
+                }
+            ],
+            "positive_items": [],
+        }
+
+        svg = render_validation_checklist_svg(snapshot, "#F97316", "#147DF5")
+        trigger_text = re.search(
+            r'<text x="62.0" y="[0-9.]+" text-anchor="start" font-size="10\.[0-9]" font-weight="400" fill="#475569">(.*?)</text>',
+            svg,
+        )
+
+        self.assertIsNotNone(trigger_text)
+        self.assertGreaterEqual(trigger_text.group(1).count("<tspan"), 3)
+        self.assertIn("Google Search &amp; other 占收入约 55.4%", trigger_text.group(1))
+
+
+class ReportRegressionUnitTestCase(unittest.TestCase):
+    def test_ensure_report_payload_defaults_does_not_recompute_existing_heavy_panels(self) -> None:
+        payload = {
+            "company": get_company("alphabet"),
+            "calendar_quarter": "2017Q4",
+            "historical_cube": [
+                {
+                    "calendar_quarter": "2017Q4",
+                    "revenue_bn": 32.3,
+                    "net_income_bn": 12.6,
+                }
+            ],
+            "quality_report": {"status": "pass", "issues": []},
+            "capital_allocation": {"title": "现金流与资本配置", "cards": [], "bullets": [], "signals": [], "framework": []},
+            "expectation_reset": {"title": "预期差与指引变化", "cards": [], "bullets": [], "method": []},
+            "balance_quality": {"title": "资产负债与经营质量", "cards": [], "signals": [], "bullets": [], "framework": []},
+            "validation_checklist": {"title": "下一季验证清单", "positive_items": [], "negative_items": [], "bullets": [], "method": []},
+            "visuals": {
+                "company_brand": "<svg>brand</svg>",
+                "capital_allocation": "<svg>capital</svg>",
+                "expectation_reset": "<svg>expectation</svg>",
+                "balance_quality": "<svg>balance</svg>",
+                "validation_checklist": "<svg>validation</svg>",
+            },
+        }
+
+        with patch.object(reports_service, "_build_capital_allocation_snapshot", side_effect=AssertionError("capital recomputed")), patch.object(
+            reports_service,
+            "_build_expectation_reset_snapshot",
+            side_effect=AssertionError("expectation recomputed"),
+        ), patch.object(reports_service, "_build_balance_quality_snapshot", side_effect=AssertionError("balance recomputed")), patch.object(
+            reports_service,
+            "_build_validation_snapshot",
+            side_effect=AssertionError("validation recomputed"),
+        ), patch.object(reports_service, "render_capital_allocation_svg", side_effect=AssertionError("capital svg rerendered")), patch.object(
+            reports_service,
+            "render_expectation_reset_svg",
+            side_effect=AssertionError("expectation svg rerendered"),
+        ), patch.object(reports_service, "render_balance_quality_svg", side_effect=AssertionError("balance svg rerendered")), patch.object(
+            reports_service,
+            "render_validation_checklist_svg",
+            side_effect=AssertionError("validation svg rerendered"),
+        ):
+            normalized = reports_service.ensure_report_payload_defaults(payload)
+
+        self.assertEqual(normalized["expectation_reset"]["title"], "预期差与指引变化")
+        self.assertEqual(normalized["visuals"]["expectation_reset"], "<svg>expectation</svg>")
+
+    def test_ensure_report_payload_defaults_repairs_stale_apple_income_statement_payload(self) -> None:
+        payload = {
+            "company": get_company("apple"),
+            "company_id": "apple",
+            "calendar_quarter": "2025Q4",
+            "fiscal_label": "Q1 FY2026",
+            "period_end": "2025-12-27",
+            "release_date": "2026-01-29",
+            "money_symbol": "$",
+            "structure_dimension_used": "segment",
+            "guidance": {
+                "mode": "proxy",
+                "revenue_bn": 140.0,
+            },
+            "guidance_note": "旧指引说明",
+            "latest_kpis": {
+                "revenue_bn": 0.144,
+                "revenue_yoy_pct": 16.1,
+                "gaap_gross_margin_pct": 48.2,
+                "operating_income_bn": 50.852,
+                "net_income_bn": 42.097,
+            },
+            "current_segments": [
+                {"name": "iPhone", "value_bn": 0.069, "yoy_pct": 23.3},
+                {"name": "Mac", "value_bn": 0.007, "yoy_pct": 15.5},
+                {"name": "iPad", "value_bn": 0.007, "yoy_pct": 15.2},
+                {"name": "Wearables, Home and Accessories", "value_bn": 0.009, "yoy_pct": 9.0},
+                {"name": "Services", "value_bn": 0.04, "yoy_pct": 13.9},
+            ],
+            "current_geographies": [],
+            "income_statement": {
+                "revenue_bn": 0.144,
+                "gross_profit_bn": 0.069,
+                "gross_margin_pct": 48.2,
+                "cost_of_revenue_bn": 0.075,
+                "operating_profit_bn": 50.852,
+                "operating_expenses_bn": 18.438,
+                "net_profit_bn": 42.097,
+                "net_margin_pct": 29234.0,
+                "business_groups": [
+                    {"name": "iPhone", "value_bn": 0.069},
+                    {"name": "Mac", "value_bn": 0.007},
+                    {"name": "iPad", "value_bn": 0.007},
+                    {"name": "Wearables, Home and Accessories", "value_bn": 0.009},
+                    {"name": "Services", "value_bn": 0.04},
+                ],
+                "opex_breakdown": [
+                    {"name": "Research and development", "value_bn": 10.885, "pct_of_revenue": 7560.4, "color": "#E11D48"},
+                    {"name": "Selling, general and administrative", "value_bn": 7.553, "pct_of_revenue": 5202.8, "color": "#F43F5E"},
+                ],
+                "annotations": [
+                    {"title": "iPhone 仍是主引擎", "value": "$85.3B | +23.3% YoY", "note": "单品类仍是最大收入来源。", "color": "#111827"},
+                ],
+            },
+            "section_meta": {
+                "income_statement": {
+                    "eyebrow": "PRODUCT LAYER",
+                    "note": "iPhone把收入盘子撑到 $0.1B，最后留在净利润端的是 $42.1B；成本率和税项是主线。",
+                }
+            },
+            "visuals": {
+                "company_brand": "<svg>brand</svg>",
+                "income_statement": "<svg>$0.1B</svg>",
+                "statement_translation": "<svg>$0.1B</svg>",
+            },
+            "historical_cube": [
+                {
+                    "calendar_quarter": "2025Q3",
+                    "quarter_label": "2025Q3",
+                    "revenue_bn": 94.93,
+                    "net_income_bn": 23.434,
+                    "gross_margin_pct": 46.5,
+                },
+                {
+                    "calendar_quarter": "2025Q4",
+                    "quarter_label": "2025Q4",
+                    "revenue_bn": 143.756,
+                    "net_income_bn": 42.097,
+                    "gross_margin_pct": 48.2,
+                    "segments": [
+                        {"name": "iPhone", "value_bn": 85.269, "share_pct": 59.3, "yoy_pct": 23.3},
+                        {"name": "Services", "value_bn": 30.013, "share_pct": 20.9, "yoy_pct": 13.9},
+                        {"name": "Wearables, Home and Accessories", "value_bn": 11.493, "share_pct": 8.0, "yoy_pct": 9.0},
+                        {"name": "iPad", "value_bn": 8.595, "share_pct": 6.0, "yoy_pct": 15.2},
+                        {"name": "Mac", "value_bn": 8.386, "share_pct": 5.8, "yoy_pct": 15.5},
+                    ],
+                    "structure_basis": "segment",
+                },
+            ],
+            "qna_themes": [],
+            "sources": [],
+            "transcript_summary": None,
+            "quality_report": {"status": "pass", "issues": []},
+            "capital_allocation": {"title": "现金流与资本配置", "cards": [], "bullets": [], "signals": [], "framework": []},
+            "expectation_reset": {"title": "预期差与指引变化", "cards": [], "bullets": [], "method": []},
+            "balance_quality": {"title": "资产负债与经营质量", "cards": [], "signals": [], "bullets": [], "framework": []},
+            "validation_checklist": {"title": "下一季验证清单", "positive_items": [], "negative_items": [], "bullets": [], "method": []},
+        }
+        payload["visuals"].update(
+            {
+                "capital_allocation": "<svg>capital</svg>",
+                "expectation_reset": "<svg>expectation</svg>",
+                "balance_quality": "<svg>balance</svg>",
+                "validation_checklist": "<svg>validation</svg>",
+            }
+        )
+
+        with patch.object(
+            reports_service,
+            "render_income_statement_svg",
+            side_effect=lambda statement, *_args, **_kwargs: f"<svg>{statement['revenue_bn']:.3f}</svg>",
+        ), patch.object(
+            reports_service,
+            "render_statement_translation_svg",
+            side_effect=lambda statement, *_args, **_kwargs: f"<svg>translation:{statement['revenue_bn']:.3f}</svg>",
+        ):
+            normalized = reports_service.ensure_report_payload_defaults(payload)
+
+        self.assertAlmostEqual(normalized["latest_kpis"]["revenue_bn"], 143.756, places=3)
+        self.assertAlmostEqual(normalized["income_statement"]["revenue_bn"], 143.756, places=3)
+        self.assertEqual(normalized["visuals"]["income_statement"], "<svg>143.756</svg>")
+        self.assertEqual(normalized["visuals"]["statement_translation"], "<svg>translation:143.756</svg>")
+        self.assertIn("$143.8B", normalized["section_meta"]["income_statement"]["note"])
+        self.assertNotIn("$0.1B", normalized["section_meta"]["income_statement"]["note"])
+        self.assertAlmostEqual(normalized["current_segments"][0]["value_bn"], 85.269, places=3)
+        self.assertAlmostEqual(normalized["income_statement"]["opex_breakdown"][0]["pct_of_revenue"], 7.6, places=1)
+
+    def test_ensure_report_payload_defaults_repairs_stale_latest_growth_metrics_from_history(self) -> None:
+        payload = {
+            "company": get_company("nvidia"),
+            "company_id": "nvidia",
+            "calendar_quarter": "2025Q4",
+            "fiscal_label": "Q4 FY2026",
+            "period_end": "2026-01-25",
+            "release_date": "2026-02-25",
+            "money_symbol": "$",
+            "latest_kpis": {
+                "revenue_bn": 68.127,
+                "revenue_qoq_pct": 19.50847279233765,
+                "revenue_yoy_pct": 19.50847279233765,
+                "net_income_bn": 42.96,
+                "net_income_qoq_pct": 34.628643058602314,
+                "net_income_yoy_pct": 34.628643058602314,
+                "gaap_gross_margin_pct": 75.0,
+            },
+            "guidance": {"mode": "official", "revenue_bn": 78.0},
+            "current_segments": [
+                {"name": "Data Center", "value_bn": 62.314, "yoy_pct": 21.7},
+                {"name": "Gaming", "value_bn": 3.727, "yoy_pct": -12.6},
+                {"name": "Professional Visualization", "value_bn": 1.321, "yoy_pct": 73.8},
+                {"name": "Automotive", "value_bn": 0.604, "yoy_pct": 2.0},
+                {"name": "OEM and Other", "value_bn": 0.161, "yoy_pct": -7.5},
+            ],
+            "current_geographies": [],
+            "historical_cube": [
+                {
+                    "calendar_quarter": "2024Q4",
+                    "quarter_label": "2024Q4",
+                    "fiscal_label": "Q4 FY2025",
+                    "revenue_bn": 39.331,
+                    "net_income_bn": 22.091,
+                    "gross_margin_pct": 73.0,
+                    "segments": [
+                        {"name": "Data Center", "value_bn": 35.58, "share_pct": 90.46},
+                        {"name": "Gaming", "value_bn": 2.544, "share_pct": 6.47},
+                        {"name": "Professional Visualization", "value_bn": 0.511, "share_pct": 1.30},
+                        {"name": "Automotive", "value_bn": 0.57, "share_pct": 1.45},
+                        {"name": "OEM and Other", "value_bn": 0.126, "share_pct": 0.32},
+                    ],
+                    "structure_basis": "segment",
+                },
+                {"calendar_quarter": "2025Q1", "quarter_label": "2025Q1", "fiscal_label": "Q1 FY2026", "revenue_bn": 44.0, "net_income_bn": 28.0, "gross_margin_pct": 73.5},
+                {"calendar_quarter": "2025Q2", "quarter_label": "2025Q2", "fiscal_label": "Q2 FY2026", "revenue_bn": 50.0, "net_income_bn": 30.0, "gross_margin_pct": 74.0},
+                {
+                    "calendar_quarter": "2025Q3",
+                    "quarter_label": "2025Q3",
+                    "fiscal_label": "Q3 FY2026",
+                    "revenue_bn": 56.999,
+                    "net_income_bn": 31.91,
+                    "gross_margin_pct": 74.5,
+                    "segments": [
+                        {"name": "Data Center", "value_bn": 51.215, "share_pct": 89.84},
+                        {"name": "Gaming", "value_bn": 4.265, "share_pct": 7.48},
+                        {"name": "Professional Visualization", "value_bn": 0.76, "share_pct": 1.33},
+                        {"name": "Automotive", "value_bn": 0.592, "share_pct": 1.04},
+                        {"name": "OEM and Other", "value_bn": 0.174, "share_pct": 0.31},
+                    ],
+                    "structure_basis": "segment",
+                },
+                {
+                    "calendar_quarter": "2025Q4",
+                    "quarter_label": "2025Q4",
+                    "fiscal_label": "Q4 FY2026",
+                    "revenue_bn": 68.127,
+                    "net_income_bn": 42.96,
+                    "gross_margin_pct": 75.0,
+                    "revenue_yoy_pct": 19.50847279233765,
+                    "net_income_yoy_pct": 34.628643058602314,
+                    "segments": [
+                        {"name": "Data Center", "value_bn": 62.314, "share_pct": 91.47, "yoy_pct": 21.7},
+                        {"name": "Gaming", "value_bn": 3.727, "share_pct": 5.47, "yoy_pct": -12.6},
+                        {"name": "Professional Visualization", "value_bn": 1.321, "share_pct": 1.94, "yoy_pct": 73.8},
+                        {"name": "Automotive", "value_bn": 0.604, "share_pct": 0.89, "yoy_pct": 2.0},
+                        {"name": "OEM and Other", "value_bn": 0.161, "share_pct": 0.24, "yoy_pct": -7.5},
+                    ],
+                    "structure_basis": "segment",
+                },
+            ],
+            "visuals": {
+                "segment_mix": "<svg>+21.7%</svg>",
+                "income_statement": "<svg>+21.7%</svg>",
+                "statement_translation": "<svg>+21.7%</svg>",
+            },
+        }
+
+        with patch.object(reports_service, "render_current_quarter_svg", return_value="<svg>current</svg>"), patch.object(
+            reports_service, "render_guidance_svg", return_value="<svg>guidance</svg>"
+        ), patch.object(
+            reports_service, "render_segment_mix_svg", side_effect=lambda segments, *_args, **_kwargs: f"<svg>mix:{segments[0].get('yoy_pct')}</svg>"
+        ), patch.object(
+            reports_service, "render_income_statement_svg", side_effect=lambda statement, *_args, **_kwargs: f"<svg>income:{statement['sources'][0].get('yoy_pct')}</svg>"
+        ), patch.object(
+            reports_service, "render_statement_translation_svg", side_effect=lambda statement, *_args, **_kwargs: f"<svg>statement:{statement['sources'][0].get('yoy_pct')}</svg>"
+        ):
+            normalized = reports_service.ensure_report_payload_defaults(payload)
+
+        self.assertAlmostEqual(normalized["latest_kpis"]["revenue_yoy_pct"], 73.21451272533115, places=4)
+        self.assertAlmostEqual(normalized["latest_kpis"]["net_income_yoy_pct"], 94.468335521253, places=4)
+        self.assertAlmostEqual(normalized["historical_cube"][-1]["revenue_yoy_pct"], 73.21451272533115, places=4)
+        self.assertAlmostEqual(normalized["historical_cube"][-1]["net_income_qoq_pct"], 34.628643058602314, places=4)
+        self.assertNotAlmostEqual(normalized["latest_kpis"]["revenue_yoy_pct"], normalized["latest_kpis"]["revenue_qoq_pct"], places=3)
+        self.assertAlmostEqual(normalized["current_segments"][0]["yoy_pct"], 75.13884103428891, places=4)
+        self.assertAlmostEqual(normalized["historical_cube"][-1]["segments"][0]["yoy_pct"], 75.13884103428891, places=4)
+        self.assertEqual(normalized["visuals"]["segment_mix"], "<svg>mix:75.13884103428891</svg>")
+        self.assertEqual(normalized["visuals"]["income_statement"], "<svg>income:75.13884103428891</svg>")
+        self.assertEqual(normalized["visuals"]["statement_translation"], "<svg>statement:75.13884103428891</svg>")
+
+    def test_ensure_report_payload_defaults_refreshes_implausible_official_guidance_from_cached_materials(self) -> None:
+        payload = {
+            "company": get_company("microsoft"),
+            "company_id": "microsoft",
+            "calendar_quarter": "2025Q4",
+            "fiscal_label": "FY2026 Q2",
+            "period_end": "2025-12-31",
+            "release_date": "2026-01-28",
+            "money_symbol": "$",
+            "latest_kpis": {
+                "revenue_bn": 81.273,
+                "gaap_gross_margin_pct": 68.0361251584167,
+            },
+            "guidance": {
+                "mode": "official",
+                "revenue_bn": 34.55,
+                "comparison_label": "下一季收入指引",
+                "commentary": "官方原文给出的收入展望约为 $34.5B。",
+            },
+            "current_segments": [
+                {"name": "Productivity and Business Processes", "value_bn": 34.1, "yoy_pct": 16.0},
+                {"name": "Intelligent Cloud", "value_bn": 32.9, "yoy_pct": 29.0},
+                {"name": "More Personal Computing", "value_bn": 14.3, "yoy_pct": -3.0},
+            ],
+            "historical_cube": [
+                {"calendar_quarter": "2025Q3", "quarter_label": "2025Q3", "fiscal_label": "FY2026 Q1", "revenue_bn": 77.37, "net_income_bn": 27.23, "gross_margin_pct": 67.1},
+                {"calendar_quarter": "2025Q4", "quarter_label": "2025Q4", "fiscal_label": "FY2026 Q2", "revenue_bn": 81.273, "net_income_bn": 38.5, "gross_margin_pct": 68.0361251584167},
+            ],
+            "guidance_panel": {"title": "当前业绩与下一季指引", "cards": [], "bullets": []},
+            "visuals": {"guidance": "<svg>old-guidance</svg>"},
+        }
+
+        with patch.object(
+            reports_service,
+            "_discover_cached_material_sources",
+            return_value=[{"url": "https://example.com/call", "kind": "call_summary", "role": "earnings_call", "date": "2026-01-28"}],
+        ), patch.object(
+            reports_service,
+            "_refresh_historical_guidance_from_cached_materials",
+            return_value={
+                "guidance": {
+                    "mode": "official",
+                    "revenue_bn": 81.2,
+                    "revenue_low_bn": 80.65,
+                    "revenue_high_bn": 81.75,
+                    "comparison_label": "下一季收入指引（分部加总）",
+                    "commentary": "下一季收入指引约为 $81.2B，由 Productivity and Business Processes、Intelligent Cloud、More Personal Computing 分部加总得到。",
+                }
+            },
+        ), patch.object(reports_service, "render_guidance_svg", return_value="<svg>guidance-fixed</svg>"):
+            normalized = reports_service.ensure_report_payload_defaults(payload)
+
+        self.assertAlmostEqual(normalized["guidance"]["revenue_bn"], 81.2, places=2)
+        self.assertEqual(normalized["visuals"]["guidance"], "<svg>guidance-fixed</svg>")
+        self.assertIn("$81.2B", normalized["guidance_panel"]["bullets"][0])
+
+    def test_resolve_quarter_guidance_snapshot_reuses_official_context_without_force_guidance_retry(self) -> None:
+        history = [
+            {
+                "calendar_quarter": "2017Q3",
+                "fiscal_label": "2017Q3",
+                "period_end": "2017-09-30",
+            }
+        ]
+        company = {
+            "id": "alphabet",
+            "official_source": True,
+        }
+        parsed_payload = {
+            "guidance": {
+                "mode": "official_context",
+                "commentary": "While we expect Sites TAC as a percentage of Sites revenues to continue to increase, the rate of growth will slow after the first quarter of 2018.",
+            }
+        }
+
+        with patch.object(reports_service, "get_quarter_fixture", return_value=None), patch.object(
+            reports_service,
+            "get_company",
+            return_value=company,
+        ), patch.object(
+            reports_service,
+            "_load_historical_official_quarter_cache",
+            return_value=None,
+        ), patch.object(
+            reports_service,
+            "_load_or_parse_historical_official_quarter_payload",
+            return_value=parsed_payload,
+        ) as load_payload:
+            snapshot = reports_service._resolve_quarter_guidance_snapshot("alphabet", "2017Q3", history)
+
+        self.assertEqual(snapshot["guidance"]["mode"], "official_context")
+        self.assertEqual(load_payload.call_count, 1)
+        load_payload.assert_called_once_with(
+            company,
+            "2017Q3",
+            entry=history[0],
+            require_guidance=False,
+        )
+
+    def test_resolve_quarter_guidance_snapshot_reuses_cached_guidance_even_when_structure_cache_drifted(self) -> None:
+        history = [
+            {
+                "calendar_quarter": "2017Q3",
+                "fiscal_label": "2017Q3",
+                "period_end": "2017-09-30",
+                "revenue_bn": 27.772,
+                "net_income_bn": 6.732,
+            }
+        ]
+        company = {
+            "id": "alphabet",
+            "official_source": True,
+        }
+        cached_payload = {
+            "source_date": "2017-10-26",
+            "latest_kpis": {
+                "revenue_bn": 27.772,
+                "net_income_bn": 6.732,
+            },
+            "guidance": {
+                "mode": "official_context",
+                "commentary": "While we expect Sites TAC as a percentage of Sites revenues to continue to increase, the rate of growth will slow after the first quarter of 2018.",
+            },
+            "current_geographies": [
+                {"name": "International", "value_bn": 14.842, "scope": "geography"},
+                {"name": "United States", "value_bn": 12.93, "scope": "geography"},
+                {"name": "EMEA", "value_bn": 9.097, "scope": "geography"},
+            ],
+        }
+
+        with patch.object(reports_service, "get_quarter_fixture", return_value=None), patch.object(
+            reports_service,
+            "get_company",
+            return_value=company,
+        ), patch.object(
+            reports_service,
+            "_load_historical_official_quarter_cache",
+            return_value=cached_payload,
+        ), patch.object(
+            reports_service,
+            "_load_or_parse_historical_official_quarter_payload",
+            side_effect=AssertionError("historical payload should not be reparsed"),
+        ):
+            snapshot = reports_service._resolve_quarter_guidance_snapshot("alphabet", "2017Q3", history)
+
+        self.assertEqual(snapshot["guidance"]["mode"], "official_context")
+        self.assertIn("first quarter of 2018", snapshot["guidance"]["commentary"])
+
+    def test_guidance_snapshot_has_official_context_accepts_call_summary_context_metadata(self) -> None:
+        guidance = {
+            "mode": "official_context",
+            "commentary": "On operating expenses, we remain committed to investing to support our growing product areas.",
+            "source_role": "earnings_call",
+            "source_kind": "call_summary",
+        }
+
+        self.assertTrue(reports_service._guidance_snapshot_has_official_context(guidance))
+
+    def test_recompute_history_derivatives_includes_net_income_qoq_when_available(self) -> None:
+        history = [
+            {"calendar_quarter": "2024Q1", "revenue_bn": 80.0, "net_income_bn": 18.0, "equity_bn": 120.0},
+            {"calendar_quarter": "2024Q2", "revenue_bn": 82.0, "net_income_bn": 19.5, "equity_bn": 122.0},
+            {"calendar_quarter": "2024Q3", "revenue_bn": 84.0, "net_income_bn": 20.0, "equity_bn": 124.0},
+            {"calendar_quarter": "2024Q4", "revenue_bn": 86.0, "net_income_bn": 21.0, "equity_bn": 126.0},
+            {"calendar_quarter": "2025Q1", "revenue_bn": 88.0, "net_income_bn": 22.5, "equity_bn": 128.0},
+        ]
+
+        recomputed = _recompute_history_derivatives(history)
+
+        self.assertAlmostEqual(recomputed[-1]["net_income_qoq_pct"], 7.14285714285714, places=4)
+
+    def test_compose_summary_headline_mentions_net_income_yoy(self) -> None:
+        headline = compose_summary_headline(
+            get_company("alphabet"),
+            "2024Q4",
+            {
+                "revenue_bn": 96.469,
+                "revenue_yoy_pct": 11.8,
+                "net_income_bn": 26.536,
+                "net_income_yoy_pct": 28.0,
+            },
+            {
+                "revenue_bn": 96.469,
+                "revenue_yoy_pct": 11.8,
+                "net_income_bn": 26.536,
+                "net_income_yoy_pct": 28.0,
+                "net_income_qoq_pct": 11.770362646275055,
+            },
+            {
+                "current_segments": [],
+                "current_geographies": [],
+                "guidance": {},
+            },
+        )
+
+        self.assertIn("净利润 $26.5B，同比 +28.0%", headline)
+
+    def test_compose_layered_takeaways_mentions_net_income_yoy_and_qoq(self) -> None:
+        takeaways = compose_layered_takeaways(
+            get_company("alphabet"),
+            {
+                "latest_kpis": {
+                    "revenue_bn": 96.469,
+                    "revenue_yoy_pct": 11.8,
+                    "revenue_qoq_pct": 9.3,
+                    "net_income_bn": 26.536,
+                    "net_income_yoy_pct": 28.0,
+                },
+                "current_segments": [],
+                "current_geographies": [],
+                "guidance": {},
+            },
+            [
+                {
+                    "revenue_bn": 86.310,
+                    "net_income_bn": 23.697,
+                    "revenue_qoq_pct": 9.3,
+                    "net_income_yoy_pct": 28.0,
+                    "net_income_qoq_pct": 11.770362646275055,
+                },
+                {
+                    "revenue_bn": 96.469,
+                    "net_income_bn": 26.536,
+                    "revenue_qoq_pct": 9.3,
+                    "net_income_yoy_pct": 28.0,
+                    "net_income_qoq_pct": 11.770362646275055,
+                },
+            ],
+            "$",
+        )
+
+        self.assertIn("净利润 $26.5B，同比 +28.0%，环比 +11.8%", takeaways[0]["body"])
+
+    def test_extract_html_statement_metric_uses_target_quarter_when_headers_only_list_years(self) -> None:
+        rows = [
+            ["Quarter Ended December 31,", "Year Ended December 31,"],
+            ["2023", "2024", "2023", "2024"],
+            ["(unaudited)", "(unaudited)"],
+            ["Revenues", "$", "86,310", "$", "96,469", "$", "307,394", "$", "350,018"],
+        ]
+
+        current, prior, yoy = _extract_html_statement_metric_from_rows(rows, ["Revenues"], "2024Q4")
+
+        self.assertAlmostEqual(current, 96.469, places=3)
+        self.assertAlmostEqual(prior, 86.310, places=3)
+        self.assertAlmostEqual(yoy, 11.770362646275046, places=4)
+
+    def test_merge_fixture_payload_does_not_leak_proxy_guidance_numbers_into_official_context(self) -> None:
+        merged = _merge_fixture_payload(
+            {
+                "guidance": {
+                    "mode": "proxy",
+                    "revenue_bn": 87.5,
+                    "revenue_low_bn": 85.0,
+                    "revenue_high_bn": 90.0,
+                    "commentary": "经营基线来自近四季均值。",
+                }
+            },
+            {
+                "guidance": {
+                    "mode": "official_context",
+                    "commentary": "公司未给出下一季收入数值指引，管理层强调需求与 ROI 改善。",
+                }
+            },
+        )
+
+        self.assertEqual(merged["guidance"]["mode"], "official_context")
+        self.assertNotIn("revenue_bn", merged["guidance"])
+        self.assertNotIn("revenue_low_bn", merged["guidance"])
+        self.assertNotIn("revenue_high_bn", merged["guidance"])
+
+    def test_guidance_display_value_prefers_baseline_revenue_for_official_context(self) -> None:
+        value = _guidance_display_value(
+            {
+                "mode": "official_context",
+                "revenue_bn": 79.388,
+                "gaap_gross_margin_pct": 58.6725,
+                "revenue_derived_from_baseline": True,
+            },
+            "$",
+        )
+
+        self.assertEqual(value, "$79.4B")
+
+    def test_guidance_display_value_marks_commentaryless_official_context_as_missing(self) -> None:
+        value = _guidance_display_value(
+            {
+                "mode": "official_context",
+            },
+            "$",
+        )
+
+        self.assertEqual(value, "未披露")
+
+    @patch("app.services.reports._load_or_parse_historical_official_quarter_payload")
+    @patch("app.services.reports.get_quarter_fixture")
+    def test_build_expectation_reset_snapshot_keeps_previous_official_context_as_non_numeric_outlook(
+        self,
+        mock_get_quarter_fixture: object,
+        mock_load_historical_payload: object,
+    ) -> None:
+        mock_get_quarter_fixture.side_effect = (
+            lambda company_id, quarter: {
+                "fiscal_label": "2025Q3",
+                "guidance": {
+                    "mode": "official_context",
+                    "commentary": "管理层未给出数值指引，但强调需求延续和供给爬坡。",
+                },
+                "period_end": "2025-09-30",
+            }
+            if company_id == "alphabet" and quarter == "2025Q3"
+            else None
+        )
+        mock_load_historical_payload.return_value = {"guidance": {}}
+
+        history = [
+            {"quarter_label": "2024Q4", "calendar_quarter": "2024Q4", "fiscal_label": "2024Q4", "revenue_bn": 72.0, "gross_margin_pct": 55.0},
+            {"quarter_label": "2025Q1", "calendar_quarter": "2025Q1", "fiscal_label": "2025Q1", "revenue_bn": 74.0, "gross_margin_pct": 55.5},
+            {"quarter_label": "2025Q2", "calendar_quarter": "2025Q2", "fiscal_label": "2025Q2", "revenue_bn": 76.0, "gross_margin_pct": 56.0},
+            {"quarter_label": "2025Q3", "calendar_quarter": "2025Q3", "fiscal_label": "2025Q3", "revenue_bn": 78.0, "gross_margin_pct": 56.5},
+            {"quarter_label": "2025Q4", "calendar_quarter": "2025Q4", "fiscal_label": "2025Q4", "revenue_bn": 82.0, "revenue_yoy_pct": 12.0, "gross_margin_pct": 57.0},
+        ]
+
+        snapshot = _build_expectation_reset_snapshot(
+            "alphabet",
+            "2025Q4",
+            {
+                "fiscal_label": "2025Q4",
+                "guidance": {
+                    "mode": "official_context",
+                    "commentary": "管理层未给出数值指引，但强调 AI 需求仍在加速。",
+                },
+                "latest_kpis": {
+                    "revenue_bn": 82.0,
+                    "revenue_yoy_pct": 12.0,
+                },
+            },
+            history,
+            "$",
+        )
+
+        self.assertIsNone(snapshot["previous_guidance_bn"])
+        self.assertIn("官方展望", snapshot["cards"][0]["title"])
+        self.assertEqual(snapshot["cards"][0]["value"], "官方展望")
+        self.assertIsNone(snapshot["beat_vs_prior_pct"])
+        self.assertIn("未给出可验证的收入数值指引", snapshot["bullets"][0])
+
+    @patch("app.services.local_data._load_companyfacts")
+    def test_get_companyfacts_quarter_supplement_extracts_quarterly_cash_flow_metrics(
+        self,
+        mock_load_companyfacts: object,
+    ) -> None:
+        mock_load_companyfacts.return_value = {
+            "facts": {
+                "us-gaap": {
+                    "NetCashProvidedByUsedInOperatingActivities": {
+                        "units": {
+                            "USD": [
+                                {
+                                    "start": "2025-09-28",
+                                    "end": "2025-12-27",
+                                    "val": 53925000000,
+                                    "fy": 2026,
+                                    "fp": "Q1",
+                                    "form": "10-Q",
+                                    "frame": "CY2025Q4",
+                                    "filed": "2026-01-30",
+                                }
+                            ]
+                        }
+                    },
+                    "PaymentsToAcquirePropertyPlantAndEquipment": {
+                        "units": {
+                            "USD": [
+                                {
+                                    "start": "2025-09-28",
+                                    "end": "2025-12-27",
+                                    "val": 2373000000,
+                                    "fy": 2026,
+                                    "fp": "Q1",
+                                    "form": "10-Q",
+                                    "frame": "CY2025Q4",
+                                    "filed": "2026-01-30",
+                                }
+                            ]
+                        }
+                    },
+                }
+            }
+        }
+
+        metrics = get_companyfacts_quarter_supplement("apple", "2025Q4")
+
+        self.assertAlmostEqual(metrics["operating_cash_flow_bn"], 53.925, places=3)
+        self.assertAlmostEqual(metrics["capital_expenditures_bn"], 2.373, places=3)
+        self.assertAlmostEqual(metrics["free_cash_flow_bn"], 51.552, places=3)
+
+    def test_pick_material_prefers_press_release_over_transcript_for_official_release(self) -> None:
+        materials = [
+            {
+                "kind": "official_release",
+                "role": "earnings_release",
+                "label": "NVIDIA Fourth Quarter 2026 Fourth Quarter Transcript",
+                "raw_text": "transcript " * 500,
+                "raw_path": "/tmp/nvidia-transcript.txt",
+                "url": "https://example.com/transcript",
+            },
+            {
+                "kind": "official_release",
+                "role": "earnings_release",
+                "label": 'NVIDIA Press Release, dated February 25, 2026, entitled "NVIDIA Announces Financial Results"',
+                "raw_text": "press release " * 200,
+                "raw_path": "/tmp/nvidia-release.txt",
+                "url": "https://example.com/release",
+            },
+        ]
+
+        selected = _pick_material(materials, kind="official_release")
+
+        self.assertIsNotNone(selected)
+        self.assertIn("Press Release", str(selected.get("label") or ""))
+
+    def test_build_report_payload_apple_2025q4_backfills_cash_flow_and_shareholder_metrics_from_companyfacts(
+        self,
+    ) -> None:
+        payload = build_report_payload("apple", "2025Q4", 12, refresh_source_materials=False)
+
+        latest_kpis = dict(payload["latest_kpis"])
+        self.assertAlmostEqual(latest_kpis["operating_cash_flow_bn"], 53.925, places=3)
+        self.assertAlmostEqual(latest_kpis["capital_expenditures_bn"], 2.373, places=3)
+        self.assertAlmostEqual(latest_kpis["free_cash_flow_bn"], 51.552, places=3)
+        self.assertEqual(payload["expectation_reset"]["cards"][2]["value"], "$108.9B")
+
+    @patch("app.services.reports._load_or_parse_historical_official_quarter_payload")
+    @patch("app.services.reports.get_company")
+    @patch("app.services.reports.get_quarter_fixture")
+    def test_resolve_quarter_guidance_snapshot_retries_after_context_only_parse(
+        self,
+        mock_get_quarter_fixture: object,
+        mock_get_company: object,
+        mock_load_historical_payload: object,
+    ) -> None:
+        mock_get_quarter_fixture.return_value = {}
+        mock_get_company.return_value = {"id": "microsoft", "official_source": {"sec_cik": "789019"}}
+        mock_load_historical_payload.side_effect = [
+            {
+                "guidance": {
+                    "mode": "official_context",
+                    "commentary": "管理层先给了定性展望。",
+                }
+            },
+            {
+                "guidance": {
+                    "mode": "official",
+                    "revenue_low_bn": 23.8,
+                    "revenue_high_bn": 24.5,
+                    "revenue_bn": 24.15,
+                }
+            },
+        ]
+
+        snapshot = reports_service._resolve_quarter_guidance_snapshot("microsoft", "2017Q2", [])
+
+        self.assertEqual(snapshot["guidance"]["mode"], "official")
+        self.assertAlmostEqual(snapshot["guidance"]["revenue_bn"], 24.15, places=2)
+        self.assertEqual(mock_load_historical_payload.call_count, 2)
+        self.assertFalse(mock_load_historical_payload.call_args_list[0].kwargs["require_guidance"])
+        self.assertTrue(mock_load_historical_payload.call_args_list[1].kwargs["require_guidance"])
+
+    def test_sanitize_fixture_payload_strips_placeholder_guidance_ranges(self) -> None:
+        company = get_company("alphabet")
+        fixture = {
+            "latest_kpis": {
+                "revenue_bn": 96.469,
+                "net_income_bn": 26.536,
+                "revenue_yoy_pct": 11.8,
+            },
+            "guidance": {
+                "mode": "official_context",
+                "commentary": "公司未给出下一季收入数值指引，但明确表示 Google Services 会继续受益于 AI 创新与广告 ROI 改善；2026 年 CapEx 预计达到 - 到 -。",
+            },
+        }
+        latest_history = {
+            "revenue_bn": 96.469,
+            "net_income_bn": 26.536,
+            "gross_margin_pct": 58.2,
+            "revenue_yoy_pct": 11.8,
+            "net_income_yoy_pct": 28.0,
+        }
+
+        sanitized = _sanitize_fixture_payload(company, fixture, latest_history)
+
+        self.assertIn("Google Services", sanitized["guidance"]["commentary"])
+        self.assertNotIn("- 到 -", sanitized["guidance"]["commentary"])
+
+    def test_guidance_related_sources_from_materials_rejects_generic_investor_homepages(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="guidance-materials-") as temp_dir:
+            text_path = Path(temp_dir) / "alphabet-release.txt"
+            text_path.write_text(
+                (
+                    "Webcast and conference call information. "
+                    "A live audio webcast of our fourth quarter 2017 earnings release call "
+                    "will be available at http://abc.xyz/investor. "
+                    "This press release is also available on that site."
+                ),
+                encoding="utf-8",
+            )
+
+            discovered = reports_service._guidance_related_sources_from_materials(
+                get_company("alphabet"),
+                [
+                    {
+                        "status": "cached",
+                        "text_path": str(text_path),
+                        "date": "2018-02-01",
+                    }
+                ],
+            )
+
+        self.assertEqual(discovered, [])
+
+    @patch("app.services.reports.get_institutional_views")
+    @patch("app.services.reports._enrich_history_with_official_structures")
+    @patch("app.services.reports._build_expectation_reset_snapshot")
+    @patch("app.services.reports._build_guidance_change_panel")
+    @patch("app.services.reports._guidance_related_sources_from_materials")
+    @patch("app.services.reports.parse_official_materials")
+    @patch("app.services.reports.hydrate_source_materials")
+    @patch("app.services.reports.resolve_official_sources")
+    def test_build_report_payload_reparses_with_embedded_guidance_sources_when_initial_parse_is_context_only(
+        self,
+        mock_resolve_sources: object,
+        mock_hydrate_materials: object,
+        mock_parse_materials: object,
+        mock_guidance_sources: object,
+        mock_guidance_change_panel: object,
+        mock_expectation_reset_snapshot: object,
+        mock_enrich_history: object,
+        mock_get_institutional_views: object,
+    ) -> None:
+        mock_get_institutional_views.return_value = []
+        mock_enrich_history.side_effect = lambda company, history, progress_callback=None: history
+        mock_guidance_change_panel.return_value = {}
+        mock_expectation_reset_snapshot.return_value = {}
+        mock_resolve_sources.return_value = [
+            {
+                "label": "Alphabet release",
+                "url": "https://example.com/alphabet-q4-2017-release",
+                "kind": "official_release",
+                "role": "earnings_release",
+                "date": "2018-02-01",
+            }
+        ]
+        mock_hydrate_materials.side_effect = [
+            [
+                {
+                    "label": "Alphabet release",
+                    "url": "https://example.com/alphabet-q4-2017-release",
+                    "kind": "official_release",
+                    "role": "earnings_release",
+                    "status": "cached",
+                }
+            ],
+            [
+                {
+                    "label": "Alphabet release",
+                    "url": "https://example.com/alphabet-q4-2017-release",
+                    "kind": "official_release",
+                    "role": "earnings_release",
+                    "status": "cached",
+                },
+                {
+                    "label": "Alphabet transcript",
+                    "url": "https://example.com/alphabet-q4-2017-transcript",
+                    "kind": "call_summary",
+                    "role": "earnings_call",
+                    "status": "cached",
+                },
+            ],
+        ]
+        mock_guidance_sources.return_value = [
+            {
+                "label": "Alphabet transcript",
+                "url": "https://example.com/alphabet-q4-2017-transcript",
+                "kind": "call_summary",
+                "role": "earnings_call",
+                "date": "2018-02-01",
+            }
+        ]
+        mock_parse_materials.side_effect = [
+            {
+                "latest_kpis": {"revenue_bn": 32.323},
+                "current_segments": [],
+                "current_geographies": [],
+                "guidance": {
+                    "mode": "official_context",
+                    "commentary": "管理层表示会在电话会里提供更多展望。",
+                },
+            },
+            {
+                "latest_kpis": {"revenue_bn": 32.323},
+                "current_segments": [],
+                "current_geographies": [],
+                "guidance": {
+                    "mode": "official",
+                    "revenue_low_bn": 26.0,
+                    "revenue_high_bn": 27.0,
+                    "revenue_bn": 26.5,
+                },
+            },
+        ]
+
+        payload = build_report_payload(
+            "alphabet",
+            "2017Q4",
+            12,
+            refresh_source_materials=False,
+            require_full_coverage=False,
+        )
+
+        self.assertEqual(payload["guidance"]["mode"], "official")
+        self.assertAlmostEqual(payload["guidance"]["revenue_bn"], 26.5, places=2)
+        self.assertEqual(mock_parse_materials.call_count, 2)
+        second_hydrate_sources = mock_hydrate_materials.call_args_list[1].args[2]
+        self.assertTrue(
+            any(str(item.get("role") or "") == "earnings_call" for item in second_hydrate_sources)
+        )
+        self.assertFalse(mock_guidance_change_panel.call_args.kwargs["allow_expensive_parse"])
+        self.assertFalse(mock_expectation_reset_snapshot.call_args.kwargs["allow_expensive_parse"])
+
+    def test_temporal_sanitizer_strips_two_year_forward_narrative_for_2024_report(self) -> None:
+        sanitized = _sanitize_temporal_narrative_facts(
+            {
+                "guidance": {"mode": "official_context", "commentary": "公司预计 2026 年继续加大 CapEx 投入。"},
+                "management_theme_items": [{"label": "投入抬升", "score": 82, "note": "管理层把 2026 年 CapEx 扩张列为重点。"}],
+                "qna_theme_items": [{"label": "CapEx 节奏", "score": 70, "note": "市场会继续追问 2026 年投入强度。"}],
+            },
+            {"fiscal_label": "2024Q4"},
+        )
+
+        self.assertEqual(sanitized["guidance"], {"mode": "official_context"})
+        self.assertEqual(sanitized["management_theme_items"], [])
+        self.assertEqual(sanitized["qna_theme_items"], [])
+
+    def test_backfill_historical_segment_history_keeps_edge_quarter_on_original_structure(self) -> None:
+        company = get_company("alphabet")
+        history = [
+            {
+                "calendar_quarter": "2024Q1",
+                "revenue_bn": 80.0,
+                "segments": [
+                    {"name": "Google Search & other", "value_bn": 42.0, "share_pct": 52.5},
+                    {"name": "YouTube ads", "value_bn": 8.0, "share_pct": 10.0},
+                    {"name": "Google subscriptions, platforms, and devices", "value_bn": 9.0, "share_pct": 11.25},
+                    {"name": "Google Cloud", "value_bn": 11.0, "share_pct": 13.75},
+                ],
+                "structure_basis": "segment",
+            },
+            {
+                "calendar_quarter": "2024Q2",
+                "revenue_bn": 82.0,
+                "segments": [
+                    {"name": "Google Search & other", "value_bn": 44.0, "share_pct": 53.66},
+                    {"name": "YouTube ads", "value_bn": 8.2, "share_pct": 10.0},
+                    {"name": "Google Network", "value_bn": 7.8, "share_pct": 9.51},
+                    {"name": "Google subscriptions, platforms, and devices", "value_bn": 8.4, "share_pct": 10.24},
+                    {"name": "Google Cloud", "value_bn": 13.0, "share_pct": 15.85},
+                    {"name": "Other Bets", "value_bn": 0.6, "share_pct": 0.73},
+                ],
+                "structure_basis": "segment",
+            },
+            {
+                "calendar_quarter": "2024Q3",
+                "revenue_bn": 84.0,
+                "segments": [
+                    {"name": "Google Search & other", "value_bn": 45.0, "share_pct": 53.57},
+                    {"name": "YouTube ads", "value_bn": 8.5, "share_pct": 10.12},
+                    {"name": "Google Network", "value_bn": 7.6, "share_pct": 9.05},
+                    {"name": "Google subscriptions, platforms, and devices", "value_bn": 8.8, "share_pct": 10.48},
+                    {"name": "Google Cloud", "value_bn": 13.4, "share_pct": 15.95},
+                    {"name": "Other Bets", "value_bn": 0.7, "share_pct": 0.83},
+                ],
+                "structure_basis": "segment",
+            },
+        ]
+
+        enriched = _backfill_historical_segment_history(company, history)
+        segment_names = [str(item.get("name") or "") for item in enriched[0]["segments"]]
+
+        self.assertFalse(enriched[0].get("segments_inferred"))
+        self.assertNotIn("Google Network", segment_names)
+        self.assertNotIn("Other Bets", segment_names)
+        self.assertEqual(len(segment_names), 4)
+
+    def test_build_scoreboard_includes_net_income_yoy_when_available(self) -> None:
+        company = get_company("apple")
+        fixture = {
+            "latest_kpis": {
+                "revenue_bn": 119.6,
+                "revenue_yoy_pct": 2.1,
+                "net_income_bn": 33.9,
+            },
+            "current_segments": [
+                {"name": "iPhone", "value_bn": 69.7},
+            ],
+            "guidance": {"mode": "official_context"},
+            "coverage_months": ["2023-10", "2023-11", "2023-12"],
+            "fiscal_label": "2023Q4",
+        }
+        history = [
+            {
+                "net_margin_pct": 28.4,
+                "net_income_yoy_pct": 13.1,
+            }
+        ]
+
+        scoreboard = _build_scoreboard(company, fixture, history, "segment", "$")
+
+        self.assertEqual(scoreboard[3]["title"], "净利润")
+        self.assertIn("YoY +13.1%", scoreboard[3]["subvalue"])
+        self.assertIn("净利率 28.4%", scoreboard[3]["subvalue"])
+
+    def test_automatic_transcript_summary_rejects_binary_like_material(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="earnings-transcript-") as temp_dir:
+            text_path = Path(temp_dir) / "transcript.txt"
+            gibberish = ("EE E,\x03\x10K\x15O\x17_|i5G gO<x t RwKKJK KKex! /89$88* " * 18).strip()
+            text_path.write_text(gibberish, encoding="utf-8", errors="ignore")
+
+            summary = _automatic_transcript_summary(
+                [
+                    {
+                        "status": "fetched",
+                        "label": "Apple Podcasts transcript.zip",
+                        "role": "earnings_call",
+                        "kind": "call_summary",
+                        "text_path": str(text_path),
+                    }
+                ]
+            )
+
+        self.assertIsNone(summary)
+
+    def test_sanitize_fixture_payload_drops_noisy_guidance_excerpt(self) -> None:
+        company = get_company("apple")
+        fixture = {
+            "latest_kpis": {
+                "revenue_bn": 119.6,
+                "net_income_bn": 33.9,
+                "revenue_yoy_pct": 2.1,
+            },
+            "guidance": {
+                "mode": "official_context",
+                "commentary": (
+                    "官方展望语境摘录：2023, the Company expects 66 % of total deferred revenue "
+                    "to be realized in less than a year, 26 % within one-to-two years, 7 % within "
+                    "two-to-three years and 1 % in greater than three years. Apple Inc. | Q1 2024 "
+                    "Form 10-Q | Note 3 - Earnings Per Share."
+                ),
+            },
+        }
+        latest_history = {
+            "revenue_bn": 119.6,
+            "net_income_bn": 33.9,
+            "gross_margin_pct": 45.9,
+            "revenue_yoy_pct": 2.1,
+            "net_income_yoy_pct": 13.1,
+        }
+
+        sanitized = _sanitize_fixture_payload(company, fixture, latest_history)
+
+        self.assertNotIn("commentary", sanitized["guidance"])
+
+    def test_build_call_panel_filters_unreadable_transcript_highlights(self) -> None:
+        panel = build_call_panel(
+            {
+                "source_type": "official_call_material",
+                "highlights": [
+                    "EE E,\x03\x10K\x15O\x17_|i5G gO<x t RwKKJK KKex! /89$88* " * 3,
+                ],
+            },
+            [
+                {
+                    "label": "服务业务",
+                    "note": "先看 Services 增速能不能继续快于公司整体。",
+                }
+            ],
+            {
+                "qna": {"status": "official_call_material"},
+                "call_panel_meta_lines": ["这页主要依据 电话会材料。"],
+            },
+        )
+
+        self.assertEqual(panel["bullets"], ["先看 Services 增速能不能继续快于公司整体。"])
 
 if __name__ == "__main__":
     unittest.main()

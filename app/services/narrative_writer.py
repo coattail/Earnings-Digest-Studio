@@ -63,6 +63,31 @@ def _trim_sentence(text: str) -> str:
     return cleaned + ("。" if cleaned[-1] not in "。！？!?" else "")
 
 
+def _line_looks_readable(text: Optional[str]) -> bool:
+    cleaned = _clean(text)
+    if not cleaned:
+        return False
+    if any(ord(char) < 32 and char not in "\t\r\n" for char in cleaned):
+        return False
+    if any(not char.isprintable() and not char.isspace() for char in cleaned):
+        return False
+    tokens = cleaned.split()
+    readable_terms = re.findall(r"[A-Za-z\u4e00-\u9fff]{2,}", cleaned)
+    textual_chars = sum(char.isalpha() or ("\u4e00" <= char <= "\u9fff") for char in cleaned)
+    weird_tokens = [
+        token
+        for token in tokens
+        if len(token) >= 12 and not re.search(r"[A-Za-z\u4e00-\u9fff]", token)
+    ]
+    if len(cleaned) >= 60 and textual_chars / max(1, len(cleaned)) < 0.28:
+        return False
+    if len(tokens) >= 6 and len(readable_terms) < 3:
+        return False
+    if len(weird_tokens) >= max(2, len(tokens) // 3):
+        return False
+    return True
+
+
 def polish_generated_text(text: Optional[str]) -> str:
     cleaned = _clean(text)
     if not cleaned:
@@ -153,6 +178,25 @@ def _select_headline_segment(
     return max(segments, key=lambda item: float(item.get("value_bn") or 0.0), default=None)
 
 
+def _metric_clause(
+    label: str,
+    value_bn: Optional[float],
+    money_symbol: str,
+    *,
+    yoy_pct: Optional[float] = None,
+    qoq_pct: Optional[float] = None,
+    include_qoq: bool = False,
+) -> Optional[str]:
+    if value_bn is None:
+        return None
+    bits = [f"{label} {format_money_bn(value_bn, money_symbol)}"]
+    if yoy_pct is not None:
+        bits.append(f"同比 {format_pct(yoy_pct, signed=True)}")
+    if include_qoq and qoq_pct is not None:
+        bits.append(f"环比 {format_pct(qoq_pct, signed=True)}")
+    return "，".join(bits)
+
+
 def compose_summary_headline(
     company: dict[str, Any],
     fiscal_label: str,
@@ -193,12 +237,11 @@ def compose_summary_headline(
         else:
             lead = f"{company['english_name']} {fiscal_label} 这季不是一句“收入增长”就能概括的季度。"
 
-    fact_bits = [f"收入 {format_money_bn(revenue_bn, money_symbol)}"]
-    if revenue_yoy_pct is not None:
-        fact_bits.append(f"同比 {format_pct(revenue_yoy_pct, signed=True)}")
-    if net_income_bn is not None:
-        fact_bits.append(f"净利润 {format_money_bn(net_income_bn, money_symbol)}")
-    facts = "，".join(fact_bits) + "。"
+    fact_clauses = [
+        _metric_clause("收入", revenue_bn, money_symbol, yoy_pct=revenue_yoy_pct),
+        _metric_clause("净利润", net_income_bn, money_symbol, yoy_pct=net_income_yoy_pct),
+    ]
+    facts = "；".join(clause for clause in fact_clauses if clause) + "。"
 
     guidance = dict(fixture.get("guidance") or {})
     outlook = ""
@@ -226,6 +269,8 @@ def compose_layered_takeaways(
     revenue_yoy_pct = _coalesce_number(latest_kpis.get("revenue_yoy_pct"), latest.get("revenue_yoy_pct"))
     revenue_qoq_pct = _coalesce_number(latest_kpis.get("revenue_qoq_pct"), latest.get("revenue_qoq_pct"))
     net_income_bn = _coalesce_number(latest_kpis.get("net_income_bn"), latest.get("net_income_bn"))
+    net_income_yoy_pct = _coalesce_number(latest_kpis.get("net_income_yoy_pct"), latest.get("net_income_yoy_pct"))
+    net_income_qoq_pct = _coalesce_number(latest_kpis.get("net_income_qoq_pct"), latest.get("net_income_qoq_pct"))
     current_margin = _coalesce_number(latest_kpis.get("gaap_gross_margin_pct"), latest.get("gross_margin_pct"), latest.get("net_margin_pct"))
     top_segment = max(
         list(fixture.get("current_segments") or []),
@@ -243,16 +288,25 @@ def compose_layered_takeaways(
     second_title = "变化来自哪里" if top_segment or top_geo else "这季为什么更重要"
     third_title = "下一步盯什么"
 
-    first_bits = []
-    if revenue_bn is not None:
-        first_bits.append(f"收入做到 {format_money_bn(revenue_bn, money_symbol)}")
-    if revenue_yoy_pct is not None:
-        first_bits.append(f"同比 {format_pct(revenue_yoy_pct, signed=True)}")
-    if revenue_qoq_pct is not None:
-        first_bits.append(f"环比 {format_pct(revenue_qoq_pct, signed=True)}")
-    if net_income_bn is not None:
-        first_bits.append(f"净利润 {format_money_bn(net_income_bn, money_symbol)}")
-    first_body = "，".join(first_bits) + "。"
+    first_clauses = [
+        _metric_clause(
+            "收入做到",
+            revenue_bn,
+            money_symbol,
+            yoy_pct=revenue_yoy_pct,
+            qoq_pct=revenue_qoq_pct,
+            include_qoq=True,
+        ),
+        _metric_clause(
+            "净利润",
+            net_income_bn,
+            money_symbol,
+            yoy_pct=net_income_yoy_pct,
+            qoq_pct=net_income_qoq_pct,
+            include_qoq=True,
+        ),
+    ]
+    first_body = "；".join(clause for clause in first_clauses if clause) + "。"
 
     second_body = ""
     if top_segment and revenue_bn not in (None, 0):
@@ -348,9 +402,22 @@ def build_call_panel(
 ) -> dict[str, Any]:
     qna_status = str(((narrative_provenance or {}).get("qna") or {}).get("status") or "")
     meta_lines = dedupe_lines([str(item) for item in list((narrative_provenance or {}).get("call_panel_meta_lines") or [])], limit=2)
+    fallback_bullets = dedupe_lines(
+        [
+            str(item.get("note") or "")
+            for item in list(qna_topics or [])
+            if _line_looks_readable(str(item.get("note") or ""))
+        ],
+        limit=2,
+    )
     if transcript_summary:
         title = "电话会摘录" if transcript_summary.get("source_type") == "manual_transcript" else "电话会要点"
-        bullets = dedupe_lines([str(item) for item in list(transcript_summary.get("highlights") or [])], limit=2)
+        bullets = dedupe_lines(
+            [str(item) for item in list(transcript_summary.get("highlights") or []) if _line_looks_readable(str(item))],
+            limit=2,
+        )
+        if not bullets:
+            bullets = fallback_bullets
         return {"title": title, "meta_lines": meta_lines, "bullets": bullets}
     if qna_status in {"manual_transcript", "official_call_material"}:
         title = "电话会里最值得追的两件事"
@@ -358,8 +425,7 @@ def build_call_panel(
         title = "电话会缺席时，先看这些问题"
     else:
         title = "管理层接下来最可能被追问什么"
-    bullets = dedupe_lines([str(item.get("note") or "") for item in list(qna_topics or [])], limit=2)
-    return {"title": title, "meta_lines": meta_lines, "bullets": bullets}
+    return {"title": title, "meta_lines": meta_lines, "bullets": fallback_bullets}
 
 
 def build_institutional_digest(institutional_views: list[dict[str, Any]]) -> dict[str, Any]:
@@ -560,7 +626,7 @@ def humanize_support_lines(lines: list[str]) -> list[str]:
             rewritten.append("因为分部披露不连续，这一页改从地区结构去看迁移。")
             continue
         if "优先根据官方原文动态解析" in cleaned or "优先解析自动发现的官方" in cleaned:
-            rewritten.append("这份报告优先按当季官方原文整理，未披露字段才回到历史口径。")
+            rewritten.append("这份报告优先按当季官方原文动态解析，未披露字段才回到历史口径。")
             continue
         if "动态补入地区营收结构" in cleaned or "优先采用官方披露原文中的地理口径" in cleaned:
             rewritten.append("地区拆分这次直接按官方披露原文整理，没有再沿用旧口径。")

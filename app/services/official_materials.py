@@ -7,11 +7,13 @@ import re
 import shutil
 import subprocess
 import tempfile
+import zipfile
 from datetime import date, datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urljoin, urlparse
+from xml.etree import ElementTree as ET
 
 import httpx
 from bs4 import BeautifulSoup
@@ -35,6 +37,7 @@ RECENT_MATERIAL_TTL_SECONDS = 12 * 60 * 60
 HISTORICAL_MATERIAL_TTL_SECONDS = 45 * 24 * 60 * 60
 ERROR_RETRY_TTL_SECONDS = 3 * 60 * 60
 HYDRATED_MATERIALS_MEMORY_CACHE: dict[tuple[str, str, tuple[tuple[str, str, str, str, str], ...]], list[dict[str, Any]]] = {}
+WAYBACK_CDX_URL = "https://web.archive.org/cdx/search/cdx"
 
 
 def _source_cache_dir(company_id: str, calendar_quarter: str) -> Path:
@@ -45,7 +48,7 @@ def _source_cache_dir(company_id: str, calendar_quarter: str) -> Path:
 
 
 def _source_key(source: dict[str, Any]) -> str:
-    basis = f"{source.get('kind', 'source')}-{source.get('label', '')}-{source.get('url', '')}"
+    basis = f"{source.get('kind', 'source')}-{source.get('label', '')}-{source.get('url', '')}-{source.get('fetch_url', '')}"
     return slugify(basis)[:96]
 
 
@@ -220,6 +223,12 @@ def _guess_suffix(url: str, content_type: str) -> str:
     lowered_type = (content_type or "").lower()
     if "pdf" in lowered_type:
         return ".pdf"
+    if "wordprocessingml.document" in lowered_type:
+        return ".docx"
+    if "presentationml.presentation" in lowered_type:
+        return ".pptx"
+    if "spreadsheetml.sheet" in lowered_type:
+        return ".xlsx"
     if "html" in lowered_type:
         return ".html"
     if "text" in lowered_type or "json" in lowered_type:
@@ -227,10 +236,115 @@ def _guess_suffix(url: str, content_type: str) -> str:
     return ".bin"
 
 
+def _ooxml_archive(raw_bytes: bytes) -> Optional[zipfile.ZipFile]:
+    try:
+        return zipfile.ZipFile(BytesIO(raw_bytes))
+    except zipfile.BadZipFile:
+        return None
+
+
+def _ooxml_title(archive: zipfile.ZipFile) -> str:
+    try:
+        root = ET.fromstring(archive.read("docProps/core.xml"))
+    except Exception:
+        return ""
+    namespace = {"dc": "http://purl.org/dc/elements/1.1/"}
+    node = root.find(".//dc:title", namespace)
+    return str(node.text or "").strip()[:240] if node is not None else ""
+
+
+def _docx_to_text(raw_bytes: bytes) -> tuple[str, str]:
+    archive = _ooxml_archive(raw_bytes)
+    if archive is None:
+        return _text_to_text(raw_bytes)
+    namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    names = sorted(
+        name
+        for name in archive.namelist()
+        if name == "word/document.xml" or name.startswith("word/header") or name.startswith("word/footer")
+    )
+    paragraphs: list[str] = []
+    for name in names:
+        try:
+            root = ET.fromstring(archive.read(name))
+        except Exception:
+            continue
+        for paragraph in root.findall(".//w:p", namespace):
+            texts = [str(node.text or "") for node in paragraph.findall(".//w:t", namespace) if str(node.text or "")]
+            if texts:
+                paragraphs.append("".join(texts).strip())
+    title = _ooxml_title(archive)
+    return title, "\n".join(item for item in paragraphs if item).strip()
+
+
+def _pptx_to_text(raw_bytes: bytes) -> tuple[str, str]:
+    archive = _ooxml_archive(raw_bytes)
+    if archive is None:
+        return _text_to_text(raw_bytes)
+    namespace = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
+    slide_names = sorted(name for name in archive.namelist() if name.startswith("ppt/slides/slide") and name.endswith(".xml"))
+    slides: list[str] = []
+    for name in slide_names:
+        try:
+            root = ET.fromstring(archive.read(name))
+        except Exception:
+            continue
+        texts = [str(node.text or "").strip() for node in root.findall(".//a:t", namespace) if str(node.text or "").strip()]
+        if texts:
+            slides.append("\n".join(texts))
+    title = _ooxml_title(archive)
+    return title, "\n\n".join(slides).strip()
+
+
+def _xlsx_to_text(raw_bytes: bytes) -> tuple[str, str]:
+    archive = _ooxml_archive(raw_bytes)
+    if archive is None:
+        return _text_to_text(raw_bytes)
+    shared_strings: list[str] = []
+    try:
+        root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+        namespace = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        for item in root.findall(".//s:si", namespace):
+            parts = [str(node.text or "") for node in item.findall(".//s:t", namespace)]
+            shared_strings.append("".join(parts))
+    except Exception:
+        shared_strings = []
+    sheet_names = sorted(name for name in archive.namelist() if name.startswith("xl/worksheets/sheet") and name.endswith(".xml"))
+    namespace = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    rows: list[str] = []
+    for name in sheet_names:
+        try:
+            root = ET.fromstring(archive.read(name))
+        except Exception:
+            continue
+        for row in root.findall(".//s:row", namespace):
+            values: list[str] = []
+            for cell in row.findall("./s:c", namespace):
+                raw_value = str((cell.find("./s:v", namespace) or ET.Element("v")).text or "").strip()
+                if not raw_value:
+                    continue
+                if str(cell.get("t") or "") == "s" and raw_value.isdigit():
+                    index = int(raw_value)
+                    if 0 <= index < len(shared_strings):
+                        values.append(shared_strings[index])
+                        continue
+                values.append(raw_value)
+            if values:
+                rows.append("\t".join(values))
+    title = _ooxml_title(archive)
+    return title, "\n".join(rows).strip()
+
+
 def _extract_text(raw_bytes: bytes, content_type: str, suffix: str) -> tuple[str, str]:
     lowered_type = (content_type or "").lower()
     if suffix == ".pdf" or "pdf" in lowered_type:
         return _pdf_to_text(raw_bytes)
+    if suffix == ".docx" or "wordprocessingml.document" in lowered_type:
+        return _docx_to_text(raw_bytes)
+    if suffix == ".pptx" or "presentationml.presentation" in lowered_type:
+        return _pptx_to_text(raw_bytes)
+    if suffix == ".xlsx" or "spreadsheetml.sheet" in lowered_type:
+        return _xlsx_to_text(raw_bytes)
     if suffix in {".html", ".htm"} or "html" in lowered_type:
         return _html_to_text(raw_bytes)
     return _text_to_text(raw_bytes)
@@ -436,7 +550,9 @@ def _material_text_quality_issue(
     suffix: str,
 ) -> str:
     normalized_text = _normalize_whitespace(text)
-    lowered = f"{str(title or '').lower()} {normalized_text.lower()}".strip()
+    lowered_title = str(title or "").lower()
+    lowered = f"{lowered_title} {normalized_text.lower()}".strip()
+    leading_lowered = f"{lowered_title} {normalized_text[:4000].lower()}".strip()
     if not normalized_text:
         return "empty extracted text"
 
@@ -452,13 +568,36 @@ def _material_text_quality_issue(
         "please turn javascript on",
         "are you a robot",
         "captcha",
+        "just a moment",
+        "performing security verification",
+        "checking your browser",
+        "cloudflare",
     )
-    for phrase in obvious_error_phrases:
-        if phrase in lowered:
-            return f"unusable source page: {phrase}"
-
     kind = str(source.get("kind") or "").casefold()
     role = str(source.get("role") or "").casefold()
+    sec_filing_signal_count = sum(
+        1
+        for keyword in (
+            "form 10-k",
+            "form 10-q",
+            "form 20-f",
+            "annual report",
+            "quarterly report",
+            "net income",
+            "cash flow",
+            "geographic area",
+            "revenue",
+            "three months ended",
+            "year ended",
+            "balance sheet",
+        )
+        if keyword in lowered
+    )
+    for phrase in obvious_error_phrases:
+        if phrase in leading_lowered:
+            if kind == "sec_filing" and role == "sec_filing" and sec_filing_signal_count >= 3:
+                continue
+            return f"unusable source page: {phrase}"
     if kind not in {"official_release", "presentation", "call_summary", "sec_filing"} and role not in {
         "earnings_release",
         "earnings_commentary",
@@ -467,6 +606,15 @@ def _material_text_quality_issue(
         "sec_filing",
     }:
         return ""
+
+    if kind == "call_summary" or role == "earnings_call":
+        parsed = urlparse(str(source.get("url") or ""))
+        generic_home_paths = {"", "/", "/investor", "/investors", "/en-us/investor", "/en-us/investors"}
+        if (
+            str(title or "").strip().lower() in {"home page", "homepage", "investor relations"}
+            or parsed.path.lower().rstrip("/") in generic_home_paths
+        ):
+            return "generic investor homepage is not a usable earnings call source"
 
     if len(normalized_text) >= 180:
         return ""
@@ -496,10 +644,148 @@ def _material_text_quality_issue(
     return ""
 
 
+def _revalidate_cached_material_quality(
+    cached: dict[str, Any],
+    *,
+    meta_path: Path,
+) -> dict[str, Any]:
+    text_path_value = str(cached.get("text_path") or "")
+    if not text_path_value:
+        return cached
+    text_path = Path(text_path_value)
+    if not text_path.exists():
+        return cached
+    raw_path = Path(str(cached.get("raw_path") or ""))
+    quality_issue = _material_text_quality_issue(
+        cached,
+        title=str(cached.get("title") or ""),
+        text=text_path.read_text(encoding="utf-8", errors="ignore"),
+        content_type=str(cached.get("content_type") or ""),
+        suffix=raw_path.suffix.lower(),
+    )
+    if not quality_issue:
+        if str(cached.get("status") or "") == "error" or str(cached.get("error") or "").strip():
+            updated = dict(cached)
+            updated["status"] = "cached"
+            updated["error"] = ""
+            _write_material_meta(meta_path, updated)
+            return updated
+        return cached
+    updated = dict(cached)
+    updated["status"] = "error"
+    updated["error"] = quality_issue
+    _write_material_meta(meta_path, updated)
+    return updated
+
+
 def _write_material_meta(meta_path: Path, metadata: dict[str, Any]) -> dict[str, Any]:
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     return metadata
+
+
+def _wayback_cdx_rows(payload: Any) -> list[dict[str, str]]:
+    if isinstance(payload, list) and payload:
+        header = payload[0] if isinstance(payload[0], list) else []
+        rows = payload[1:] if isinstance(header, list) else payload
+        if isinstance(header, list) and {"timestamp", "original"} <= {str(item) for item in header}:
+            normalized: list[dict[str, str]] = []
+            for row in rows:
+                if not isinstance(row, list):
+                    continue
+                item = {
+                    str(header[index]): str(row[index] if index < len(row) else "")
+                    for index in range(len(header))
+                }
+                if item.get("timestamp") and item.get("original"):
+                    normalized.append(item)
+            return normalized
+    return []
+
+
+def _wayback_snapshot_url(timestamp: str, original_url: str) -> str:
+    return f"https://web.archive.org/web/{timestamp}if_/{original_url}"
+
+
+def _discover_wayback_snapshot_url(
+    source_url: str,
+    *,
+    client: Optional[httpx.Client] = None,
+) -> str:
+    normalized_url = str(source_url or "").strip()
+    if not normalized_url:
+        return ""
+    owns_client = client is None
+    http_client = client or httpx.Client(headers=REQUEST_HEADERS, follow_redirects=True, timeout=40.0)
+    try:
+        response = http_client.get(
+            WAYBACK_CDX_URL,
+            params={
+                "url": normalized_url,
+                "output": "json",
+                "fl": "timestamp,original,statuscode,mimetype",
+                "filter": "statuscode:200",
+                "limit": 8,
+            },
+        )
+        response.raise_for_status()
+        rows = _wayback_cdx_rows(response.json())
+        if not rows:
+            return ""
+        best_row = max(rows, key=lambda item: str(item.get("timestamp") or ""))
+        return _wayback_snapshot_url(str(best_row.get("timestamp") or ""), str(best_row.get("original") or normalized_url))
+    except Exception:
+        return ""
+    finally:
+        if owns_client:
+            http_client.close()
+
+
+def _response_looks_like_bot_challenge(response: httpx.Response) -> bool:
+    text = str(getattr(response, "text", "") or "")
+    lowered = text.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "just a moment",
+            "performing security verification",
+            "checking your browser",
+            "cloudflare",
+            "captcha",
+            "cf-browser-verification",
+        )
+    )
+
+
+def _quality_issue_warrants_wayback_retry(issue: str) -> bool:
+    normalized = str(issue or "").lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "unusable source page",
+            "generic investor homepage",
+            "insufficient extracted text",
+            "empty extracted text",
+        )
+    )
+
+
+def _transport_fetch_url(fetch_url: str) -> str:
+    normalized = str(fetch_url or "").strip()
+    if normalized.startswith("https://web.archive.org/"):
+        return "http://" + normalized[len("https://") :]
+    return normalized
+
+
+def _get_with_transport_fallback(client: httpx.Client, fetch_url: str) -> httpx.Response:
+    normalized = str(fetch_url or "").strip()
+    try:
+        return client.get(normalized)
+    except Exception:
+        fallback_url = _transport_fetch_url(normalized)
+        if fallback_url == normalized:
+            raise
+        return client.get(fallback_url)
 
 
 def _maybe_refresh_cached_excerpt(
@@ -633,6 +919,7 @@ def _disabled_material(source: dict[str, Any], cached: Optional[dict[str, Any]] 
     return {
         "label": source.get("label", "Source"),
         "url": source.get("url", ""),
+        "fetch_url": source.get("fetch_url", ""),
         "kind": source.get("kind", "source"),
         "role": source.get("role", source.get("kind", "source")),
         "date": source.get("date", ""),
@@ -671,7 +958,8 @@ def _fetch_material(
         cached = _maybe_upgrade_cached_html_ocr(dict(cached), root=root, key=key, meta_path=meta_path)
         cached = _maybe_upgrade_cached_pdf_ocr(dict(cached), meta_path=meta_path)
         cached = _maybe_refresh_cached_excerpt(dict(cached), meta_path=meta_path)
-        cached["status"] = "cached"
+        cached = _revalidate_cached_material_quality(dict(cached), meta_path=meta_path)
+        cached["status"] = "cached" if str(cached.get("status") or "") != "error" else "error"
         cached["from_cache"] = True
         notify(1.0, f"已复用缓存：{source.get('label', 'Source')}")
         return cached
@@ -684,70 +972,110 @@ def _fetch_material(
     try:
         notify(0.08, f"开始下载：{source.get('label', 'Source')}")
         with httpx.Client(headers=REQUEST_HEADERS, follow_redirects=True, timeout=40.0) as client:
-            response = client.get(str(source.get("url") or ""))
-            response.raise_for_status()
-        raw_bytes = response.content
-        content_type = response.headers.get("content-type", "")
-        suffix = _guess_suffix(str(source.get("url") or ""), content_type)
-        raw_path = root / f"{key}{suffix}"
-        raw_path.write_bytes(raw_bytes)
-
-        notify(0.42, f"正在提取正文：{source.get('label', 'Source')}")
-        if (
-            suffix == ".txt"
-            and "sec.gov/Archives/edgar/data" in str(source.get("url") or "")
-            and str(source.get("kind") or "") in {"sec_filing", "official_release", "call_summary"}
-        ):
-            title, text = _extract_sec_submission_text(raw_bytes, source)
-        else:
-            title, text = _extract_text(raw_bytes, content_type, suffix)
-        if suffix in {".html", ".htm"} or "html" in content_type.lower():
-            image_sources = _html_image_sources(raw_bytes)
-            if _should_ocr_html(text, image_sources):
-                notify(0.68, f"正在做图片 OCR：{source.get('label', 'Source')}")
-                ocr_text = _html_image_ocr_text(str(source.get("url") or ""), raw_bytes, root, key)
-                if ocr_text:
-                    text = f"{text}\n\n{ocr_text}".strip()
-        text_path = root / f"{key}.txt"
-        text_path.write_text(text, encoding="utf-8")
-        quality_issue = _material_text_quality_issue(
-            source,
-            title=title,
-            text=text,
-            content_type=content_type,
-            suffix=suffix,
-        )
-        status = "fetched"
-        error = ""
-        if quality_issue:
-            status = "error"
-            error = quality_issue
-        metadata = {
-            "label": source.get("label", "Source"),
-            "url": source.get("url", ""),
-            "kind": source.get("kind", "source"),
-            "role": source.get("role", source.get("kind", "source")),
-            "date": source.get("date", ""),
-            "status": status,
-            "from_cache": False,
-            "content_type": content_type,
-            "title": title or source.get("label", ""),
-            "excerpt": _excerpt(text),
-            "text_length": len(text),
-            "raw_path": str(raw_path),
-            "text_path": str(text_path),
-            "fetched_at": now_iso(),
-            "error": error,
-        }
-        if quality_issue:
-            notify(1.0, f"已识别低质量材料：{source.get('label', 'Source')}")
-            return _write_material_meta(meta_path, metadata)
-        notify(1.0, f"已完成材料处理：{source.get('label', 'Source')}")
-        return _write_material_meta(meta_path, metadata)
+            canonical_url = str(source.get("url") or "")
+            initial_fetch_url = str(source.get("fetch_url") or canonical_url)
+            pending_urls = [item for item in [initial_fetch_url] if item]
+            attempted_urls: set[str] = set()
+            last_error: Optional[Exception] = None
+            while pending_urls:
+                fetch_url = pending_urls.pop(0)
+                if fetch_url in attempted_urls:
+                    continue
+                attempted_urls.add(fetch_url)
+                try:
+                    response = _get_with_transport_fallback(client, fetch_url)
+                    if fetch_url == canonical_url and _response_looks_like_bot_challenge(response):
+                        fallback_fetch_url = _discover_wayback_snapshot_url(canonical_url, client=client)
+                        if fallback_fetch_url and fallback_fetch_url not in attempted_urls:
+                            notify(0.18, f"检测到站点挑战页，切换 Wayback：{source.get('label', 'Source')}")
+                            pending_urls.insert(0, fallback_fetch_url)
+                        if response.status_code >= 400:
+                            continue
+                    response.raise_for_status()
+                    raw_bytes = response.content
+                    content_type = response.headers.get("content-type", "")
+                    suffix = _guess_suffix(fetch_url, content_type)
+                    notify(0.42, f"正在提取正文：{source.get('label', 'Source')}")
+                    if (
+                        suffix == ".txt"
+                        and "sec.gov/Archives/edgar/data" in canonical_url
+                        and str(source.get("kind") or "") in {"sec_filing", "official_release", "call_summary"}
+                    ):
+                        title, text = _extract_sec_submission_text(raw_bytes, source)
+                    else:
+                        title, text = _extract_text(raw_bytes, content_type, suffix)
+                    if suffix in {".html", ".htm"} or "html" in content_type.lower():
+                        image_sources = _html_image_sources(raw_bytes)
+                        if _should_ocr_html(text, image_sources):
+                            notify(0.68, f"正在做图片 OCR：{source.get('label', 'Source')}")
+                            ocr_text = _html_image_ocr_text(fetch_url, raw_bytes, root, key)
+                            if ocr_text:
+                                text = f"{text}\n\n{ocr_text}".strip()
+                    quality_issue = _material_text_quality_issue(
+                        source,
+                        title=title,
+                        text=text,
+                        content_type=content_type,
+                        suffix=suffix,
+                    )
+                    if (
+                        quality_issue
+                        and fetch_url == canonical_url
+                        and _quality_issue_warrants_wayback_retry(quality_issue)
+                    ):
+                        fallback_fetch_url = str(source.get("fetch_url") or "") or _discover_wayback_snapshot_url(canonical_url, client=client)
+                        if fallback_fetch_url and fallback_fetch_url not in attempted_urls:
+                            notify(0.24, f"实时页面正文不足，改抓 Wayback 快照：{source.get('label', 'Source')}")
+                            pending_urls.insert(0, fallback_fetch_url)
+                            continue
+                    raw_path = root / f"{key}{suffix}"
+                    raw_path.write_bytes(raw_bytes)
+                    text_path = root / f"{key}.txt"
+                    text_path.write_text(text, encoding="utf-8")
+                    status = "fetched"
+                    error = ""
+                    if quality_issue:
+                        status = "error"
+                        error = quality_issue
+                    metadata = {
+                        "label": source.get("label", "Source"),
+                        "url": canonical_url,
+                        "fetch_url": fetch_url if fetch_url != canonical_url else str(source.get("fetch_url") or ""),
+                        "kind": source.get("kind", "source"),
+                        "role": source.get("role", source.get("kind", "source")),
+                        "date": source.get("date", ""),
+                        "status": status,
+                        "from_cache": False,
+                        "content_type": content_type,
+                        "title": title or source.get("label", ""),
+                        "excerpt": _excerpt(text),
+                        "text_length": len(text),
+                        "raw_path": str(raw_path),
+                        "text_path": str(text_path),
+                        "fetched_at": now_iso(),
+                        "error": error,
+                    }
+                    if quality_issue:
+                        notify(1.0, f"已识别低质量材料：{source.get('label', 'Source')}")
+                        return _write_material_meta(meta_path, metadata)
+                    notify(1.0, f"已完成材料处理：{source.get('label', 'Source')}")
+                    return _write_material_meta(meta_path, metadata)
+                except Exception as exc:
+                    last_error = exc
+                    if fetch_url == canonical_url:
+                        fallback_fetch_url = str(source.get("fetch_url") or "") or _discover_wayback_snapshot_url(canonical_url, client=client)
+                        if fallback_fetch_url and fallback_fetch_url not in attempted_urls:
+                            notify(0.18, f"主站抓取失败，改抓 Wayback 快照：{source.get('label', 'Source')}")
+                            pending_urls.insert(0, fallback_fetch_url)
+                            continue
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError(f"unable to fetch source: {canonical_url}")
     except Exception as exc:
         metadata = {
             "label": source.get("label", "Source"),
             "url": source.get("url", ""),
+            "fetch_url": source.get("fetch_url", ""),
             "kind": source.get("kind", "source"),
             "role": source.get("role", source.get("kind", "source")),
             "date": source.get("date", ""),
@@ -780,6 +1108,7 @@ def hydrate_source_materials(
         tuple(
             (
                 str(source.get("url") or ""),
+                str(source.get("fetch_url") or ""),
                 str(source.get("label") or ""),
                 str(source.get("kind") or ""),
                 str(source.get("role") or ""),
