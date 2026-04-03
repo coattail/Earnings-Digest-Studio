@@ -460,6 +460,7 @@ def _compact_category_label(value: str) -> str:
     label = label.replace("Wearables, Home & Accessories", "Wearables & Acc.")
     label = label.replace("Wearables, Home and Accessories", "Wearables & Acc.")
     label = label.replace("Google Search & other", "Search & other")
+    label = label.replace("Google other", "Google other（旧口径）")
     label = label.replace("Google subscriptions, platforms & devices", "Subs, platforms & dev.")
     label = label.replace("Google subscriptions, platforms, & devices", "Subs, platforms & dev.")
     label = label.replace("Google subscriptions, platforms, and devices", "Subs, platforms & dev.")
@@ -555,32 +556,69 @@ def render_segment_mix_svg(
     accent: str,
     money_symbol: str = "$",
 ) -> str:
+    segment_regional_mode = bool(segments) and all(
+        str(item.get("scope") or "").casefold() == "regional_segment" for item in segments
+    )
     business_names = [str(item.get("name") or "Business") for item in segments]
     business_palette = _segment_palette(business_names, colors, accent)
     annual_geography_mode = bool(geographies) and all(str(item.get("scope") or "") == "annual_filing" for item in geographies)
-    regional_segment_mode = bool(geographies) and all(str(item.get("scope") or "") == "regional_segment" for item in geographies)
+    geography_regional_mode = bool(geographies) and all(
+        str(item.get("scope") or "").casefold() == "regional_segment" for item in geographies
+    )
+    duplicate_regional_panels = (
+        geography_regional_mode
+        and bool(segments)
+        and {
+            (
+                str(item.get("name") or "").casefold(),
+                round(float(item.get("value_bn") or 0.0), 3),
+            )
+            for item in segments
+        }
+        == {
+            (
+                str(item.get("name") or "").casefold(),
+                round(float(item.get("value_bn") or 0.0), 3),
+            )
+            for item in geographies
+        }
+    )
     business_svg = _donut_panel_svg(
-        "业务营收结构",
-        "优先采用财报分部口径，保持品牌映射一致。",
+        "区域经营分部结构" if segment_regional_mode else "业务营收结构",
+        "公司按区域经营分部披露，这里直接保留官方分部口径，不把它误写成营收类型。"
+        if segment_regional_mode
+        else "优先采用财报分部口径，保持品牌映射一致。"
+        if not duplicate_regional_panels
+        else "公司按区域经营分部披露时，这里直接保留官方分部口径。",
         segments,
         business_palette,
         accent,
         money_symbol,
         "当前缺少稳定分部披露，系统已改为总量成长、利润质量与管理层结构摘要。",
+        center_label="经营分部" if segment_regional_mode else "当季营收",
     )
     geography_svg = _donut_panel_svg(
         "地区营收结构",
+        "公司未单列终端地理收入，因此这一栏不重复展示与分部完全相同的区域口径。"
+        if duplicate_regional_panels
+        else
         "若财报披露地理口径，则自动补入第二张圆环结构图。"
-        if not annual_geography_mode and not regional_segment_mode
+        if not annual_geography_mode and not geography_regional_mode
         else "若公司按区域经营分部披露，则采用区域经营分部口径，并显式区分于业务分部。"
-        if regional_segment_mode
+        if geography_regional_mode
         else "若当季未单独披露，则回退到最近年报地理口径，并显式标注为年度视角。",
-        geographies,
+        [] if duplicate_regional_panels else geographies,
         _geography_palette([str(item.get("name") or "Geography") for item in geographies], accent),
         accent,
         money_symbol,
-        "当前季度未在已接入官方材料中发现稳定地区收入拆分，因此本页保留业务结构主图。",
-        center_label="当季营收" if not annual_geography_mode and not regional_segment_mode else "区域经营分部" if regional_segment_mode else "年度地区口径",
+        "当前季度未在已接入官方材料中发现稳定地区收入拆分，因此本页保留业务结构主图。"
+        if not duplicate_regional_panels
+        else "当前官方材料只披露了区域经营分部，没有单独给出终端地理收入拆分。",
+        center_label="当季营收"
+        if not annual_geography_mode and not geography_regional_mode
+        else "区域经营分部"
+        if geography_regional_mode
+        else "年度地区口径",
     )
     return _svg(
         1140,
@@ -1501,38 +1539,23 @@ def _microsoft_corporate_logo(x: float, y: float, square: float = 17.0) -> str:
 
 
 def _microsoft_business_lockup(name: str, x: float, y: float) -> str:
-    if name == "Productivity and Business Processes":
-        return (
-            f'<g transform="translate({x:.1f},{y:.1f})">'
-            '<rect x="0" y="0" width="10" height="10" fill="#F25022"/>'
-            '<rect x="12" y="0" width="10" height="10" fill="#7FBA00"/>'
-            '<rect x="0" y="12" width="10" height="10" fill="#00A4EF"/>'
-            '<rect x="12" y="12" width="10" height="10" fill="#FFB900"/>'
-            '<text x="32" y="9" font-size="10.5" font-weight="700" fill="#6B7280">Microsoft 365</text>'
-            '<rect x="32" y="13" width="12" height="12" rx="2.5" fill="#0A66C2"/>'
-            '<text x="38" y="21.5" text-anchor="middle" font-size="7.5" font-weight="700" fill="#FFFFFF">in</text>'
-            '<text x="50" y="23" font-size="11.5" font-weight="700" fill="#2563EB">LinkedIn</text>'
-            "</g>"
-        )
-    if name == "Intelligent Cloud":
-        return (
-            f'<g transform="translate({x:.1f},{y:.1f})">'
-            '<path d="M18 0 L36 56 L27 56 L22 40 L9 40 L2 56 L0 56 L16 0 Z" fill="#2B63C6"/>'
-            '<path d="M26 0 L58 0 L33 56 L24 56 Z" fill="#2DB3F1" opacity="0.92"/>'
-            '<path d="M26 27 L30 40 L21 40 Z" fill="#FFFFFF" opacity="0.92"/>'
-            '<text x="64" y="16" font-size="11" font-weight="700" fill="#6B7280">Azure</text>'
-            "</g>"
-        )
-    if name == "More Personal Computing":
-        return (
-            f'<g transform="translate({x:.1f},{y:.1f})">'
-            '<rect x="0" y="10" width="18" height="18" fill="#1C9CDD" transform="skewY(-8)"/>'
-            '<rect x="22" y="6" width="18" height="22" fill="#1C9CDD" transform="skewY(-8)"/>'
-            '<circle cx="74" cy="15" r="11" fill="#111111"/>'
-            '<path d="M65 8 L69 5 L74 11 L79 5 L83 8 L78 14 L83 20 L79 24 L74 17 L69 24 L65 20 L70 14 Z" fill="#FFFFFF"/>'
-            "</g>"
-        )
-    return ""
+    accent = {
+        "Productivity and Business Processes": "#2796D4",
+        "Intelligent Cloud": "#FFBE0B",
+        "More Personal Computing": "#7A7A7A",
+    }.get(name, "#94A3B8")
+    tag = {
+        "Productivity and Business Processes": "WORK",
+        "Intelligent Cloud": "CLOUD",
+        "More Personal Computing": "PERSONAL",
+    }.get(name, "MICROSOFT")
+    return (
+        f'<g transform="translate({x:.1f},{y:.1f})">'
+        f'<rect x="0" y="0" width="82" height="26" rx="13" fill="#FFFFFF" stroke="{_mix_hex(accent, "#CBD5E1", 0.65)}"/>'
+        f'{_microsoft_corporate_logo(8, 7, 5.2)}'
+        f'<text x="41" y="17" font-size="9.2" font-weight="700" letter-spacing="0.08em" fill="{accent}">{_escape(tag)}</text>'
+        "</g>"
+    )
 
 
 def _render_microsoft_income_statement_svg(
@@ -1647,7 +1670,7 @@ def _render_microsoft_income_statement_svg(
         source_bottom = center_y + source_height / 2
         body.append(f'<path d="{_flow_path(flow_start_x, source_top, source_bottom, revenue_x, seg_top, seg_bottom)}" fill="{fill_color}" opacity="0.94"/>')
         body.append(f'<rect x="{left_node_x}" y="{source_top:.1f}" width="{left_node_w}" height="{source_height:.1f}" rx="4" fill="{node_color}"/>')
-        lockup_offset = 34 if name == "Productivity and Business Processes" else 30 if name == "Intelligent Cloud" else 26
+        lockup_offset = 13
         body.append(_microsoft_business_lockup(name, left_lockup_x, center_y - lockup_offset))
         body.append(
             f'<text x="{value_x:.1f}" y="{center_y - 4:.1f}" text-anchor="end" font-size="17" font-weight="600" fill="#666666">{format_money_bn(value_bn, money_symbol)}</text>'
@@ -1826,8 +1849,6 @@ def render_income_statement_svg(
         ]
         return _svg(width, height, "".join(body))
     company_id = str(statement.get("company_id") or "")
-    if company_id == "microsoft":
-        return _render_microsoft_income_statement_svg(statement, business_groups, money_symbol)
 
     revenue = float(statement["revenue_bn"])
     gross_profit = float(statement["gross_profit_bn"])
@@ -2659,8 +2680,26 @@ def _dominant_history_structure_basis(entries: list[dict[str, object]]) -> str:
 
 
 def _growth_stack_plan(entries: list[dict[str, object]]) -> tuple[list[str], list[dict[str, object]], bool]:
-    share_maps = [_segment_share_map(entry) for entry in entries]
-    anchor_segments = next((_entry_structure_items(entry)[0] for entry in reversed(entries) if _entry_structure_items(entry)[0]), [])
+    dominant_basis = _dominant_history_structure_basis(entries)
+    filtered_items: list[list[dict[str, object]]] = []
+    share_maps: list[dict[str, float]] = []
+    for entry in entries:
+        items, basis = _entry_structure_items(entry)
+        if basis and basis != dominant_basis:
+            items = []
+        filtered_items.append(items)
+        total = sum(float(item.get("value_bn") or 0.0) for item in items)
+        if total <= 0:
+            share_maps.append({})
+            continue
+        share_maps.append(
+            {
+                str(item.get("name") or "Business"): float(item.get("value_bn") or 0.0) / total
+                for item in items
+                if float(item.get("value_bn") or 0.0) > 0
+            }
+        )
+    anchor_segments = next((items for items in reversed(filtered_items) if items), [])
     segment_names = [str(item.get("name") or "Business") for item in anchor_segments]
     for share_map in share_maps:
         for name in share_map:
@@ -2686,10 +2725,6 @@ def _growth_stack_plan(entries: list[dict[str, object]]) -> tuple[list[str], lis
                 next_map = share_maps[next_index]
                 for name in segment_names:
                     candidate_map[name] = prev_map.get(name, 0.0) * (1 - weight) + next_map.get(name, 0.0) * weight
-            elif prev_index is not None:
-                candidate_map = {name: share_maps[prev_index].get(name, 0.0) for name in segment_names}
-            elif next_index is not None:
-                candidate_map = {name: share_maps[next_index].get(name, 0.0) for name in segment_names}
             share_total = sum(candidate_map.values())
             if share_total > 0:
                 share_map = {name: value / share_total for name, value in candidate_map.items() if value > 0}
@@ -2709,7 +2744,13 @@ def _growth_stack_plan(entries: list[dict[str, object]]) -> tuple[list[str], lis
     return (segment_names, plan, inferred_any)
 
 
-def render_growth_overview_svg(entries: list[dict[str, object]], colors: dict[str, str], primary: str, money_symbol: str = "$") -> str:
+def render_growth_overview_svg(
+    entries: list[dict[str, object]],
+    colors: dict[str, str],
+    primary: str,
+    money_symbol: str = "$",
+    title: str = "近 12 季成长总览",
+) -> str:
     width, height = 1180, 428
     chart_left = 74
     chart_top = 74
@@ -2720,16 +2761,18 @@ def render_growth_overview_svg(entries: list[dict[str, object]], colors: dict[st
     max_total = max(totals) if any(totals) else 1
     segment_names, stack_plan, inferred_segments = _growth_stack_plan(entries)
     has_segment_stacks = bool(stack_plan and segment_names)
+    has_unstacked_quarters = has_segment_stacks and any(not list(item.get("segments") or []) for item in stack_plan)
     structure_basis = _dominant_history_structure_basis(entries)
     structure_label = "业务结构" if structure_basis != "geography" else "地区结构"
     legend_label = "业务类型" if structure_basis != "geography" else "地区类型"
     palette = _segment_palette(segment_names, colors, primary)
+    empty_title = title.replace("成长总览", "收入序列")
     body = [
         f'<rect x="0" y="0" width="{width}" height="{height}" rx="28" fill="#FFFFFF"/>',
-        '<text x="32" y="36" font-size="18" font-weight="700" fill="#0F172A">近 12 季成长总览</text>',
+        f'<text x="32" y="36" font-size="18" font-weight="700" fill="#0F172A">{_escape(title)}</text>',
         (
-            f'<text x="32" y="56" font-size="12" fill="#64748B">每个季度柱体按{structure_label}分段上色；带 * 的季度按邻近官方结构占比补足显示，并保持全报告颜色映射一致。</text>'
-            if inferred_segments
+            f'<text x="32" y="56" font-size="12" fill="#64748B">每个季度柱体按{structure_label}分段上色；带 * 的季度仅在前后都有官方锚点时按邻近结构插值，纯色柱表示该季度暂无可靠结构。</text>'
+            if inferred_segments or has_unstacked_quarters
             else f'<text x="32" y="56" font-size="12" fill="#64748B">每个季度柱体按{structure_label}分段上色，并保持全报告颜色映射一致。</text>'
         )
         if has_segment_stacks
@@ -2739,7 +2782,7 @@ def render_growth_overview_svg(entries: list[dict[str, object]], colors: dict[st
         body.extend(
             [
                 '<rect x="74" y="92" width="1032" height="286" rx="24" fill="#F8FAFC" stroke="#E2E8F0" stroke-dasharray="7 7"/>',
-                f'<text x="108" y="154" font-size="20" font-weight="700" fill="{primary}">近 12 季收入序列暂未接入完整数值</text>',
+                f'<text x="108" y="154" font-size="20" font-weight="700" fill="{primary}">{_escape(empty_title)} 暂未接入完整数值</text>',
                 '<text x="108" y="190" font-size="14" fill="#334155">系统会继续展示当季页、电话会页与指引页；历史成长图在无可靠收入序列时不再强行绘制伪数据。</text>',
                 '<text x="108" y="222" font-size="13" fill="#64748B">可用季度：</text>',
                 "".join(
@@ -2805,12 +2848,12 @@ def render_growth_overview_svg(entries: list[dict[str, object]], colors: dict[st
             f'<text x="{last_x:.1f}" y="{last_y-12:.1f}" text-anchor="middle" font-size="12" fill="#0F172A">{format_money_bn(entries[-1].get("revenue_bn"), money_symbol)}</text>'
         )
     if has_segment_stacks and segment_names:
-        legend_items = segment_names[:6]
-        legend_rows = 1 if len(legend_items) <= 3 else 2
+        legend_items = segment_names[:7]
+        legend_rows = math.ceil(len(legend_items) / 3) if legend_items else 1
         if inferred_segments:
             legend_rows = max(2, legend_rows)
-        legend_box_y = 342 if legend_rows == 2 else 352
-        legend_box_h = 74 if legend_rows == 2 else 46
+        legend_box_y = 324 if legend_rows >= 3 else 342 if legend_rows == 2 else 352
+        legend_box_h = 34 + legend_rows * 20
         body.append(
             f'<rect x="74" y="{legend_box_y:.1f}" width="1036" height="{legend_box_h:.1f}" rx="18" fill="#F8FAFC" stroke="#E2E8F0"/>'
         )
@@ -2833,9 +2876,9 @@ def render_growth_overview_svg(entries: list[dict[str, object]], colors: dict[st
             body.append(
                 f'<text x="1090" y="{legend_box_y + legend_box_h - 10:.1f}" text-anchor="end" font-size="10.5" fill="#94A3B8">其余细分{legend_label}已并入颜色映射并在后续结构页展开</text>'
             )
-        elif inferred_segments:
+        elif inferred_segments or has_unstacked_quarters:
             body.append(
-                f'<text x="1090" y="{legend_box_y + legend_box_h - 10:.1f}" text-anchor="end" font-size="10.5" fill="#94A3B8">* 表示该季度按邻近官方结构占比补足展示</text>'
+                f'<text x="1090" y="{legend_box_y + legend_box_h - 10:.1f}" text-anchor="end" font-size="10.5" fill="#94A3B8">* 表示该季度仅在双锚点之间按邻近官方结构插值</text>'
             )
     return _svg(width, height, "".join(body))
 
@@ -2853,10 +2896,11 @@ def render_structure_transition_svg(entries: list[dict[str, object]], colors: di
         }
         for entry in entries
     ]
-    complete = all(list(entry.get("_normalized_structure_items") or []) for entry in normalized_entries)
+    available_entries = [entry for entry in normalized_entries if list(entry.get("_normalized_structure_items") or [])]
+    complete = len(available_entries) == len(normalized_entries)
     structure_basis = _dominant_history_structure_basis(entries)
     structure_label = "业务分部" if structure_basis != "geography" else "地区结构"
-    if not complete:
+    if len(available_entries) < 2:
         note = fallback_note or "当前历史分部数据不足，结构页自动降级为管理层结构说明。"
         body.extend(
             [
@@ -2874,13 +2918,25 @@ def render_structure_transition_svg(entries: list[dict[str, object]], colors: di
     chart_height = 190
     step_x = chart_width / max(1, len(entries))
     bar_width = step_x * 0.66
-    latest_items = list(normalized_entries[-1].get("_normalized_structure_items") or [])
+    latest_items = list(available_entries[-1].get("_normalized_structure_items") or [])
     segment_names = [str(segment.get("name") or "Business") for segment in latest_items]
     palette = _segment_palette(segment_names, colors, primary)
+    if not complete:
+        body.append(
+            f'<text x="32" y="56" font-size="12" fill="#64748B">仅在有可靠官方结构的季度绘制分段；空心柱表示当季结构不足，系统不伪造占比。</text>'
+        )
     for index, entry in enumerate(normalized_entries):
         x = left + index * step_x + step_x * 0.17
         y_cursor = top + chart_height
-        for segment in list(entry.get("_normalized_structure_items") or []):
+        structure_items = list(entry.get("_normalized_structure_items") or [])
+        if not structure_items:
+            body.append(
+                f'<rect x="{x:.1f}" y="{top + 6:.1f}" width="{bar_width:.1f}" height="{chart_height - 6:.1f}" rx="12" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.4" stroke-dasharray="6 5"/>'
+            )
+            body.append(
+                f'<text x="{x + bar_width/2:.1f}" y="{top + chart_height / 2 + 4:.1f}" text-anchor="middle" font-size="10.5" fill="#94A3B8">结构待补</text>'
+            )
+        for segment in structure_items:
             share_pct = float(segment["share_pct"])
             part_height = share_pct / 100 * chart_height
             y_cursor -= part_height
@@ -2890,8 +2946,8 @@ def render_structure_transition_svg(entries: list[dict[str, object]], colors: di
         body.append(
             f'<text x="{x + bar_width/2:.1f}" y="{top+chart_height+22:.1f}" text-anchor="middle" font-size="11" fill="#64748B">{_escape(str(entry["quarter_label"]))}</text>'
         )
-    first = max(list(normalized_entries[0].get("_normalized_structure_items") or []), key=lambda item: float(item.get("share_pct") or 0.0))
-    last = max(list(normalized_entries[-1].get("_normalized_structure_items") or []), key=lambda item: float(item.get("share_pct") or 0.0))
+    first = max(list(available_entries[0].get("_normalized_structure_items") or []), key=lambda item: float(item.get("share_pct") or 0.0))
+    last = max(list(available_entries[-1].get("_normalized_structure_items") or []), key=lambda item: float(item.get("share_pct") or 0.0))
     legend_items = segment_names[:6]
     legend_rows = 1 if len(legend_items) <= 3 else 2
     legend_y = 280 if legend_rows == 1 else 266
@@ -2912,6 +2968,8 @@ def render_structure_transition_svg(entries: list[dict[str, object]], colors: di
         body.append(f'<text x="{x + 18:.1f}" y="{y + 2:.1f}" font-size="{10.2 if legend_rows == 2 else 10.8}" fill="#334155">{_escape(_trim_note(_compact_category_label(name), 22 if legend_rows == 2 else 24))}</text>')
     if len(segment_names) > len(legend_items):
         body.append(f'<text x="1094" y="{legend_y + legend_h - 12:.1f}" text-anchor="end" font-size="10.2" fill="#94A3B8">其余业务已并入统一颜色映射</text>')
+    elif not complete:
+        body.append(f'<text x="1094" y="{legend_y + legend_h - 12:.1f}" text-anchor="end" font-size="10.2" fill="#94A3B8">空心柱表示该季度缺少可靠结构，系统仅保留时间序列不伪造占比</text>')
     return _svg(width, height, "".join(body))
 
 
@@ -3089,6 +3147,227 @@ def render_contribution_svg(entries: list[dict[str, object]], colors: dict[str, 
     body.append(
         f'<text x="42" y="274" font-size="12" fill="#475569">总收入增量：{format_money_bn(total_delta, money_symbol)} | 观察期：{first_label} → {last_label}</text>'
     )
+    return _svg(width, height, "".join(body))
+
+
+def render_capital_allocation_svg(snapshot: dict[str, Any], primary: str, accent: str, money_symbol: str = "$") -> str:
+    del money_symbol
+    width, height = 1180, 352
+    metrics = [
+        ("规模", "收入", snapshot.get("cards", [{}])[0].get("value") if len(snapshot.get("cards", [])) > 0 else "-", primary),
+        ("兑现", "净利润", snapshot.get("cards", [{}, {}])[1].get("value") if len(snapshot.get("cards", [])) > 1 else "-", "#0F172A"),
+        ("现金", "经营现金流", snapshot.get("cards", [{}, {}, {}])[2].get("value") if len(snapshot.get("cards", [])) > 2 else "-", accent),
+        ("股东现金", "自由现金流", snapshot.get("cards", [{}, {}, {}, {}])[3].get("value") if len(snapshot.get("cards", [])) > 3 else "-", "#16A34A"),
+    ]
+    body = [
+        f'<rect x="0" y="0" width="{width}" height="{height}" rx="28" fill="#FFFFFF"/>',
+        '<text x="32" y="36" font-size="18" font-weight="700" fill="#0F172A">现金流与资本配置</text>',
+        '<text x="32" y="58" font-size="12" fill="#64748B">先看利润有没有变成现金，再看资本开支与股东回报会不会吞掉自由现金流。</text>',
+    ]
+    card_y = 86
+    card_w = 246
+    gap = 18
+    for index, (step, title, value, color) in enumerate(metrics):
+        x = 32 + index * (card_w + gap)
+        body.extend(
+            [
+                f'<rect x="{x}" y="{card_y}" width="{card_w}" height="118" rx="22" fill="{_mix_hex(color, "#FFFFFF", 0.93)}" stroke="{_mix_hex(color, "#CBD5E1", 0.66)}"/>',
+                f'<text x="{x + 18}" y="{card_y + 26}" font-size="11" letter-spacing="0.12em" fill="#94A3B8">STEP {index + 1} · {_escape(step)}</text>',
+                f'<text x="{x + 18}" y="{card_y + 50}" font-size="16" font-weight="700" fill="#0F172A">{_escape(title)}</text>',
+                f'<text x="{x + 18}" y="{card_y + 86}" font-size="30" font-weight="700" fill="{color}">{_escape(str(value or "-"))}</text>',
+                f'<line x1="{x + card_w - 12}" y1="{card_y + 58}" x2="{x + card_w + 6}" y2="{card_y + 58}" stroke="#CBD5E1" stroke-width="2"/>'
+                if index < len(metrics) - 1
+                else "",
+            ]
+        )
+    status_colors = {
+        "strong": accent,
+        "balanced": primary,
+        "watch": "#F97316",
+        "light": "#0EA5E9",
+        "heavy": "#DC2626",
+        "selective": "#0284C7",
+        "aggressive": "#B91C1C",
+    }
+    signal_y = 224
+    for index, item in enumerate(list(snapshot.get("signals") or [])[:3]):
+        x = 32 + index * 372
+        visual = dict(item.get("visual") or {})
+        headline = str(visual.get("headline") or item.get("summary") or item.get("note") or "")
+        supporting = str(visual.get("supporting") or "")
+        headline_lines = _wrap_visual_text_lines(headline, 30.0, 2)
+        supporting_lines = _wrap_visual_text_lines(supporting, 34.0, 1)
+        signal_color = status_colors.get(str(item.get("status") or "").lower(), primary)
+        body.extend(
+            [
+                f'<rect x="{x}" y="{signal_y}" width="356" height="92" rx="20" fill="{_mix_hex(signal_color, "#FFFFFF", 0.95)}" stroke="{_mix_hex(signal_color, "#CBD5E1", 0.72)}"/>',
+                f'<text x="{x + 16}" y="{signal_y + 22}" font-size="11" letter-spacing="0.12em" fill="{_mix_hex(signal_color, "#64748B", 0.55)}">{_escape(str(item.get("title") or "Signal").upper())}</text>',
+                _text_block(x + 16, signal_y + 42, headline_lines, font_size=11.8, fill="#334155", line_height=12.4),
+                _text_block(x + 16, signal_y + 76, supporting_lines, font_size=10.6, fill="#64748B", line_height=11.0),
+            ]
+        )
+    return _svg(width, height, "".join(body))
+
+
+def render_expectation_reset_svg(snapshot: dict[str, Any], primary: str, secondary: str, money_symbol: str = "$") -> str:
+    del money_symbol
+    width, height = 1180, 330
+    cards = list(snapshot.get("cards") or [])
+    beat_pct = snapshot.get("beat_vs_prior_pct")
+    reset_pct = snapshot.get("reset_vs_actual_pct")
+    body = [
+        f'<rect x="0" y="0" width="{width}" height="{height}" rx="28" fill="#FFFFFF"/>',
+        '<text x="32" y="36" font-size="18" font-weight="700" fill="#0F172A">预期差与指引变化</text>',
+        '<text x="32" y="58" font-size="12" fill="#64748B">把上一季口径、本季实际和本次新口径排成一条线，直接看预期是被兑现还是被重置。</text>',
+    ]
+    positions = [42, 420, 798]
+    colors = [secondary, "#0F172A", primary]
+    for index, item in enumerate(cards[:3]):
+        x = positions[index]
+        color = colors[index]
+        value = str(item.get("value") or "-")
+        if value == "-":
+            value = "待补"
+        body.extend(
+            [
+                f'<rect x="{x}" y="92" width="340" height="138" rx="24" fill="{_mix_hex(color, "#FFFFFF", 0.94)}" stroke="{_mix_hex(color, "#CBD5E1", 0.7)}"/>',
+                f'<text x="{x + 18}" y="120" font-size="12" fill="#64748B">{_escape(str(item.get("title") or "-"))}</text>',
+                f'<text x="{x + 18}" y="172" font-size="{28 if value == "待补" else 34}" font-weight="700" fill="{color}">{_escape(value)}</text>',
+                _text_block(x + 18, 196, _wrap_visual_text_lines(str(item.get("note") or ""), 28.0, 2), font_size=11.2, fill="#475569", line_height=11.6),
+            ]
+        )
+    body.append(f'<line x1="382" y1="161" x2="420" y2="161" stroke="#CBD5E1" stroke-width="2.5"/>')
+    body.append(f'<line x1="760" y1="161" x2="798" y2="161" stroke="#CBD5E1" stroke-width="2.5"/>')
+    if beat_pct is not None:
+        body.append(f'<text x="401" y="150" text-anchor="middle" font-size="11.5" font-weight="700" fill="#0F172A">{format_pct(float(beat_pct), signed=True)}</text>')
+    if reset_pct is not None:
+        body.append(f'<text x="779" y="150" text-anchor="middle" font-size="11.5" font-weight="700" fill="{primary}">{format_pct(float(reset_pct), signed=True)}</text>')
+    bullets = list(snapshot.get("bullets") or [])[:2]
+    for index, bullet in enumerate(bullets):
+        body.append(f'<circle cx="52" cy="{262 + index * 26}" r="4" fill="{primary if index == 0 else secondary}"/>')
+        body.append(_text_block(66, 266 + index * 26, _wrap_visual_text_lines(str(bullet), 138.0, 1), font_size=12.2, fill="#334155"))
+    if snapshot.get("source_anchor"):
+        body.append(f'<text x="1140" y="306" text-anchor="end" font-size="11" fill="#94A3B8">{_escape(str(snapshot.get("source_anchor") or ""))}</text>')
+    return _svg(width, height, "".join(body))
+
+
+def render_balance_quality_svg(snapshot: dict[str, Any], primary: str, secondary: str, money_symbol: str = "$") -> str:
+    del money_symbol
+    width, height = 1180, 338
+    cards = list(snapshot.get("cards") or [])
+    signals = list(snapshot.get("signals") or [])
+    body = [
+        f'<rect x="0" y="0" width="{width}" height="{height}" rx="28" fill="#FFFFFF"/>',
+        '<text x="32" y="36" font-size="18" font-weight="700" fill="#0F172A">资产负债与经营质量</text>',
+        '<text x="32" y="58" font-size="12" fill="#64748B">利润表只回答这一季赚了多少，资产负债表更能回答这种改善能不能站住。</text>',
+    ]
+    metric_w = 262
+    metric_h = 92
+    for index, item in enumerate(cards[:4]):
+        x = 32 + index * (metric_w + 18)
+        color = primary if index % 2 == 0 else secondary
+        body.extend(
+            [
+                f'<rect x="{x}" y="88" width="{metric_w}" height="{metric_h}" rx="22" fill="#FFFFFF" stroke="#E2E8F0"/>',
+                f'<text x="{x + 16}" y="114" font-size="11" fill="#64748B">{_escape(str(item.get("title") or "-"))}</text>',
+                f'<text x="{x + 16}" y="150" font-size="27" font-weight="700" fill="{color}">{_escape(str(item.get("value") or "-"))}</text>',
+                _text_block(x + 16, 166, _wrap_visual_text_lines(str(item.get("note") or ""), 24.0, 1), font_size=10.8, fill="#94A3B8"),
+            ]
+        )
+    for index, item in enumerate(signals[:4]):
+        x = 32 + (index % 2) * 562
+        y = 206 + (index // 2) * 58
+        body.extend(
+            [
+                f'<rect x="{x}" y="{y}" width="548" height="48" rx="16" fill="#F8FAFC" stroke="#E2E8F0"/>',
+                f'<text x="{x + 16}" y="{y + 18}" font-size="10.8" letter-spacing="0.12em" fill="#94A3B8">{_escape(str(item.get("title") or "Signal").upper())}</text>',
+                _text_block(x + 16, y + 34, _wrap_visual_text_lines(str(item.get("note") or ""), 56.0, 1), font_size=11.6, fill="#334155"),
+            ]
+        )
+    return _svg(width, height, "".join(body))
+
+
+def render_validation_checklist_svg(snapshot: dict[str, Any], risk_color: str, positive_color: str) -> str:
+    width = 1180
+    positive_items = list(snapshot.get("positive_items") or [])[:3]
+    negative_items = list(snapshot.get("negative_items") or [])[:3]
+    summary_lines = _wrap_visual_text_lines(
+        "把多头验证点和风险验证点拆开列，是为了让下一季跟踪动作更像清单，而不是再重复一遍结论。",
+        66.0,
+        2,
+    )
+    column_y = 82
+    column_title_y = column_y + 30
+    card_start_y = column_y + 50
+    card_gap = 16
+    card_width = 508
+    card_min_height = 54
+    card_bottom_padding = 16
+    title_font = 11.2
+    title_line_height = 12.2
+    detail_font = 10.5
+    detail_line_height = 11.4
+    verify_font = 10.2
+    verify_line_height = 11.0
+
+    def _block_height(line_count: int, font_size: float, line_height: float) -> float:
+        if line_count <= 0:
+            return 0.0
+        return font_size + max(line_count - 1, 0) * line_height
+
+    def _layout_validation_item(item: dict[str, Any]) -> dict[str, Any]:
+        title_lines = _wrap_visual_text_lines(str(item.get("label") or "-"), 30.0, 4) or ["-"]
+        trigger_lines = _wrap_visual_text_lines(f"触发：{item.get('trigger') or '-'}", 39.0, 6) or ["触发：-"]
+        verify_lines = _wrap_visual_text_lines(f"验证：{item.get('verify') or '-'}", 39.0, 6) or ["验证：-"]
+        title_height = _block_height(len(title_lines), title_font, title_line_height)
+        trigger_height = _block_height(len(trigger_lines), detail_font, detail_line_height)
+        verify_height = _block_height(len(verify_lines), verify_font, verify_line_height)
+        height = 18 + title_height + 6 + trigger_height + 5 + verify_height + card_bottom_padding
+        return {
+            "title_lines": title_lines,
+            "trigger_lines": trigger_lines,
+            "verify_lines": verify_lines,
+            "content_height": height,
+        }
+
+    negative_layouts = [_layout_validation_item(item) for item in negative_items]
+    positive_layouts = [_layout_validation_item(item) for item in positive_items]
+    row_count = max(len(negative_layouts), len(positive_layouts))
+    row_heights = [
+        max(
+            card_min_height,
+            math.ceil(negative_layouts[index]["content_height"]) if index < len(negative_layouts) else card_min_height,
+            math.ceil(positive_layouts[index]["content_height"]) if index < len(positive_layouts) else card_min_height,
+        )
+        for index in range(row_count)
+    ]
+    column_height = 50 + sum(row_heights) + card_gap * max(row_count - 1, 0) + 18
+    height = max(372, column_y + column_height + 28)
+    body = [
+        f'<rect x="0" y="0" width="{width}" height="{height}" rx="28" fill="#FFFFFF"/>',
+        '<text x="32" y="36" font-size="18" font-weight="700" fill="#0F172A">下一季验证清单</text>',
+        _text_block(32, 58, summary_lines, font_size=12, fill="#64748B", line_height=13.2),
+        f'<rect x="28" y="{column_y}" width="548" height="{column_height}" rx="24" fill="{_mix_hex(risk_color, "#FFFFFF", 0.94)}" stroke="{_mix_hex(risk_color, "#CBD5E1", 0.66)}"/>',
+        f'<rect x="604" y="{column_y}" width="548" height="{column_height}" rx="24" fill="{_mix_hex(positive_color, "#FFFFFF", 0.95)}" stroke="{_mix_hex(positive_color, "#CBD5E1", 0.66)}"/>',
+        f'<text x="48" y="{column_title_y}" font-size="14" font-weight="700" fill="{risk_color}">风险验证点</text>',
+        f'<text x="624" y="{column_title_y}" font-size="14" font-weight="700" fill="{positive_color}">多头验证点</text>',
+    ]
+    for side_layouts, start_x, title_color in ((negative_layouts, 48, risk_color), (positive_layouts, 624, positive_color)):
+        y = card_start_y
+        for index, layout in enumerate(side_layouts):
+            card_height = row_heights[index]
+            title_y = y + 18
+            trigger_y = title_y + _block_height(len(layout["title_lines"]), title_font, title_line_height) + 6
+            verify_y = trigger_y + _block_height(len(layout["trigger_lines"]), detail_font, detail_line_height) + 5
+            body.extend(
+                [
+                    f'<rect x="{start_x}" y="{y}" width="{card_width}" height="{card_height}" rx="18" fill="#FFFFFF" stroke="{_mix_hex(title_color, "#CBD5E1", 0.78)}"/>',
+                    _text_block(start_x + 14, title_y, layout["title_lines"], font_size=title_font, fill=title_color, weight=700, line_height=title_line_height),
+                    _text_block(start_x + 14, trigger_y, layout["trigger_lines"], font_size=detail_font, fill="#475569", line_height=detail_line_height),
+                    _text_block(start_x + 14, verify_y, layout["verify_lines"], font_size=verify_font, fill="#64748B", line_height=verify_line_height),
+                ]
+            )
+            y += card_height + card_gap
     return _svg(width, height, "".join(body))
 
 

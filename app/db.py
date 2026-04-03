@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS reports (
   structure_dimension_used TEXT NOT NULL,
   coverage_warnings_json TEXT NOT NULL DEFAULT '[]',
   payload_json TEXT NOT NULL,
+  html_path TEXT,
   pdf_path TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -51,8 +52,15 @@ CREATE TABLE IF NOT EXISTS report_jobs (
 
 def init_db() -> None:
     ensure_directories()
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as connection:
         connection.executescript(SCHEMA_SQL)
+        report_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(reports)")
+        }
+        if "html_path" not in report_columns:
+            connection.execute("ALTER TABLE reports ADD COLUMN html_path TEXT")
         connection.commit()
 
 

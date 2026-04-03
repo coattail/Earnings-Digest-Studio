@@ -113,7 +113,7 @@
         </div>
         <div class="page-split two-col compact-panels">
           <article class="text-panel">
-            <h3>研究结论分层</h3>
+            <h3>这季先看三件事</h3>
             <div class="thesis-stack">
               {% for item in report.layered_takeaways[:3] %}
               <article class="thesis-item">
@@ -172,7 +172,7 @@
         {{ render_page_head("guidance", report.guidance_title, report.report_style.quarterly_label, "quarterly") }}
         <div class="chart-card wide-card">{{ report.visuals.guidance | safe }}</div>
         <div class="page-split two-col compact-panels tight-panels balanced-panels">
-          <article class="text-panel">
+          <article class="text-panel" data-autofit-block="guidance-panel">
             <h3>{{ report.guidance_panel.title }}</h3>
             {% if report.guidance_panel.bullets %}
             <ul class="warning-list">
@@ -197,7 +197,7 @@
             </div>
             {% endif %}
           </article>
-          <article class="text-panel">
+          <article class="text-panel" data-autofit-block="guidance-panel">
             <h3>{{ report.expectation_panel.title }}</h3>
             <ul class="warning-list">
               {% for item in report.expectation_panel.bullets[:3] %}
@@ -211,7 +211,7 @@
 
       <section class="page section-quarterly page-mix">
         <div class="page-no">5 / {{ report.page_count }}</div>
-        {{ render_page_head("mix", "当季营收结构与集中度", report.report_style.quarterly_label, "quarterly") }}
+        {{ render_page_head("mix", report.mix_page_title, report.report_style.quarterly_label, "quarterly") }}
         <div class="chart-card wide-card">{{ report.visuals.segment_mix | safe }}</div>
         <div class="mini-card-grid three-col">
           {% for item in report.current_detail_cards %}
@@ -241,7 +241,7 @@
         {{ render_page_head("management_qna", "电话会与问答主题", report.report_style.quarterly_label, "quarterly") }}
         <div class="chart-card wide-card">{{ report.visuals.management_qna | safe }}</div>
         <div class="page-split two-col compact-panels signal-followup-panels balanced-panels">
-          <article class="text-panel">
+          <article class="text-panel" data-autofit-block="signal-panel">
             <h3>{{ report.call_panel.title }}</h3>
             {% if report.call_panel.meta_lines %}
             <ul class="summary-list">
@@ -256,12 +256,12 @@
               {% endfor %}
             </ul>
           </article>
-          <article class="text-panel">
+          <article class="text-panel" data-autofit-block="signal-panel">
             {% if report.call_quote_cards %}
             <h3>{{ report.narrative_provenance.quote_panel_title }}</h3>
             <div class="quote-card-stack">
               {% set featured_quote = report.call_quote_cards[0] %}
-              <article class="quote-card{% if featured_quote.quote|length > 280 or featured_quote.analysis|length > 150 or featured_quote.source_label|length > 88 %} quote-card-dense{% endif %}{% if featured_quote.quote|length > 420 or featured_quote.analysis|length > 210 %} quote-card-ultra-dense{% endif %}">
+              <article class="quote-card{% if featured_quote.quote|length > 280 or featured_quote.analysis|length > 150 or featured_quote.source_label|length > 88 %} quote-card-dense{% endif %}{% if featured_quote.quote|length > 420 or featured_quote.analysis|length > 210 %} quote-card-ultra-dense{% endif %}" data-autofit-block="quote-card">
                 <span>{{ featured_quote.speaker }}</span>
                 <strong>{{ featured_quote.quote }}</strong>
                 <p>{{ featured_quote.analysis }}</p>
@@ -285,7 +285,7 @@
         {{ render_page_head("risks", "风险与催化剂", report.report_style.quarterly_label, "quarterly") }}
         <div class="chart-card wide-card">{{ report.visuals.risks_catalysts | safe }}</div>
         <div class="page-split two-col compact-panels signal-followup-panels balanced-panels">
-          <article class="text-panel">
+          <article class="text-panel" data-autofit-block="signal-panel">
             <h3>本季风险视角</h3>
             <p><strong>来源：</strong>{{ report.narrative_provenance.risks.label }}。{{ report.narrative_provenance.risks.detail }}</p>
             <div class="scenario-stack">
@@ -300,7 +300,7 @@
               {% endfor %}
             </div>
           </article>
-          <article class="text-panel">
+          <article class="text-panel" data-autofit-block="signal-panel">
             <h3>本季催化剂视角</h3>
             <p><strong>来源：</strong>{{ report.narrative_provenance.catalysts.label }}。{{ report.narrative_provenance.catalysts.detail }}</p>
             <div class="scenario-stack">
@@ -343,8 +343,8 @@
         </div>
         {% else %}
         <article class="text-panel street-view-empty">
-          <h3>当前未稳定抓到可追溯机构观点</h3>
-          <p>系统会优先展示带机构名、发布时间和链接的公开条目；若当前季度没有足够高质量结果，这一页会保留说明而不是硬拼内容。</p>
+          <h3>这季公开可追踪的卖方条目还不够</h3>
+          <p>我们只放带机构名、发布时间和链接的公开条目；如果这季拿不到足够扎实的内容，这一页宁可留白，也不硬凑观点。</p>
         </article>
         {% endif %}
         <div class="page-split two-col compact-panels">
@@ -367,9 +367,108 @@
         </div>
       </section>
 
-      <section class="page section-historical page-growth-overview">
+      <section class="page section-quarterly page-capital-allocation">
         <div class="page-no">11 / {{ report.page_count }}</div>
-        {{ render_page_head("growth", "近 12 季成长总览", report.report_style.historical_label, "historical") }}
+        {{ render_page_head("capital_allocation", report.capital_allocation.title, report.report_style.quarterly_label, "quarterly") }}
+        <div class="chart-card wide-card">{{ report.visuals.capital_allocation | safe }}</div>
+        <div class="page-split two-col compact-panels balanced-panels">
+          <article class="text-panel">
+            <h3>本页判断</h3>
+            <ul class="warning-list">
+              {% for item in report.capital_allocation.bullets %}
+              <li>{{ item }}</li>
+              {% endfor %}
+            </ul>
+          </article>
+          <article class="text-panel">
+            <h3>怎么用这页</h3>
+            <ul class="warning-list">
+              {% for item in report.capital_allocation.framework %}
+              <li>{{ item }}</li>
+              {% endfor %}
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section class="page section-quarterly page-expectation-reset">
+        <div class="page-no">12 / {{ report.page_count }}</div>
+        {{ render_page_head("expectation_reset", report.expectation_reset.title, report.report_style.quarterly_label, "quarterly") }}
+        <div class="chart-card wide-card">{{ report.visuals.expectation_reset | safe }}</div>
+        <div class="page-split two-col compact-panels balanced-panels">
+          <article class="text-panel">
+            <h3>预期差摘要</h3>
+            <ul class="warning-list">
+              {% for item in report.expectation_reset.bullets %}
+              <li>{{ item }}</li>
+              {% endfor %}
+            </ul>
+          </article>
+          <article class="text-panel">
+            <h3>解读方法</h3>
+            <ul class="warning-list">
+              {% for item in report.expectation_reset.method %}
+              <li>{{ item }}</li>
+              {% endfor %}
+            </ul>
+            {% if report.expectation_reset.source_anchor %}
+            <p class="panel-source">依据：{{ report.expectation_reset.source_anchor }}</p>
+            {% endif %}
+          </article>
+        </div>
+      </section>
+
+      <section class="page section-quarterly page-balance-quality">
+        <div class="page-no">13 / {{ report.page_count }}</div>
+        {{ render_page_head("balance_quality", report.balance_quality.title, report.report_style.quarterly_label, "quarterly") }}
+        <div class="chart-card wide-card">{{ report.visuals.balance_quality | safe }}</div>
+        <div class="page-split two-col compact-panels balanced-panels">
+          <article class="text-panel">
+            <h3>经营质量要点</h3>
+            <ul class="warning-list">
+              {% for item in report.balance_quality.bullets %}
+              <li>{{ item }}</li>
+              {% endfor %}
+            </ul>
+          </article>
+          <article class="text-panel">
+            <h3>判读框架</h3>
+            <ul class="warning-list">
+              {% for item in report.balance_quality.framework %}
+              <li>{{ item }}</li>
+              {% endfor %}
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section class="page section-quarterly page-validation" data-fit="tight">
+        <div class="page-no">14 / {{ report.page_count }}</div>
+        {{ render_page_head("validation", report.validation_checklist.title, report.report_style.quarterly_label, "quarterly") }}
+        <div class="chart-card wide-card">{{ report.visuals.validation_checklist | safe }}</div>
+        <div class="page-split two-col compact-panels balanced-panels">
+          <article class="text-panel">
+            <h3>下季度继续追问</h3>
+            <ul class="warning-list">
+              {% for item in report.validation_checklist.bullets %}
+              <li>{{ item }}</li>
+              {% endfor %}
+            </ul>
+          </article>
+          <article class="text-panel">
+            <h3>使用方式</h3>
+            <ul class="warning-list">
+              {% for item in report.validation_checklist.method %}
+              <li>{{ item }}</li>
+              {% endfor %}
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section class="page section-historical page-growth-overview">
+        <div class="page-no">15 / {{ report.page_count }}</div>
+        {{ render_page_head("growth", report.historical_growth_title, report.report_style.historical_label, "historical") }}
         <div class="chart-card wide-card">{{ report.visuals.growth_overview | safe }}</div>
         <div class="mini-card-grid three-col">
           {% for item in report.historical_summary_cards %}
@@ -383,7 +482,7 @@
       </section>
 
       <section class="page section-historical page-transition">
-        <div class="page-no">12 / {{ report.page_count }}</div>
+        <div class="page-no">16 / {{ report.page_count }}</div>
         {{ render_page_head("transition", "结构迁移与集中度", report.report_style.historical_label, "historical") }}
         <div class="chart-card wide-card">{{ report.visuals.structure_transition | safe }}</div>
         <div class="page-split two-col">
@@ -412,19 +511,19 @@
       </section>
 
       <section class="page section-historical page-profitability">
-        <div class="page-no">13 / {{ report.page_count }}</div>
+        <div class="page-no">17 / {{ report.page_count }}</div>
         {{ render_page_head("profitability", "盈利质量与经营杠杆", report.report_style.historical_label, "historical") }}
         <div class="chart-card wide-card">{{ report.visuals.profitability | safe }}</div>
       </section>
 
       <section class="page section-historical page-contribution">
-        <div class="page-no">14 / {{ report.page_count }}</div>
+        <div class="page-no">18 / {{ report.page_count }}</div>
         {{ render_page_head("contribution", "增长拆解与增量来源", report.report_style.historical_label, "historical") }}
         <div class="chart-card wide-card">{{ report.visuals.contribution | safe }}</div>
       </section>
 
       <section class="page section-historical page-insights">
-        <div class="page-no">15 / {{ report.page_count }}</div>
+        <div class="page-no">19 / {{ report.page_count }}</div>
         {{ render_page_head("insights", "趋势总结", report.report_style.historical_label, "historical") }}
         <div class="insight-grid">
           {% for item in report.historical_insights %}
@@ -438,7 +537,7 @@
       </section>
 
       <section class="page section-evidence page-evidence">
-        <div class="page-no">16 / {{ report.page_count }}</div>
+        <div class="page-no">20 / {{ report.page_count }}</div>
         {{ render_page_head("evidence", "原始材料与证据摘录", report.report_style.evidence_label, "evidence") }}
         <div class="source-grid">
           {% for source in report.sources[:2] %}
@@ -493,6 +592,28 @@
     </main>
     <script>
       (function () {
+        function resetAutofit(page) {
+          page.querySelectorAll("[data-autofit-block]").forEach((node) => {
+            node.dataset.textFit = "";
+          });
+        }
+
+        function blockOverflow(node) {
+          return Math.max(node.scrollHeight - node.clientHeight, node.scrollWidth - node.clientWidth);
+        }
+
+        function fitAutofitBlocks(page) {
+          const blocks = Array.from(page.querySelectorAll("[data-autofit-block]"));
+          if (!blocks.length) return;
+          const levels = ["compact", "dense", "ultra"];
+          blocks.forEach((node) => {
+            for (const level of levels) {
+              if (blockOverflow(node) <= 1) break;
+              node.dataset.textFit = level;
+            }
+          });
+        }
+
         function pageOverflow(page) {
           const pageRect = page.getBoundingClientRect();
           let overflow = 0;
@@ -509,13 +630,22 @@
         function fitPages() {
           document.querySelectorAll(".page").forEach((page) => {
             page.dataset.fit = "";
+            resetAutofit(page);
             let overflow = pageOverflow(page);
+            if (overflow > 2) {
+              fitAutofitBlocks(page);
+              overflow = pageOverflow(page);
+            }
             if (overflow > 2) {
               page.dataset.fit = overflow > 20 ? "dense" : "tight";
               overflow = pageOverflow(page);
             }
             if (overflow > 2 && page.dataset.fit !== "dense") {
               page.dataset.fit = "dense";
+              overflow = pageOverflow(page);
+            }
+            if (overflow > 2) {
+              fitAutofitBlocks(page);
             }
           });
         }

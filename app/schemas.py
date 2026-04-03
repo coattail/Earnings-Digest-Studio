@@ -44,6 +44,7 @@ class ReportResponse(BaseModel):
     structure_dimension_used: str
     coverage_warnings: list[str]
     preview_url: str
+    html_download_url: str
     export_pdf_url: str
     payload: dict[str, Any]
 
@@ -58,8 +59,11 @@ class SkillReportResponse(BaseModel):
     structure_dimension_used: str
     coverage_warnings: list[str]
     preview_url: str
+    html_download_url: str
     export_pdf_url: str
+    html_path: Optional[str] = None
     pdf_download_url: Optional[str] = None
+    pdf_path: Optional[str] = None
     pdf_error: Optional[str] = None
     diagnostics: list[SkillDiagnostic] = Field(default_factory=list)
     payload: dict[str, Any]
@@ -80,6 +84,7 @@ class SkillReportJobResponse(BaseModel):
     report_id: Optional[str] = None
     error: Optional[str] = None
     preview_url: Optional[str] = None
+    html_download_url: Optional[str] = None
     export_pdf_url: Optional[str] = None
     pdf_download_url: Optional[str] = None
     pdf_error: Optional[str] = None

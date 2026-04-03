@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import html
 import json
 import os
 import re
@@ -8,13 +9,13 @@ import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
 
 from ..config import CACHE_DIR, ensure_directories
-from .official_materials import DISABLE_FETCH_ENV, REQUEST_HEADERS
+from .official_materials import DISABLE_FETCH_ENV, OFFICIAL_MATERIALS_DIR, REQUEST_HEADERS
 from .local_data import get_company_series
 
 
@@ -24,6 +25,8 @@ HISTORICAL_SUBMISSIONS_TTL_SECONDS = 30 * 24 * 60 * 60
 ARCHIVE_SUBMISSIONS_TTL_SECONDS = 90 * 24 * 60 * 60
 IR_DISCOVERY_TTL_SECONDS = 14 * 24 * 60 * 60
 SITEMAP_DISCOVERY_TTL_SECONDS = 14 * 24 * 60 * 60
+IR_DISCOVERY_CACHE_VERSION = 4
+WAYBACK_CDX_URL = "https://web.archive.org/cdx/search/cdx"
 DEFAULT_RELEASE_HINTS = (
     "press release",
     "earnings release",
@@ -64,6 +67,8 @@ DEFAULT_CALL_HINTS = (
     "conference call",
     "earnings call",
     "prepared remarks",
+    "replay",
+    "archive",
     "script",
 )
 DEFAULT_CALL_EXCLUDES = ("presentation", "slides", "deck", "supplement")
@@ -150,9 +155,34 @@ def _submissions_ttl_seconds(period_end: Optional[str]) -> int:
     return HISTORICAL_SUBMISSIONS_TTL_SECONDS
 
 
+def _historical_sec_coverage_is_sufficient(
+    resolved_sources: list[dict[str, Any]],
+    period_end: str,
+    *,
+    prefer_sec_only: bool,
+    filing_forms: list[str],
+) -> bool:
+    if prefer_sec_only:
+        return True
+    target_date = _parse_date(str(period_end or ""))
+    if target_date is None or abs((date.today() - target_date).days) <= 365:
+        return False
+    roles = {str(item.get("role") or "") for item in resolved_sources}
+    has_release = "earnings_release" in roles
+    has_filing = "sec_filing" in roles or not filing_forms
+    return has_release and has_filing
+
+
 def _fetch_json(url: str) -> dict[str, Any]:
     with httpx.Client(headers=REQUEST_HEADERS, follow_redirects=True, timeout=40.0) as client:
         response = client.get(url)
+        response.raise_for_status()
+        return response.json()
+
+
+def _fetch_json_response(url: str, *, params: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    with httpx.Client(headers=REQUEST_HEADERS, follow_redirects=True, timeout=40.0) as client:
+        response = client.get(url, params=params)
         response.raise_for_status()
         return response.json()
 
@@ -618,7 +648,16 @@ def _presentation_label(company: dict[str, Any], attachment_text: str) -> str:
     return f"{company['english_name']} earnings presentation"
 
 
+def _call_label(company: dict[str, Any], attachment_text: str) -> str:
+    cleaned = " ".join(str(attachment_text or "").split())
+    if cleaned:
+        return f"{company['english_name']} {cleaned}"
+    return f"{company['english_name']} earnings call"
+
+
 def _attachment_profile_label(company: dict[str, Any], role: str, attachment_text: str) -> str:
+    if role == "earnings_call":
+        return _call_label(company, attachment_text)
     if role == "earnings_commentary":
         return _commentary_label(company, attachment_text)
     if role == "earnings_presentation":
@@ -648,16 +687,16 @@ def _attachment_profiles(company: dict[str, Any], source_config: dict[str, Any])
             "excludes": DEFAULT_RELEASE_EXCLUDES,
         },
         {
-            "kind": "presentation",
-            "role": "earnings_commentary",
-            "hints": DEFAULT_COMMENTARY_HINTS,
-            "excludes": DEFAULT_COMMENTARY_EXCLUDES,
-        },
-        {
             "kind": "call_summary",
             "role": "earnings_call",
             "hints": DEFAULT_CALL_HINTS,
             "excludes": DEFAULT_CALL_EXCLUDES,
+        },
+        {
+            "kind": "presentation",
+            "role": "earnings_commentary",
+            "hints": DEFAULT_COMMENTARY_HINTS,
+            "excludes": DEFAULT_COMMENTARY_EXCLUDES,
         },
         {
             "kind": "presentation",
@@ -670,7 +709,7 @@ def _attachment_profiles(company: dict[str, Any], source_config: dict[str, Any])
 
 def _merge_sources(existing_sources: list[dict[str, Any]], resolved_sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen_indices: dict[str, int] = {}
     has_official = any(
         source.get("kind") in {"official_release", "sec_filing", "presentation"} and source.get("url")
         for source in resolved_sources
@@ -708,10 +747,21 @@ def _merge_sources(existing_sources: list[dict[str, Any]], resolved_sources: lis
     ordered.sort(key=_source_priority, reverse=True)
     for source in ordered:
         url = str(source.get("url") or "")
-        if not url or url in seen:
+        if not url:
             continue
+        existing_index = seen_indices.get(url)
+        if existing_index is not None:
+            existing = dict(merged[existing_index])
+            updated = dict(existing)
+            for key, value in source.items():
+                if updated.get(key) in (None, "", []) and value not in (None, "", []):
+                    updated[key] = value
+            if not updated.get("fetch_url") and source.get("fetch_url"):
+                updated["fetch_url"] = source.get("fetch_url")
+            merged[existing_index] = updated
+            continue
+        seen_indices[url] = len(merged)
         merged.append(source)
-        seen.add(url)
     return merged
 
 
@@ -739,11 +789,22 @@ def _sec_cik_for_calendar_quarter(source_config: dict[str, Any], calendar_quarte
     return default_cik
 
 
+def _unwrap_document_service_url(url: str) -> str:
+    candidate = str(url or "").strip()
+    parsed = urlparse(candidate)
+    host = parsed.netloc.lower().split(":")[0]
+    if host in {"view.officeapps.live.com", "view.officeapps-df.live.com"}:
+        source_url = str(parse_qs(parsed.query).get("src", [""])[0] or "").strip()
+        if source_url:
+            return source_url
+    return candidate
+
+
 def _normalize_href(base_url: str, href: str) -> Optional[str]:
     candidate = str(href or "").strip()
     if not candidate or candidate.startswith(("#", "mailto:", "javascript:", "tel:")):
         return None
-    absolute = urljoin(base_url, candidate)
+    absolute = _unwrap_document_service_url(urljoin(base_url, candidate))
     parsed = urlparse(absolute)
     if parsed.scheme not in {"http", "https"}:
         return None
@@ -756,18 +817,319 @@ def _same_domain(url_a: str, url_b: str) -> bool:
     return bool(host_a and host_b and host_a == host_b)
 
 
+def _documentish_page_link(url: str) -> bool:
+    parsed = urlparse(str(url or ""))
+    path = parsed.path.lower()
+    host = parsed.netloc.lower().split(":")[0]
+    if not path:
+        return False
+    name = Path(path).name.lower()
+    if name in {"blank.html", "blank.htm", "session-error.htm", "session-error.html", "error.htm", "error.html"}:
+        return False
+    if name == "webcast.htm" and not str(parsed.query or "").strip():
+        return False
+    if any(
+        social_host in host
+        for social_host in ("facebook.com", "linkedin.com", "twitter.com", "x.com", "reddit.com", "pinterest.com")
+    ):
+        return False
+    if any(token in path for token in ("/onerfstatics/", "/_scrf/", "/etc.clientlibs/", "/uhf/")):
+        return False
+    if any(path.endswith(suffix) for suffix in (".css", ".js", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2", ".ttf", ".map")):
+        return False
+    return True
+
+
+def _string_looks_like_link_candidate(value: str) -> bool:
+    candidate = str(value or "").strip()
+    if not candidate or len(candidate) > 2048:
+        return False
+    lowered = candidate.lower()
+    if lowered.startswith(("http://", "https://", "/")):
+        return True
+    return any(
+        lowered.endswith(suffix)
+        for suffix in (".pdf", ".htm", ".html", ".txt", ".xml", ".json", ".mp3", ".mp4", ".m3u8", ".aspx")
+    )
+
+
+def _extract_script_links(page_url: str, script_text: str) -> list[dict[str, str]]:
+    extracted: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add_candidate(raw_value: str, context: str = "") -> None:
+        normalized_value = html.unescape(str(raw_value or "").strip()).replace("\\/", "/")
+        absolute = _normalize_href(page_url, normalized_value)
+        if not absolute or absolute in seen or not _documentish_page_link(absolute):
+            return
+        context_text = " ".join(str(context or "").split())
+        lowered_context = context_text.lower()
+        if (
+            not context_text
+            or len(context_text) > 180
+            or any(token in lowered_context for token in ("{", "}", "function", "defaultlocale", "global variables", "//"))
+        ):
+            context_text = _url_slug_text(absolute)
+        text = " ".join(str(context_text or _url_slug_text(absolute)).split())
+        extracted.append({"url": absolute, "text": text})
+        seen.add(absolute)
+
+    payload = str(script_text or "").strip()
+    if not payload:
+        return []
+    if payload[:1] in {"{", "["}:
+        try:
+            json_payload = json.loads(payload)
+        except json.JSONDecodeError:
+            json_payload = None
+        if json_payload is not None:
+            stack: list[Any] = [json_payload]
+            while stack:
+                node = stack.pop()
+                if isinstance(node, dict):
+                    stack.extend(node.values())
+                elif isinstance(node, list):
+                    stack.extend(node)
+                elif isinstance(node, str) and _string_looks_like_link_candidate(node):
+                    add_candidate(node, payload[:120])
+
+    absolute_pattern = re.compile(r"https?://[^\s\"'<>\\]+", flags=re.IGNORECASE)
+    relative_pattern = re.compile(
+        r"(?:(?<=['\"])|(?<=[:\s]))((?:/|\.\./)[^\"'<>\\]+?\.(?:aspx|pdf|htm|html|txt|xml|json|mp3|mp4|m3u8)(?:\?[^\"'<>\\]*)?)",
+        flags=re.IGNORECASE,
+    )
+    for match in absolute_pattern.finditer(payload):
+        add_candidate(match.group(0), payload[:120])
+    for match in relative_pattern.finditer(payload):
+        add_candidate(match.group(1), payload[:120])
+    return extracted
+
+
 def _page_links(page_url: str, html: str) -> list[dict[str, str]]:
     soup = BeautifulSoup(html, "html.parser")
     links: list[dict[str, str]] = []
     seen: set[str] = set()
-    for anchor in soup.find_all("a", href=True):
-        absolute = _normalize_href(page_url, str(anchor.get("href") or ""))
-        if not absolute or absolute in seen:
-            continue
-        text = " ".join(anchor.get_text(" ", strip=True).split())
-        links.append({"url": absolute, "text": text})
+    attribute_candidates = {
+        "href",
+        "link",
+        "src",
+        "data-url",
+        "data-href",
+        "data-link",
+        "data-download-url",
+        "data-file",
+        "data-pdf",
+    }
+
+    def add_link(raw_href: str, text: str = "") -> None:
+        absolute = _normalize_href(page_url, raw_href)
+        if not absolute or absolute in seen or not _documentish_page_link(absolute):
+            return
+        normalized_text = " ".join(str(text or _url_slug_text(absolute)).split())
+        links.append({"url": absolute, "text": normalized_text})
         seen.add(absolute)
+
+    for anchor in soup.find_all("a", href=True):
+        add_link(str(anchor.get("href") or ""), anchor.get_text(" ", strip=True))
+    for element in soup.find_all(True):
+        element_text = " ".join(element.get_text(" ", strip=True).split())
+        for attribute, value in dict(element.attrs).items():
+            attribute_name = str(attribute or "").lower()
+            if attribute_name not in attribute_candidates and not attribute_name.endswith(("href", "url")):
+                continue
+            values = value if isinstance(value, list) else [value]
+            for item in values:
+                if not _string_looks_like_link_candidate(str(item or "")):
+                    continue
+                add_link(str(item or ""), element_text)
+    for script in soup.find_all("script"):
+        for candidate in _extract_script_links(page_url, script.get_text(" ", strip=True)):
+            add_link(candidate["url"], candidate.get("text", ""))
     return links
+
+
+def _q4_public_feed_links(page_url: str, page_html: str) -> list[dict[str, str]]:
+    lowered = str(page_html or "").lower()
+    has_events_module = ".events(" in lowered or "module-event" in lowered
+    has_presentations_module = ".presentations(" in lowered or "module-presentation" in lowered
+    has_financial_reports_module = any(
+        token in lowered
+        for token in (
+            "q4financials(",
+            "financialreport.svc/getfinancialreportlist",
+            "doccategories:",
+            '"doccategories"',
+        )
+    )
+    if "widgets.q4app.com/widgets/q4.api" not in lowered and not has_events_module and not has_presentations_module and not has_financial_reports_module:
+        return []
+
+    origin = urlparse(page_url)
+    if origin.scheme not in {"http", "https"} or not origin.netloc:
+        return []
+    path = origin.path.lower()
+    if any(token in path for token in ("/event-details/", "/news-details/", "/presentation-details/", "/sec-filings-details/")):
+        return []
+    base_url = f"{origin.scheme}://{origin.netloc}"
+    links: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add_link(raw_href: str, text: str) -> None:
+        absolute = _normalize_href(page_url, html.unescape(str(raw_href or "")).replace("\\/", "/"))
+        if not absolute or absolute in seen or not _documentish_page_link(absolute):
+            return
+        links.append({"url": absolute, "text": " ".join(str(text or _url_slug_text(absolute)).split())})
+        seen.add(absolute)
+
+    if has_events_module:
+        try:
+            event_payload = _fetch_json_response(
+                f"{base_url}/feed/Event.svc/GetEventList",
+                params={
+                    "pageSize": -1,
+                    "pageNumber": 0,
+                    "tagList": "",
+                    "includeTags": "true",
+                    "year": -1,
+                    "excludeSelection": 1,
+                    "eventSelection": 3,
+                    "eventDateFilter": 3,
+                    "includeFinancialReports": "true",
+                    "includePresentations": "true",
+                    "includePressReleases": "true",
+                    "sortOperator": 1,
+                },
+            )
+        except Exception:
+            event_payload = {}
+        for item in list(event_payload.get("GetEventListResult") or []):
+            title = str(item.get("Title") or "").strip()
+            add_link(str(item.get("LinkToDetailPage") or ""), title)
+            add_link(str(item.get("WebCastLink") or ""), f"{title} webcast")
+            for attachment in list(item.get("Attachments") or []):
+                attachment_title = str(attachment.get("Title") or attachment.get("Type") or "").strip()
+                add_link(str(attachment.get("Url") or ""), f"{title} {attachment_title}".strip())
+            for presentation in list(item.get("EventPresentation") or []):
+                presentation_title = str(presentation.get("Title") or "").strip()
+                add_link(str(presentation.get("LinkToDetailPage") or ""), presentation_title or title)
+                add_link(str(presentation.get("DocumentPath") or ""), f"{presentation_title or title} presentation")
+            for release in list(item.get("EventPressRelease") or []):
+                release_title = str(release.get("Headline") or release.get("Title") or title).strip()
+                add_link(str(release.get("LinkToDetailPage") or ""), release_title)
+                add_link(str(release.get("DocumentPath") or ""), f"{release_title} release")
+
+    if has_presentations_module:
+        try:
+            presentation_payload = _fetch_json_response(
+                f"{base_url}/feed/Presentation.svc/GetPresentationList",
+                params={
+                    "pageSize": -1,
+                    "pageNumber": 0,
+                    "tagList": "",
+                    "includeTags": "true",
+                    "year": -1,
+                    "excludeSelection": 1,
+                    "presentationDateFilter": 3,
+                },
+            )
+        except Exception:
+            presentation_payload = {}
+        for item in list(presentation_payload.get("GetPresentationListResult") or []):
+            title = str(item.get("Title") or "").strip()
+            add_link(str(item.get("LinkToDetailPage") or ""), title)
+            add_link(str(item.get("DocumentPath") or ""), f"{title} presentation")
+            add_link(str(item.get("AudioFile") or ""), f"{title} audio")
+            add_link(str(item.get("VideoFile") or ""), f"{title} video")
+
+    if has_financial_reports_module:
+        try:
+            financial_report_payload = _fetch_json_response(
+                f"{base_url}/feed/FinancialReport.svc/GetFinancialReportList",
+                params={
+                    "pageSize": -1,
+                    "pageNumber": 0,
+                    "reportTypeId": "",
+                    "languageId": 1,
+                    "categoryId": "",
+                    "year": -1,
+                    "excludeSelection": 1,
+                },
+            )
+        except Exception:
+            financial_report_payload = {}
+
+        def financial_document_text(report_title: str, category: str, document_title: str) -> str:
+            category_hint = {
+                "news": "earnings release",
+                "webcast": "webcast transcript",
+                "presentation": "earnings presentation",
+                "annual": "annual report",
+                "tenk": "form 10-k",
+                "tenq": "form 10-q",
+            }.get(category, "")
+            generic_titles = {"pdf", "html", "online", "file"}
+            cleaned_document_title = " ".join(document_title.split())
+            if cleaned_document_title.lower() in generic_titles:
+                cleaned_document_title = ""
+            preferred_suffix = cleaned_document_title or category_hint
+            return " ".join(part for part in (report_title, preferred_suffix) if part).strip()
+
+        for item in list(financial_report_payload.get("GetFinancialReportListResult") or []):
+            report_title = " ".join(
+                str(part or "").strip()
+                for part in (item.get("ReportTitle"), item.get("ReportSubType"))
+                if str(part or "").strip()
+            ).strip()
+            for document in list(item.get("Documents") or []):
+                category = str(document.get("DocumentCategory") or "").strip().lower()
+                document_title = str(document.get("DocumentTitle") or document.get("Title") or "").strip()
+                add_link(
+                    str(document.get("DocumentPath") or ""),
+                    financial_document_text(report_title, category, document_title),
+                )
+    return links
+
+
+def _discover_cached_material_sources(
+    company_id: str,
+    calendar_quarter: str,
+    *,
+    required_roles: Optional[set[str]] = None,
+) -> list[dict[str, Any]]:
+    root = OFFICIAL_MATERIALS_DIR / company_id / calendar_quarter
+    if not root.exists():
+        return []
+    roles = required_roles or {"earnings_release", "earnings_call", "earnings_presentation", "earnings_commentary"}
+    discovered: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for metadata_path in sorted(root.glob("*.json")):
+        cached = _read_cached_submissions(metadata_path)
+        if not isinstance(cached, dict):
+            continue
+        role = str(cached.get("role") or "").strip()
+        kind = str(cached.get("kind") or "").strip()
+        url = str(cached.get("url") or "").strip()
+        if role not in roles or kind not in {"official_release", "sec_filing", "call_summary", "presentation"} or not url:
+            continue
+        if str(cached.get("status") or "").strip() not in {"cached", "fetched"}:
+            continue
+        text_path = Path(str(cached.get("text_path") or "").strip())
+        if not str(text_path) or not text_path.exists():
+            continue
+        if url in seen_urls:
+            continue
+        discovered.append(
+            {
+                "label": str(cached.get("label") or ""),
+                "url": url,
+                "fetch_url": str(cached.get("fetch_url") or ""),
+                "kind": kind,
+                "role": role,
+                "date": str(cached.get("date") or ""),
+            }
+        )
+        seen_urls.add(url)
+    return discovered
 
 
 def _fiscal_period_reference(company: dict[str, Any], period_end: str) -> tuple[Optional[int], Optional[int]]:
@@ -898,11 +1260,16 @@ def _ir_source_score(
         if "news-release-details" in path:
             score += 18
     elif role == "earnings_call":
-        for keyword in ("webcast", "transcript", "earnings call", "conference call", "prepared remarks", "event"):
+        for keyword in ("transcript", "prepared remarks", "webcast replay", "call replay", "conference call", "earnings call", "webcast"):
             if keyword in tokens:
                 score += 24
+        if "event" in tokens:
+            score += 4
         if "/events/" in path:
-            score += 30
+            if any(keyword in tokens for keyword in ("transcript", "prepared remarks", "webcast replay", "call replay", "replay")):
+                score += 12
+            else:
+                score -= 16
     elif role == "earnings_presentation":
         for keyword in ("presentation", "slides", "deck", "supplement", "pdf"):
             if keyword in tokens:
@@ -950,6 +1317,10 @@ def _ir_source_score(
 
     if any(keyword in tokens for keyword in ("annual report", "proxy", "dividend", "esg", "sustainability", "stock information")):
         score -= 26
+    if role == "earnings_release" and any(
+        keyword in tokens for keyword in ("segment revenue", "segment revenues", "segment result", "segment results")
+    ):
+        score -= 30
     return score
 
 
@@ -977,6 +1348,7 @@ def _ir_temporal_alignment(
 
 def _ir_role_keywords_match(link: dict[str, str], role: str) -> bool:
     tokens = _document_tokens(link.get("url", ""), link.get("text", ""))
+    path = urlparse(str(link.get("url") or "")).path.lower()
     looks_like_upcoming_event = any(
         keyword in tokens
         for keyword in (
@@ -994,7 +1366,10 @@ def _ir_role_keywords_match(link: dict[str, str], role: str) -> bool:
     if role == "earnings_call":
         if looks_like_upcoming_event and not has_archived_call_signal:
             return False
-        return any(keyword in tokens for keyword in ("webcast", "transcript", "earnings call", "conference call", "prepared remarks", "call replay"))
+        return any(
+            keyword in tokens
+            for keyword in ("webcast", "transcript", "earnings call", "conference call", "prepared remarks", "call replay", "webcast replay", "replay")
+        )
     if role == "earnings_presentation":
         if any(keyword in tokens for keyword in ("events and presentations", "past events", "upcoming events", "quarterly results")):
             return False
@@ -1011,6 +1386,8 @@ def _ir_role_keywords_match(link: dict[str, str], role: str) -> bool:
     if role == "earnings_release":
         if "to announce" in tokens:
             return False
+        if any(keyword in tokens for keyword in ("segment revenue", "segment revenues", "segment result", "segment results")):
+            return False
         if any(keyword in tokens for keyword in ("earnings call", "conference call", "webcast", "transcript", "prepared remarks", "presentation", "slides", "deck", "/events/")):
             return False
         return any(keyword in tokens for keyword in ("earnings", "financial results", "quarterly results", "press release", "results"))
@@ -1024,8 +1401,42 @@ def _ir_related_link_keywords_match(link: dict[str, str], role: str, page_role: 
     return _ir_role_keywords_match(link, role)
 
 
+def _ir_related_link_tiebreak(link: dict[str, str], role: str) -> int:
+    if role != "earnings_call":
+        return 0
+    tokens = _document_tokens(link.get("url", ""), link.get("text", ""))
+    path = urlparse(str(link.get("url") or "")).path.lower()
+    bonus = 0
+    if any(token in tokens for token in ("transcript", "prepared remarks", "script")):
+        bonus += 30
+    if any(token in tokens for token in ("webcast replay", "call replay", "replay")):
+        bonus += 16
+    if path.endswith(".pdf") and any(token in tokens for token in ("transcript", "prepared remarks")):
+        bonus += 10
+    if "/event-details/" in path:
+        bonus -= 8
+    if any(
+        token in tokens
+        for token in ("already registered", "log in now", "register now", "complete this form to enter the webcast")
+    ):
+        bonus -= 22
+    return bonus
+
+
 def _ir_label(company: dict[str, Any], role: str, text: str) -> str:
     cleaned = " ".join(str(text or "").split())
+    cleaned = re.sub(r"\(opens in new window\)", "", cleaned, flags=re.IGNORECASE).strip(" -–—")
+    english_name = str(company.get("english_name") or "").strip()
+    lowered_cleaned = cleaned.lower()
+    lowered_name = english_name.lower()
+    while lowered_name and lowered_cleaned.startswith(f"{lowered_name} "):
+        cleaned = cleaned[len(english_name) :].strip()
+        lowered_cleaned = cleaned.lower()
+    if (
+        len(cleaned) > 180
+        or any(token in lowered_cleaned for token in ("{", "}", "defaultlocale", "global variables", "//"))
+    ):
+        cleaned = ""
     if cleaned:
         return f"{company['english_name']} {cleaned}"
     if role == "earnings_call":
@@ -1043,6 +1454,197 @@ def _ir_kind_for_role(role: str) -> str:
     if role in {"earnings_presentation", "earnings_commentary"}:
         return "presentation"
     return "official_release"
+
+
+def _wayback_snapshot_url(timestamp: str, original_url: str) -> str:
+    return f"https://web.archive.org/web/{timestamp}if_/{original_url}"
+
+
+def _wayback_cdx_rows(payload: Any) -> list[dict[str, str]]:
+    if isinstance(payload, list) and payload:
+        header = payload[0] if isinstance(payload[0], list) else []
+        rows = payload[1:] if isinstance(header, list) else payload
+        if isinstance(header, list) and {"timestamp", "original"} <= {str(item) for item in header}:
+            normalized: list[dict[str, str]] = []
+            for row in rows:
+                if not isinstance(row, list):
+                    continue
+                item = {
+                    str(header[index]): str(row[index] if index < len(row) else "")
+                    for index in range(len(header))
+                }
+                if item.get("timestamp") and item.get("original"):
+                    normalized.append(item)
+            return normalized
+    return []
+
+
+def _generic_investor_landing_path(url: str) -> bool:
+    path = urlparse(str(url or "")).path.lower().rstrip("/")
+    if path in {
+        "",
+        "/",
+        "/investor",
+        "/investors",
+        "/investor-relations",
+        "/investorrelations",
+        "/en-us/investor",
+        "/en-us/investors",
+        "/events",
+        "/event",
+        "/presentations",
+        "/presentation",
+        "/news",
+        "/media",
+        "/financial-information",
+    }:
+        return True
+    return path.endswith(
+        (
+            "/investor/earnings/default.aspx",
+            "/investors/earnings/default.aspx",
+            "/news/default.aspx",
+            "/events/default.aspx",
+            "/presentations/default.aspx",
+            "/quarterly-results/default.aspx",
+        )
+    )
+
+
+def _wayback_query_patterns(
+    ir_url: str,
+    *,
+    role: str,
+    target_years: set[str],
+    allowed_quarters: set[int],
+) -> list[str]:
+    parsed = urlparse(str(ir_url or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return []
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    trimmed_path = parsed.path.strip("/")
+    path_variants = [trimmed_path] if trimmed_path else []
+    path_variants.extend(
+        [
+            f"assets/{trimmed_path}" if trimmed_path else "",
+            f"files/{trimmed_path}" if trimmed_path else "",
+            f"static-files/{trimmed_path}" if trimmed_path else "",
+            f"static/{trimmed_path}" if trimmed_path else "",
+            f"media/{trimmed_path}" if trimmed_path else "",
+            f"uploads/{trimmed_path}" if trimmed_path else "",
+        ]
+    )
+    if role in {"earnings_call", "earnings_presentation", "earnings_release"}:
+        path_variants.extend(
+            [
+                "assets/investor",
+                "assets/investors",
+                "files/investor",
+                "media/investor",
+                "uploads/investor",
+            ]
+        )
+    patterns: list[str] = []
+    seen: set[str] = set()
+    for path_variant in path_variants or [""]:
+        normalized = f"{origin}/{path_variant.strip('/')}/" if path_variant else f"{origin}/"
+        if normalized not in seen:
+            patterns.append(normalized)
+            seen.add(normalized)
+    return patterns
+
+
+def _discover_wayback_sources(
+    company: dict[str, Any],
+    calendar_quarter: str,
+    period_end: str,
+    *,
+    required_roles: Optional[set[str]] = None,
+) -> list[dict[str, Any]]:
+    ir_url = str(company.get("ir_url") or "").strip()
+    if not ir_url:
+        return []
+    calendar_terms, fiscal_terms, target_years, allowed_quarters = _quarter_reference_terms(company, calendar_quarter, period_end)
+    roles = required_roles or {"earnings_release", "earnings_call", "earnings_presentation"}
+    discovered_rows: dict[str, dict[str, str]] = {}
+    for role in roles:
+        for pattern in _wayback_query_patterns(
+            ir_url,
+            role=role,
+            target_years=target_years,
+            allowed_quarters=allowed_quarters,
+        ):
+            try:
+                payload = _fetch_json_response(
+                    WAYBACK_CDX_URL,
+                    params={
+                        "url": pattern,
+                        "matchType": "prefix",
+                        "output": "json",
+                        "fl": "timestamp,original,statuscode,mimetype",
+                        "filter": "statuscode:200",
+                        "limit": 2000,
+                    },
+                )
+            except Exception:
+                continue
+            for row in _wayback_cdx_rows(payload):
+                original_url = str(row.get("original") or "").strip()
+                if not original_url or _generic_investor_landing_path(original_url):
+                    continue
+                if not _same_domain(ir_url, original_url):
+                    continue
+                existing = discovered_rows.get(original_url)
+                if existing is None or str(row.get("timestamp") or "") > str(existing.get("timestamp") or ""):
+                    discovered_rows[original_url] = row
+
+    selected: list[dict[str, Any]] = []
+    for role in roles:
+        best_source: Optional[dict[str, Any]] = None
+        best_key: tuple[int, int, int] = (-10_000, -10_000, -10_000)
+        for row in discovered_rows.values():
+            original_url = str(row.get("original") or "").strip()
+            timestamp = str(row.get("timestamp") or "").strip()
+            mimetype = str(row.get("mimetype") or "").lower()
+            link = {"url": original_url, "text": _url_slug_text(original_url)}
+            if not _ir_role_keywords_match(link, role):
+                continue
+            if not _ir_temporal_alignment(link, target_years=target_years, allowed_quarters=allowed_quarters):
+                continue
+            score = _ir_source_score(
+                link,
+                role=role,
+                calendar_terms=calendar_terms,
+                fiscal_terms=fiscal_terms,
+                target_years=target_years,
+                allowed_quarters=allowed_quarters,
+                company=company,
+            )
+            score += _ir_related_link_tiebreak(link, role)
+            if "pdf" in mimetype:
+                score += 8
+            if role == "earnings_call" and any(token in _document_tokens(original_url) for token in ("transcript", "prepared remarks", "prepared", "script")):
+                score += 18
+            if role == "earnings_release" and any(token in _document_tokens(original_url) for token in ("annual", "10-k", "20-f")):
+                score -= 30
+            candidate_key = (
+                score,
+                1 if "pdf" in mimetype else 0,
+                int(timestamp or "0"),
+            )
+            if candidate_key > best_key:
+                best_key = candidate_key
+                best_source = {
+                    "label": _ir_label(company, role, _url_slug_text(original_url)),
+                    "url": original_url,
+                    "fetch_url": _wayback_snapshot_url(timestamp, original_url),
+                    "kind": _ir_kind_for_role(role),
+                    "role": role,
+                    "date": f"{timestamp[:4]}-{timestamp[4:6]}-{timestamp[6:8]}" if len(timestamp) >= 8 else "",
+                }
+        if best_source is not None and best_key[0] >= 34:
+            selected.append(best_source)
+    return selected
 
 
 def _discover_related_ir_sources(
@@ -1065,16 +1667,19 @@ def _discover_related_ir_sources(
     page_label = str(page_source.get("label") or "")
     page_role = str(page_source.get("role") or "")
     page_links = _page_links(page_url, html)
-    candidate_roles = {"earnings_call", "earnings_presentation"}
+    for candidate in _q4_public_feed_links(page_url, html):
+        if not any(str(existing.get("url") or "") == str(candidate.get("url") or "") for existing in page_links):
+            page_links.append(candidate)
+    candidate_roles: list[str] = ["earnings_call", "earnings_presentation"]
     if page_role == "earnings_release":
-        candidate_roles = {"earnings_release", "earnings_call", "earnings_presentation"}
+        candidate_roles = ["earnings_release", "earnings_call", "earnings_presentation"]
     elif page_role == "earnings_call":
-        candidate_roles = {"earnings_call"}
+        candidate_roles = ["earnings_call", "earnings_presentation"]
     elif page_role == "earnings_presentation":
-        candidate_roles = {"earnings_presentation"}
+        candidate_roles = ["earnings_call", "earnings_presentation"]
     for role in candidate_roles:
         best_link: Optional[dict[str, str]] = None
-        best_score = 0
+        best_key: tuple[int, int] = (-10_000, -10_000)
         for link in page_links:
             raw_link = {
                 "url": link["url"],
@@ -1082,9 +1687,18 @@ def _discover_related_ir_sources(
             }
             if not _ir_related_link_keywords_match(raw_link, role, page_role):
                 continue
+            link_text = str(link.get("text", "")).strip()
+            link_tokens = _document_tokens(link_text, link.get("url", ""))
+            descriptive_link_text = (
+                len(link_text) >= 32
+                or any(
+                    token in link_tokens
+                    for token in ("transcript", "prepared remarks", "conference call", "earnings call", "presentation", "webcast", "financial results")
+                )
+            )
             contextual_link = {
                 "url": link["url"],
-                "text": f"{page_label} {link.get('text', '')}".strip(),
+                "text": link_text if descriptive_link_text else f"{page_label} {link_text}".strip(),
             }
             if not _ir_temporal_alignment(contextual_link, target_years=target_years, allowed_quarters=allowed_quarters):
                 continue
@@ -1097,10 +1711,12 @@ def _discover_related_ir_sources(
                 allowed_quarters=allowed_quarters,
                 company=company,
             )
-            if score > best_score:
-                best_score = score
+            tie_break = _ir_related_link_tiebreak(contextual_link, role)
+            candidate_key = (score, tie_break)
+            if candidate_key > best_key:
+                best_key = candidate_key
                 best_link = contextual_link
-        if best_link is None or best_score < 38:
+        if best_link is None or best_key[0] < 38:
             continue
         if str(best_link["url"]) == page_url:
             continue
@@ -1116,6 +1732,110 @@ def _discover_related_ir_sources(
     return related
 
 
+def _expand_related_ir_sources(
+    page_sources: list[dict[str, Any]],
+    *,
+    company: dict[str, Any],
+    calendar_terms: set[str],
+    fiscal_terms: set[str],
+    target_years: set[str],
+    allowed_quarters: set[int],
+    max_depth: int = 2,
+) -> list[dict[str, Any]]:
+    expanded: list[dict[str, Any]] = []
+    seen_urls = {str(item.get("url") or "") for item in page_sources if str(item.get("url") or "")}
+    queue: list[tuple[dict[str, Any], int]] = [
+        (dict(item), 0)
+        for item in page_sources
+        if str(item.get("role") or "") in {"earnings_release", "earnings_call", "earnings_presentation"}
+    ]
+    while queue:
+        page_source, depth = queue.pop(0)
+        if depth >= max_depth:
+            continue
+        related_sources = _discover_related_ir_sources(
+            page_source,
+            company=company,
+            calendar_terms=calendar_terms,
+            fiscal_terms=fiscal_terms,
+            target_years=target_years,
+            allowed_quarters=allowed_quarters,
+        )
+        for related in related_sources:
+            related_url = str(related.get("url") or "")
+            if not related_url or related_url in seen_urls:
+                continue
+            expanded.append(related)
+            seen_urls.add(related_url)
+            if str(related.get("role") or "") in {"earnings_release", "earnings_call", "earnings_presentation"}:
+                queue.append((related, depth + 1))
+    return expanded
+
+
+def _infer_historical_ir_page_sources(
+    company: dict[str, Any],
+    period_end: str,
+    known_links: list[dict[str, str]],
+) -> list[dict[str, Any]]:
+    ir_url = str(company.get("ir_url") or "").strip()
+    fiscal_year, fiscal_quarter = _fiscal_period_reference(company, period_end)
+    if not ir_url or fiscal_year is None or fiscal_quarter is None:
+        return []
+
+    def replace_fiscal_reference(url: str) -> Optional[str]:
+        patterns = (
+            re.compile(
+                r"(?P<prefix>.*?)(?P<fy>fy)(?P<sep1>[-_/]?)(?P<year>20\d{2})(?P<sep2>[-_/]?)(?P<q>q)(?P<quarter>[1-4])(?P<suffix>.*)",
+                flags=re.IGNORECASE,
+            ),
+            re.compile(
+                r"(?P<prefix>.*?)(?P<fy>fiscal[-_/]?year)(?P<sep1>[-_/]?)(?P<year>20\d{2})(?P<sep2>[-_/]?)(?P<q>q)(?P<quarter>[1-4])(?P<suffix>.*)",
+                flags=re.IGNORECASE,
+            ),
+        )
+        for pattern in patterns:
+            match = pattern.fullmatch(url)
+            if match is None:
+                continue
+            fy_text = str(match.group("fy") or "")
+            q_text = str(match.group("q") or "")
+            return (
+                f"{match.group('prefix')}"
+                f"{fy_text.upper() if fy_text.isupper() else fy_text}"
+                f"{match.group('sep1')}{fiscal_year}{match.group('sep2')}"
+                f"{q_text.upper() if q_text.isupper() else q_text}{fiscal_quarter}"
+                f"{match.group('suffix')}"
+            )
+        return None
+
+    inferred: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for link in known_links:
+        candidate_url = str(link.get("url") or "").strip()
+        if not candidate_url or not _same_domain(ir_url, candidate_url):
+            continue
+        tokens = _document_tokens(candidate_url, str(link.get("text") or ""))
+        if not any(keyword in tokens for keyword in ("earnings", "results", "press release", "webcast", "financial results")):
+            continue
+        inferred_url = replace_fiscal_reference(candidate_url)
+        if not inferred_url or inferred_url == candidate_url or inferred_url in seen_urls:
+            continue
+        inferred_tokens = _document_tokens(inferred_url, str(link.get("text") or ""))
+        if not any(keyword in inferred_tokens for keyword in ("earnings", "results", "press release", "webcast")):
+            continue
+        inferred.append(
+            {
+                "label": _ir_label(company, "earnings_release", str(link.get("text") or "")),
+                "url": inferred_url,
+                "kind": "official_release",
+                "role": "earnings_release",
+                "date": "",
+            }
+        )
+        seen_urls.add(inferred_url)
+    return inferred
+
+
 def _discover_ir_sources(
     company: dict[str, Any],
     calendar_quarter: str,
@@ -1129,7 +1849,8 @@ def _discover_ir_sources(
         return []
     cache_path = _ir_cache_path(str(company["id"]), calendar_quarter)
     cached = _read_cached_submissions(cache_path)
-    if cached and not refresh and _cache_file_is_fresh(cache_path, IR_DISCOVERY_TTL_SECONDS):
+    cache_is_current = int((cached or {}).get("cache_version") or 0) == IR_DISCOVERY_CACHE_VERSION
+    if cached and cache_is_current and not refresh and _cache_file_is_fresh(cache_path, IR_DISCOVERY_TTL_SECONDS):
         payload_sources = list(cached.get("sources") or [])
         if required_roles:
             payload_sources = [item for item in payload_sources if str(item.get("role") or "") in required_roles]
@@ -1138,7 +1859,7 @@ def _discover_ir_sources(
     try:
         home_html = _fetch_text(ir_url)
     except Exception:
-        return list(cached.get("sources") or []) if cached else []
+        return list(cached.get("sources") or []) if cached and cache_is_current else []
 
     fetched_pages: dict[str, str] = {ir_url: home_html}
     queue: list[tuple[str, int, int]] = [(ir_url, 0, 100)]
@@ -1176,7 +1897,11 @@ def _discover_ir_sources(
     all_links: list[dict[str, str]] = []
     seen_urls: set[str] = set()
     for page_url, html in fetched_pages.items():
-        for link in _page_links(page_url, html):
+        page_links = _page_links(page_url, html)
+        for candidate in _q4_public_feed_links(page_url, html):
+            if not any(str(existing.get("url") or "") == str(candidate.get("url") or "") for existing in page_links):
+                page_links.append(candidate)
+        for link in page_links:
             if not _same_domain(ir_url, link["url"]) or link["url"] in seen_urls:
                 continue
             all_links.append(link)
@@ -1184,6 +1909,14 @@ def _discover_ir_sources(
 
     calendar_terms, fiscal_terms, target_years, allowed_quarters = _quarter_reference_terms(company, calendar_quarter, period_end)
     roles = required_roles or {"earnings_release", "earnings_call", "earnings_presentation", "earnings_commentary"}
+    inferred_page_sources = _infer_historical_ir_page_sources(company, period_end, all_links)
+    if inferred_page_sources:
+        for page_source in inferred_page_sources:
+            inferred_url = str(page_source.get("url") or "")
+            if not inferred_url or inferred_url in seen_urls:
+                continue
+            all_links.append({"url": inferred_url, "text": str(page_source.get("label") or "")})
+            seen_urls.add(inferred_url)
     discovered: list[dict[str, Any]] = []
     for role in roles:
         best_link: Optional[dict[str, str]] = None
@@ -1217,9 +1950,39 @@ def _discover_ir_sources(
             }
         )
 
+    expansion_seed_sources: list[dict[str, Any]] = []
+    seen_seed_urls: set[str] = set()
+    for item in list(inferred_page_sources) + list(discovered):
+        candidate_url = str(item.get("url") or "")
+        candidate_role = str(item.get("role") or "")
+        if not candidate_url or candidate_url in seen_seed_urls:
+            continue
+        if candidate_role not in {"earnings_release", "earnings_call", "earnings_presentation"}:
+            continue
+        expansion_seed_sources.append(item)
+        seen_seed_urls.add(candidate_url)
+    if expansion_seed_sources:
+        related_sources = _expand_related_ir_sources(
+            expansion_seed_sources,
+            company=company,
+            calendar_terms=calendar_terms,
+            fiscal_terms=fiscal_terms,
+            target_years=target_years,
+            allowed_quarters=allowed_quarters,
+        )
+        seen_discovered_urls = {str(item.get("url") or "") for item in discovered}
+        for item in related_sources:
+            item_role = str(item.get("role") or "")
+            item_url = str(item.get("url") or "")
+            if item_role not in roles or not item_url or item_url in seen_discovered_urls:
+                continue
+            discovered.append(item)
+            seen_discovered_urls.add(item_url)
+
     _write_cached_submissions(
         cache_path,
         {
+            "cache_version": IR_DISCOVERY_CACHE_VERSION,
             "company_id": company["id"],
             "calendar_quarter": calendar_quarter,
             "period_end": period_end,
@@ -1308,6 +2071,40 @@ def _discover_sitemap_sources(
             payload = _fetch_text(target_url)
         except Exception:
             return []
+        payload = str(payload or "").strip()
+        if not payload:
+            return []
+        if payload[:1] in {"{", "["}:
+            try:
+                json_payload = json.loads(payload)
+            except json.JSONDecodeError:
+                json_payload = None
+            if json_payload is not None:
+                extracted_urls: list[str] = []
+                stack: list[Any] = [json_payload]
+                while stack:
+                    node = stack.pop()
+                    if isinstance(node, dict):
+                        stack.extend(node.values())
+                    elif isinstance(node, list):
+                        stack.extend(node)
+                    elif isinstance(node, str) and _string_looks_like_link_candidate(node):
+                        extracted_urls.append(node)
+                loc_values = _dedupe_urls([urljoin(target_url, html.unescape(item).replace("\\/", "/")) for item in extracted_urls])
+                nested_sitemap_urls = [item for item in loc_values if item.lower().endswith((".xml", ".json"))]
+                page_urls = [item for item in loc_values if item not in nested_sitemap_urls]
+                if nested_sitemap_urls and not page_urls and depth < 1:
+                    nested_links: list[dict[str, str]] = []
+                    seen_nested: set[str] = set()
+                    for child_url in sorted(nested_sitemap_urls, key=_sitemap_discovery_score, reverse=True)[:8]:
+                        for link in _sitemap_links_from_url(child_url, depth + 1):
+                            link_url = str(link.get("url") or "")
+                            if not link_url or link_url in seen_nested:
+                                continue
+                            nested_links.append(link)
+                            seen_nested.add(link_url)
+                    return nested_links
+                return [{"url": loc, "text": _url_slug_text(loc)} for loc in page_urls or loc_values]
         try:
             root = ET.fromstring(payload)
         except ET.ParseError:
@@ -1391,8 +2188,10 @@ def _discover_default_sitemap_urls(ir_url: str) -> list[str]:
         candidates.extend(
             [
                 f"{base_url}/sitemap.xml",
+                f"{base_url}/sitemap.json",
                 f"{base_url}/sitemap_index.xml",
                 f"{base_url}/sitemap-index.xml",
+                f"{base_url}/sitemap-index.json",
             ]
         )
 
@@ -1463,6 +2262,7 @@ def resolve_official_sources(
     source_config = dict(company.get("official_source") or {})
     existing_sources = list(existing_sources or [])
     cache_key = (
+        IR_DISCOVERY_CACHE_VERSION,
         str(company.get("id") or ""),
         str(calendar_quarter or ""),
         str(period_end or ""),
@@ -1625,6 +2425,35 @@ def resolve_official_sources(
             for role in {"earnings_release", "earnings_call", "earnings_presentation"}
             if role not in resolved_roles or (role == "earnings_release" and ir_url and not has_ir_release)
         }
+        if _historical_sec_coverage_is_sufficient(
+            resolved,
+            period_end,
+            prefer_sec_only=prefer_sec_only,
+            filing_forms=filing_forms,
+        ):
+            if missing_roles <= {"earnings_release"}:
+                missing_roles = set()
+    if missing_roles and not prefer_sec_only:
+        notify(0.74, "正在优先复用本地缓存的历史官方材料来源...")
+        resolved.extend(
+            _discover_cached_material_sources(
+                str(company.get("id") or ""),
+                calendar_quarter,
+                required_roles=missing_roles,
+            )
+        )
+        resolved_roles = {str(item.get("role") or "") for item in resolved}
+        has_ir_release = any(
+            str(item.get("role") or "") == "earnings_release"
+            and ir_url
+            and _same_domain(ir_url, str(item.get("url") or ""))
+            for item in resolved
+        )
+        missing_roles = {
+            role
+            for role in {"earnings_release", "earnings_call", "earnings_presentation"}
+            if role not in resolved_roles or (role == "earnings_release" and ir_url and not has_ir_release)
+        }
     auto_sitemap_urls: list[str] = []
     if missing_roles and ir_url:
         auto_sitemap_urls = _discover_default_sitemap_urls(ir_url)
@@ -1645,20 +2474,14 @@ def resolve_official_sources(
             )
         resolved.extend(sitemap_sources)
         calendar_terms, fiscal_terms, target_years, allowed_quarters = _quarter_reference_terms(company, calendar_quarter, period_end)
-        related_sources: list[dict[str, Any]] = []
-        for source in list(sitemap_sources):
-            if str(source.get("role") or "") not in {"earnings_release", "earnings_call", "earnings_presentation"}:
-                continue
-            related_sources.extend(
-                _discover_related_ir_sources(
-                    source,
-                    company=company,
-                    calendar_terms=calendar_terms,
-                    fiscal_terms=fiscal_terms,
-                    target_years=target_years,
-                    allowed_quarters=allowed_quarters,
-                )
-            )
+        related_sources = _expand_related_ir_sources(
+            list(sitemap_sources),
+            company=company,
+            calendar_terms=calendar_terms,
+            fiscal_terms=fiscal_terms,
+            target_years=target_years,
+            allowed_quarters=allowed_quarters,
+        )
         resolved.extend(related_sources)
         resolved_roles = {str(item.get("role") or "") for item in resolved}
         has_ir_release = any(
@@ -1683,21 +2506,58 @@ def resolve_official_sources(
         )
         resolved.extend(ir_sources)
         calendar_terms, fiscal_terms, target_years, allowed_quarters = _quarter_reference_terms(company, calendar_quarter, period_end)
-        related_sources: list[dict[str, Any]] = []
-        for source in list(ir_sources):
-            if str(source.get("role") or "") not in {"earnings_release", "earnings_call", "earnings_presentation"}:
-                continue
-            related_sources.extend(
-                _discover_related_ir_sources(
-                    source,
-                    company=company,
-                    calendar_terms=calendar_terms,
-                    fiscal_terms=fiscal_terms,
-                    target_years=target_years,
-                    allowed_quarters=allowed_quarters,
-                )
-            )
+        related_sources = _expand_related_ir_sources(
+            list(ir_sources),
+            company=company,
+            calendar_terms=calendar_terms,
+            fiscal_terms=fiscal_terms,
+            target_years=target_years,
+            allowed_quarters=allowed_quarters,
+        )
         resolved.extend(related_sources)
+        resolved_roles = {str(item.get("role") or "") for item in resolved}
+        has_ir_release = any(
+            str(item.get("role") or "") == "earnings_release"
+            and ir_url
+            and _same_domain(ir_url, str(item.get("url") or ""))
+            for item in resolved
+        )
+        missing_roles = {
+            role
+            for role in {"earnings_release", "earnings_call", "earnings_presentation"}
+            if role not in resolved_roles or (role == "earnings_release" and ir_url and not has_ir_release)
+        }
+    if missing_roles and ir_url and not prefer_sec_only:
+        notify(0.93, "正在通过 Wayback 补齐历史财报、电话会与演示材料...")
+        resolved.extend(
+            _discover_wayback_sources(
+                company,
+                calendar_quarter,
+                period_end,
+                required_roles=missing_roles,
+            )
+        )
+        resolved_roles = {str(item.get("role") or "") for item in resolved}
+        has_ir_release = any(
+            str(item.get("role") or "") == "earnings_release"
+            and ir_url
+            and _same_domain(ir_url, str(item.get("url") or ""))
+            for item in resolved
+        )
+        missing_roles = {
+            role
+            for role in {"earnings_release", "earnings_call", "earnings_presentation"}
+            if role not in resolved_roles or (role == "earnings_release" and ir_url and not has_ir_release)
+        }
+    if missing_roles and not prefer_sec_only:
+        notify(0.97, "正在回流已缓存的历史官方材料，补齐缺失来源...")
+        resolved.extend(
+            _discover_cached_material_sources(
+                str(company.get("id") or ""),
+                calendar_quarter,
+                required_roles=missing_roles,
+            )
+        )
 
     merged = _merge_sources(existing_sources, resolved)
     if not refresh:

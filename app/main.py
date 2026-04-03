@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -8,7 +10,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .config import APP_TITLE, DEFAULT_HISTORY_WINDOW, STATIC_DIR, TEMPLATES_DIR
+from .config import APP_TITLE, DEFAULT_HISTORY_WINDOW, EXPORT_DIR, STATIC_DIR, TEMPLATES_DIR
 from .db import init_db
 from .schemas import (
     ReportCreateRequest,
@@ -20,8 +22,8 @@ from .schemas import (
     SkillReportResponse,
     UploadResponse,
 )
-from .services.pdf_export import export_html_to_pdf
-from .services.local_data import normalize_calendar_quarter_input, resolve_company_reference, suggest_company_matches
+from .services.pdf_export import export_html_to_pdf, pdf_export_signature
+from .services.local_data import normalize_calendar_quarter_input, resolve_company_reference
 from .services.reports import (
     company_cards,
     company_quarters,
@@ -31,9 +33,10 @@ from .services.reports import (
     get_report,
     get_report_job,
     resolve_canonical_report_id,
-    update_report_pdf,
+    update_report_artifacts,
 )
 from .services.uploads import create_upload
+from .utils import slugify
 
 
 app = FastAPI(title=APP_TITLE)
@@ -70,6 +73,79 @@ def _report_context(record: dict[str, Any], show_toolbar: bool) -> dict[str, Any
 
 def render_report_html(record: dict[str, Any], show_toolbar: bool) -> str:
     return templates.env.get_template("report_document.html").render(**_report_context(record, show_toolbar))
+
+
+def _report_export_stem(record: dict[str, Any]) -> str:
+    return slugify(f"{record['company_id']}-{record['calendar_quarter']}-deep-report")
+
+
+def _report_html_output_path(record: dict[str, Any]) -> Path:
+    return EXPORT_DIR / f"{_report_export_stem(record)}.html"
+
+
+def _report_pdf_metadata_path(record: dict[str, Any], pdf_path: str | None = None) -> Path:
+    candidate = str(pdf_path or record.get("pdf_path") or "").strip()
+    if candidate:
+        resolved = Path(candidate)
+        return resolved.with_name(f"{resolved.name}.meta.json")
+    return EXPORT_DIR / f"{_report_export_stem(record)}.pdf.meta.json"
+
+
+def _report_export_source_hash(html_content: str) -> str:
+    return hashlib.sha256(html_content.encode("utf-8")).hexdigest()
+
+
+def _load_report_export_metadata(record: dict[str, Any], pdf_path: str | None = None) -> dict[str, Any] | None:
+    metadata_path = _report_pdf_metadata_path(record, pdf_path)
+    try:
+        return json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_report_export_metadata(
+    record: dict[str, Any],
+    *,
+    html_content: str,
+    html_path: str,
+    pdf_path: str,
+) -> None:
+    metadata_path = _report_pdf_metadata_path(record, pdf_path)
+    payload = {
+        "source_hash": _report_export_source_hash(html_content),
+        "pdf_profile_signature": pdf_export_signature(),
+        "html_path": html_path,
+        "pdf_path": pdf_path,
+    }
+    metadata_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _can_reuse_report_export(record: dict[str, Any], *, html_content: str, html_path: str, pdf_path: str) -> bool:
+    html_file = Path(html_path)
+    pdf_file = Path(pdf_path)
+    if not html_file.exists() or not pdf_file.exists():
+        return False
+    try:
+        if html_file.read_text(encoding="utf-8") != html_content:
+            return False
+    except OSError:
+        return False
+    metadata = _load_report_export_metadata(record, pdf_path)
+    if not metadata:
+        return False
+    return (
+        metadata.get("source_hash") == _report_export_source_hash(html_content)
+        and metadata.get("pdf_profile_signature") == pdf_export_signature()
+        and metadata.get("html_path") == html_path
+        and metadata.get("pdf_path") == pdf_path
+    )
+
+
+def _write_report_html(record: dict[str, Any], *, show_toolbar: bool = False) -> str:
+    html_content = render_report_html(record, show_toolbar=show_toolbar)
+    output_path = _report_html_output_path(record)
+    output_path.write_text(html_content, encoding="utf-8")
+    return str(output_path)
 
 
 def _skill_diagnostic(
@@ -118,10 +194,6 @@ def _resolve_skill_inputs(company_value: str, quarter_value: str) -> tuple[dict[
             ),
         ) from exc
     except KeyError as exc:
-        suggestions = [
-            f"{item['english_name']} ({item['ticker']})"
-            for item in suggest_company_matches(company_value, limit=5)
-        ]
         raise HTTPException(
             status_code=404,
             detail=_skill_error_detail(
@@ -131,9 +203,8 @@ def _resolve_skill_inputs(company_value: str, quarter_value: str) -> tuple[dict[
                         "company_not_resolved",
                         "resolve_company",
                         "error",
-                        f"无法识别公司输入“{company_value}”。",
-                        recovery_hint="请改用更标准的英文名、中文名或股票代码。",
-                        suggestions=suggestions,
+                        f"当前未能解析公司输入“{company_value}”。",
+                        recovery_hint="请改用更完整的公司英文名或股票代码（ticker）重试。",
                     )
                 ],
             ),
@@ -259,22 +330,53 @@ def _skill_payload_diagnostics(report_payload: dict[str, Any], pdf_error: str | 
     return diagnostics
 
 
-def _ensure_report_pdf(record: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+def _ensure_report_files(record: dict[str, Any]) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    html_download_url = f"/reports/{record['id']}/download.html"
+    pdf_download_url = f"/reports/{record['id']}/download.pdf"
+    html_path = str(record.get("html_path") or "").strip()
     existing_pdf_path = str(record.get("pdf_path") or "").strip()
-    if existing_pdf_path and Path(existing_pdf_path).exists():
-        return (f"/reports/{record['id']}/download.pdf", None)
+    html_exists = bool(html_path) and Path(html_path).exists()
+    pdf_exists = bool(existing_pdf_path) and Path(existing_pdf_path).exists()
+    html_content = render_report_html(record, show_toolbar=False)
+    if html_exists and pdf_exists and _can_reuse_report_export(
+        record,
+        html_content=html_content,
+        html_path=html_path,
+        pdf_path=existing_pdf_path,
+    ):
+        return (html_download_url, pdf_download_url, None, None)
+    generated_html_path: Optional[str] = None
     try:
-        html_content = render_report_html(record, show_toolbar=False)
-        filename_stem = f"{record['company_id']}-{record['calendar_quarter']}-deep-report"
+        html_output_path = _report_html_output_path(record)
+        html_output_path.write_text(html_content, encoding="utf-8")
+        generated_html_path = str(html_output_path)
+        filename_stem = _report_export_stem(record)
         pdf_path = export_html_to_pdf(filename_stem, html_content)
-        update_report_pdf(record["id"], pdf_path)
-        return (f"/reports/{record['id']}/download.pdf", None)
+        update_report_artifacts(record["id"], html_path=generated_html_path, pdf_path=pdf_path)
+        _write_report_export_metadata(
+            record,
+            html_content=html_content,
+            html_path=generated_html_path,
+            pdf_path=pdf_path,
+        )
+        return (html_download_url, pdf_download_url, generated_html_path, None)
     except Exception as exc:  # pragma: no cover - environment dependent
-        return (None, f"PDF export failed: {exc}")
+        if generated_html_path and Path(generated_html_path).exists():
+            update_report_artifacts(record["id"], html_path=generated_html_path)
+            return (html_download_url, None, generated_html_path, f"PDF export failed: {exc}")
+        if html_exists:
+            return (html_download_url, None, html_path, f"PDF export failed: {exc}")
+        try:
+            html_path = _write_report_html(record, show_toolbar=False)
+            update_report_artifacts(record["id"], html_path=html_path)
+            return (html_download_url, None, html_path, f"PDF export failed: {exc}")
+        except Exception as html_exc:  # pragma: no cover - environment dependent
+            return (None, None, None, f"HTML/PDF export failed: {html_exc}; PDF export failed: {exc}")
 
 
 def _skill_job_response_payload(job: dict[str, Any], *, ensure_pdf: bool) -> SkillReportJobResponse:
     company = resolve_company_reference(str(job.get("company_id") or ""))
+    html_download_url = None
     pdf_download_url = None
     pdf_error = None
     diagnostics: list[dict[str, Any]] = []
@@ -294,7 +396,7 @@ def _skill_job_response_payload(job: dict[str, Any], *, ensure_pdf: bool) -> Ski
                 )
             )
         else:
-            pdf_download_url, pdf_error = _ensure_report_pdf(record)
+            html_download_url, pdf_download_url, _html_path, pdf_error = _ensure_report_files(record)
             diagnostics.extend(_skill_payload_diagnostics(dict(record.get("payload") or {}), pdf_error))
     if str(job.get("status") or "") == "failed":
         diagnostics.append(
@@ -321,6 +423,7 @@ def _skill_job_response_payload(job: dict[str, Any], *, ensure_pdf: bool) -> Ski
         report_id=str(report_id) if report_id else None,
         error=job.get("error"),
         preview_url=job.get("preview_url"),
+        html_download_url=html_download_url,
         export_pdf_url=job.get("export_pdf_url"),
         pdf_download_url=pdf_download_url,
         pdf_error=pdf_error,
@@ -390,6 +493,7 @@ def create_report_endpoint(payload: ReportCreateRequest) -> ReportResponse:
         structure_dimension_used=record["structure_dimension_used"],
         coverage_warnings=report_payload["coverage_warnings"],
         preview_url=f"/reports/{report_id}/preview",
+        html_download_url=f"/reports/{report_id}/download.html",
         export_pdf_url=f"/reports/{report_id}/export.pdf",
         payload=report_payload,
     )
@@ -413,16 +517,15 @@ def create_skill_report_endpoint(payload: SkillReportCreateRequest) -> SkillRepo
 
     report_payload = record["payload"]
     report_id = record["id"]
+    html_download_url = None
+    html_path = None
     pdf_download_url = None
     pdf_error = None
     try:
-        html_content = render_report_html(record, show_toolbar=False)
-        filename_stem = f"{record['company_id']}-{record['calendar_quarter']}-deep-report"
-        pdf_path = export_html_to_pdf(filename_stem, html_content)
-        update_report_pdf(report_id, pdf_path)
-        pdf_download_url = f"/reports/{report_id}/download.pdf"
+        html_download_url, pdf_download_url, html_path, pdf_error = _ensure_report_files(record)
     except Exception as exc:  # pragma: no cover - environment dependent
-        pdf_error = f"PDF export failed: {exc}"
+        pdf_error = str(exc)
+    refreshed_record = get_report(report_id)
     diagnostics = _skill_payload_diagnostics(report_payload, pdf_error)
 
     return SkillReportResponse(
@@ -435,8 +538,11 @@ def create_skill_report_endpoint(payload: SkillReportCreateRequest) -> SkillRepo
         structure_dimension_used=record["structure_dimension_used"],
         coverage_warnings=report_payload["coverage_warnings"],
         preview_url=f"/reports/{report_id}/preview",
+        html_download_url=html_download_url or f"/reports/{report_id}/download.html",
         export_pdf_url=f"/reports/{report_id}/export.pdf",
+        html_path=html_path or str(refreshed_record.get("html_path") or "") or None,
         pdf_download_url=pdf_download_url,
+        pdf_path=str(refreshed_record.get("pdf_path") or "") or None,
         pdf_error=pdf_error,
         diagnostics=diagnostics,
         payload=report_payload,
@@ -513,6 +619,7 @@ def report_endpoint(report_id: str) -> JSONResponse:
             "structure_dimension_used": record["structure_dimension_used"],
             "coverage_warnings": record["payload"]["coverage_warnings"],
             "preview_url": f"/reports/{record['id']}/preview",
+            "html_download_url": f"/reports/{record['id']}/download.html",
             "export_pdf_url": f"/reports/{record['id']}/export.pdf",
             "payload": record["payload"],
         }
@@ -541,20 +648,60 @@ def export_report(report_id: str) -> JSONResponse:
         record = get_report(report_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    html_content = render_report_html(record, show_toolbar=False)
-    filename_stem = f"{record['company_id']}-{record['calendar_quarter']}-deep-report"
     try:
-        pdf_path = export_html_to_pdf(filename_stem, html_content)
+        html_download_url, pdf_download_url, html_path, pdf_error = _ensure_report_files(record)
     except Exception as exc:  # pragma: no cover - environment dependent
         raise HTTPException(status_code=500, detail=f"PDF export failed: {exc}") from exc
-    update_report_pdf(report_id, pdf_path)
+    refreshed = get_report(report_id)
+    if pdf_error or not refreshed.get("pdf_path"):
+        raise HTTPException(status_code=500, detail=pdf_error or "PDF export failed: file was not materialized.")
     return JSONResponse(
         {
             "report_id": report_id,
-            "pdf_path": pdf_path,
-            "download_url": f"/reports/{report_id}/download.pdf",
+            "html_path": html_path or str(refreshed.get("html_path") or "") or None,
+            "html_download_url": html_download_url,
+            "pdf_path": str(refreshed.get("pdf_path") or ""),
+            "download_url": pdf_download_url,
         }
     )
+
+
+@app.post("/reports/{report_id}/export.html")
+def export_report_html(report_id: str) -> JSONResponse:
+    canonical_id = resolve_canonical_report_id(report_id)
+    if canonical_id and canonical_id != report_id:
+        report_id = canonical_id
+    try:
+        record = get_report(report_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    html_path = _write_report_html(record, show_toolbar=False)
+    update_report_artifacts(report_id, html_path=html_path)
+    return JSONResponse(
+        {
+            "report_id": report_id,
+            "html_path": html_path,
+            "download_url": f"/reports/{report_id}/download.html",
+        }
+    )
+
+
+@app.get("/reports/{report_id}/download.html")
+def download_report_html(report_id: str) -> FileResponse:
+    canonical_id = resolve_canonical_report_id(report_id)
+    if canonical_id and canonical_id != report_id:
+        report_id = canonical_id
+    try:
+        record = get_report(report_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    html_path = str(record.get("html_path") or "").strip()
+    path = Path(html_path) if html_path else None
+    if path is None or not path.exists():
+        html_path = _write_report_html(record, show_toolbar=False)
+        update_report_artifacts(report_id, html_path=html_path)
+        path = Path(html_path)
+    return FileResponse(path, media_type="text/html; charset=utf-8", filename=path.name)
 
 
 @app.get("/reports/{report_id}/download.pdf")
@@ -566,10 +713,15 @@ def download_report_pdf(report_id: str) -> FileResponse:
         record = get_report(report_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    pdf_path = record.get("pdf_path")
-    if not pdf_path:
-        raise HTTPException(status_code=404, detail="PDF has not been exported yet.")
-    path = Path(pdf_path)
+    pdf_path = str(record.get("pdf_path") or "").strip()
+    path = Path(pdf_path) if pdf_path else None
+    if path is None or not path.exists():
+        _, _, _, pdf_error = _ensure_report_files(record)
+        refreshed = get_report(report_id)
+        pdf_path = str(refreshed.get("pdf_path") or "").strip()
+        path = Path(pdf_path) if pdf_path else None
+        if pdf_error or path is None:
+            raise HTTPException(status_code=404, detail=pdf_error or "PDF has not been exported yet.")
     if not path.exists():
         raise HTTPException(status_code=404, detail="Exported PDF file is missing.")
     return FileResponse(path, media_type="application/pdf", filename=path.name)

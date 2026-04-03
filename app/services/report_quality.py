@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
+
+from .narrative_writer import narrative_template_markers
 
 
 FALLBACK_MARKERS = (
@@ -10,6 +13,10 @@ FALLBACK_MARKERS = (
     "回溯",
     "限制说明",
     "内置口径",
+    "没有完整电话会",
+    "原始材料不足",
+    "近几季常态",
+    "替代阅读",
 )
 FULL_COVERAGE_CORE_MARKERS = (
     "结构",
@@ -30,6 +37,38 @@ FALLBACK_WARNING_EXEMPT_SNIPPETS = (
     "未披露字段才回退到内置口径",
     "若部分字段仍未披露，再回退到结构化季度财务序列与统一研究模板",
 )
+NARRATIVE_TEMPLATE_MARKERS = narrative_template_markers()
+NARRATIVE_PROVENANCE_MARKERS = (
+    "来源：",
+    "依据：",
+    "核对：",
+    "这页主要依据",
+    "原始材料",
+    "财报稿",
+    "filling",
+    "filing",
+    "transcript",
+)
+
+
+def _topic_note_looks_placeholder(note: Any) -> bool:
+    cleaned = re.sub(r"\s+", " ", str(note or "")).strip()
+    if not cleaned:
+        return True
+    if any(marker in cleaned for marker in ("关键词聚类", "来自自动抓取的官方电话会材料", "来自官方补充材料", "来自手动上传 transcript")):
+        return True
+    if "..." in cleaned or "…" in cleaned:
+        return True
+    if re.search(r"(?:同比|环比)\s*[-–—]", cleaned):
+        return True
+    if cleaned.endswith(("...", "…", "-", "—", "–", ":", "：", ",", "，")):
+        return True
+    readable_terms = re.findall(r"[A-Za-z\u4e00-\u9fff]{2,}", cleaned)
+    return len(readable_terms) < 3
+
+
+def _placeholder_topic_count(items: list[dict[str, Any]]) -> int:
+    return sum(1 for item in items if _topic_note_looks_placeholder(item.get("note")))
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -78,6 +117,56 @@ def _issue(severity: str, code: str, message: str) -> dict[str, str]:
 def _has_any_marker(text: str, markers: tuple[str, ...]) -> bool:
     lowered = str(text or "").casefold()
     return any(marker.casefold() in lowered for marker in markers)
+
+
+def _collect_narrative_lines(payload: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    lines.append(str(payload.get("headline") or ""))
+    lines.extend(str(item) for item in list(payload.get("takeaways") or []))
+    for item in _non_empty_items(payload.get("layered_takeaways")):
+        lines.append(str(item.get("title") or ""))
+        lines.append(str(item.get("body") or ""))
+    call_panel = dict(payload.get("call_panel") or {})
+    lines.append(str(call_panel.get("title") or ""))
+    lines.extend(str(item) for item in list(call_panel.get("meta_lines") or []))
+    lines.extend(str(item) for item in list(call_panel.get("bullets") or []))
+    institutional_digest = dict(payload.get("institutional_digest") or {})
+    lines.append(str(institutional_digest.get("title") or ""))
+    lines.extend(str(item) for item in list(institutional_digest.get("bullets") or []))
+    for item in _non_empty_items(payload.get("management_themes")):
+        lines.append(str(item.get("label") or ""))
+        lines.append(str(item.get("note") or ""))
+    for item in _non_empty_items(payload.get("qna_themes")):
+        lines.append(str(item.get("label") or ""))
+        lines.append(str(item.get("note") or ""))
+    return [re.sub(r"\s+", " ", line).strip() for line in lines if str(line or "").strip()]
+
+
+def _template_phrase_hits(lines: list[str]) -> int:
+    hits = 0
+    for line in lines:
+        if _has_any_marker(line, NARRATIVE_TEMPLATE_MARKERS):
+            hits += 1
+    return hits
+
+
+def _repeated_ngram_hits(lines: list[str], *, n: int = 6) -> int:
+    counts: dict[str, set[int]] = {}
+    for index, line in enumerate(lines):
+        compact = re.sub(r"[^\w\u4e00-\u9fff]+", "", line.casefold())
+        if len(compact) < n * 2:
+            continue
+        grams = {compact[offset : offset + n] for offset in range(len(compact) - n + 1)}
+        for gram in grams:
+            counts.setdefault(gram, set()).add(index)
+    return sum(1 for seen_in_lines in counts.values() if len(seen_in_lines) >= 3)
+
+
+def _provenance_heavy_ratio(lines: list[str]) -> float:
+    if not lines:
+        return 0.0
+    provenance_lines = sum(1 for line in lines if _has_any_marker(line, NARRATIVE_PROVENANCE_MARKERS))
+    return provenance_lines / len(lines)
 
 
 def evaluate_report_payload(
@@ -173,6 +262,24 @@ def evaluate_report_payload(
         issues.append(_issue("major", "qna_sparse", "问答主题过少，电话会页信息密度不足。"))
     if len(management_themes) < 2:
         issues.append(_issue("minor", "management_theme_sparse", "管理层主题数量偏少。"))
+    qna_placeholder_count = _placeholder_topic_count(qna_themes)
+    management_placeholder_count = _placeholder_topic_count(management_themes)
+    if qna_placeholder_count > 0:
+        issues.append(
+            _issue(
+                "major" if qna_placeholder_count >= min(2, len(qna_themes)) else "minor",
+                "qna_placeholder_topics",
+                f"问答主题里仍有 {qna_placeholder_count} 条占位/模板化摘要，电话会页可读性不足。",
+            )
+        )
+    if management_placeholder_count > 0:
+        issues.append(
+            _issue(
+                "major" if management_placeholder_count >= 2 else "minor",
+                "management_placeholder_topics",
+                f"管理层主题里仍有 {management_placeholder_count} 条占位/模板化摘要，执行层信号不够完整。",
+            )
+        )
     if len(evidence_cards) < 2:
         issues.append(_issue("major", "evidence_sparse", "证据卡片不足，回溯原文的可验证性下降。"))
 
@@ -187,6 +294,21 @@ def evaluate_report_payload(
         issues.append(_issue("critical", "source_material_not_extracted", "官方源材料已定位但未提取出可解析文本。"))
     if source_materials and failed_materials and len(failed_materials) >= max(2, len(source_materials) // 2):
         issues.append(_issue("major", "source_material_fail_ratio_high", "官方材料抓取失败比例较高，建议重跑并检查源站解析策略。"))
+
+    narrative_lines = _collect_narrative_lines(normalized)
+    template_phrase_hits = _template_phrase_hits(narrative_lines)
+    repeated_ngram_hits = _repeated_ngram_hits(narrative_lines)
+    provenance_heavy_ratio = _provenance_heavy_ratio(narrative_lines)
+    if template_phrase_hits >= 3:
+        issues.append(_issue("major", "narrative_template_language", "报告文案里仍有较明显的模板化或系统提示式表达。"))
+    elif template_phrase_hits >= 1:
+        issues.append(_issue("minor", "narrative_template_language", "报告文案里还有少量模板化表达。"))
+    if repeated_ngram_hits >= 18:
+        issues.append(_issue("major", "narrative_repetition_high", "报告文案重复度偏高，读起来仍像自动拼接。"))
+    elif repeated_ngram_hits >= 10:
+        issues.append(_issue("minor", "narrative_repetition_high", "报告文案存在可感知的重复句型。"))
+    if provenance_heavy_ratio >= 0.33:
+        issues.append(_issue("minor", "narrative_provenance_too_dense", "正文里来源/方法说明占比偏高，影响阅读流畅度。"))
 
     if require_full_coverage:
         if structure_dimension == "management":
@@ -251,6 +373,10 @@ def evaluate_report_payload(
             issues.append(_issue("critical", "full_coverage_qna_sparse", "Full coverage 模式要求至少 3 条电话会/问答主题。"))
         if len(management_themes) < 3:
             issues.append(_issue("critical", "full_coverage_management_sparse", "Full coverage 模式要求至少 3 条管理层主题。"))
+        if qna_placeholder_count > 0:
+            issues.append(_issue("critical", "full_coverage_qna_placeholder_topics", "Full coverage 模式不允许问答主题保留占位/模板化摘要。"))
+        if management_placeholder_count > 0:
+            issues.append(_issue("critical", "full_coverage_management_placeholder_topics", "Full coverage 模式不允许管理层主题保留占位/模板化摘要。"))
         if len(evidence_cards) < 3:
             issues.append(_issue("critical", "full_coverage_evidence_sparse", "Full coverage 模式要求至少 3 张证据卡片。"))
 
@@ -323,6 +449,11 @@ def evaluate_report_payload(
         "geography_to_revenue_ratio": geo_ratio,
         "segment_history_coverage": _coverage_ratio(history, "segments"),
         "geography_history_coverage": _coverage_ratio(history, "geographies"),
+        "narrative_template_phrase_hits": template_phrase_hits,
+        "narrative_repeated_ngram_hits": repeated_ngram_hits,
+        "narrative_provenance_heavy_ratio": provenance_heavy_ratio,
+        "qna_placeholder_topic_count": qna_placeholder_count,
+        "management_placeholder_topic_count": management_placeholder_count,
     }
 
     return {

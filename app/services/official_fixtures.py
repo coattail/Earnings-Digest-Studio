@@ -29,6 +29,8 @@ BRAND_SEGMENT_COLOR_UPDATES = {
         "Other Bets": "#64748B",
     },
     "amazon": {
+        "Media": "#111827",
+        "Electronics and other general merchandise": "#F59E0B",
         "North America": "#111827",
         "International": "#F59E0B",
         "AWS": "#2563EB",
@@ -75,7 +77,8 @@ OFFICIAL_MAG7_FIXTURES = {
             "net_income_bn": 42.097,
             "net_income_yoy_pct": 15.9,
             "operating_cash_flow_bn": 53.948,
-            "free_cash_flow_bn": None,
+            "free_cash_flow_bn": 51.575,
+            "capital_expenditures_bn": 2.373,
             "gaap_eps": 2.84,
             "non_gaap_eps": 2.84,
         },
