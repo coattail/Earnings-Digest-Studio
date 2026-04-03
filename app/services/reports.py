@@ -5847,12 +5847,18 @@ def _quarterize_fixture_geographies(fixture: dict[str, Any]) -> dict[str, Any]:
 
 
 def _promote_geographies_as_segments(
+    company: dict[str, Any],
     fixture: dict[str, Any],
 ) -> dict[str, Any]:
     normalized = dict(fixture)
     segments = list(normalized.get("current_segments") or [])
     geographies = list(normalized.get("current_geographies") or [])
     if segments or len(geographies) < 2:
+        return normalized
+    if len(list(company.get("segment_order") or [])) >= 2:
+        return normalized
+    blocked_scopes = {"annual_filing", "quarterly_mapped_from_official_geography", "regional_segment"}
+    if any(str(item.get("scope") or "").casefold() in blocked_scopes for item in geographies):
         return normalized
     normalized["current_segments"] = [
         {
@@ -7350,7 +7356,7 @@ def build_report_payload(
     fixture["current_segments"] = _normalize_segment_items(company, list(fixture.get("current_segments") or []))
     fixture = _sanitize_fixture_payload(company, fixture, history[-1])
     fixture = _quarterize_fixture_geographies(fixture)
-    fixture = _promote_geographies_as_segments(fixture)
+    fixture = _promote_geographies_as_segments(company, fixture)
     history = _refresh_latest_history_entry(company, history, fixture)
     _emit_progress(progress_callback, 0.81, "history", f"正在用官方结构补齐近 {int(history_window)} 季口径...")
     history = _enrich_history_with_official_structures(
@@ -7377,7 +7383,7 @@ def build_report_payload(
     fixture["current_segments"] = _normalize_segment_items(company, list(fixture.get("current_segments") or []))
     fixture = _sanitize_fixture_payload(company, fixture, history[-1])
     fixture = _quarterize_fixture_geographies(fixture)
-    fixture = _promote_geographies_as_segments(fixture)
+    fixture = _promote_geographies_as_segments(company, fixture)
     fixture = _quarterize_fixture_geographies(fixture)
     fixture = _refresh_fixture_growth_metrics_from_history(company, fixture, history)
     fixture["guidance"] = _resolve_guidance_payload(fixture["guidance"], history)

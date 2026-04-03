@@ -8192,11 +8192,17 @@ def _walmart_segment_row(
     label: str,
     canonical_name: str,
 ) -> Optional[dict[str, Any]]:
-    pattern = (
+    legacy_pattern = (
         rf"{_table_label_pattern(label)}\s*\$?\s*([0-9]+(?:\.[0-9]+)?)\s*\$?\s*([0-9]+(?:\.[0-9]+)?)\s+"
         rf"{_table_pct_pattern()}\s*%\s+"
     )
-    match = _search(pattern, flat_text)
+    modern_pattern = (
+        rf"{_table_label_pattern(label)}\s+Q[1-4]\s+FY[0-9]{{2,4}}\s+Q[1-4]\s+FY[0-9]{{2,4}}\s+Change"
+        rf"(?:\s+FY[0-9]{{2,4}}\s+FY[0-9]{{2,4}}\s+Change)?\s+"
+        rf"Net sales\s+\$?\s*([0-9]+(?:\.[0-9]+)?)\s+\$?\s*([0-9]+(?:\.[0-9]+)?)\s+"
+        rf"\$?\s*\(?-?[0-9]+(?:\.[0-9]+)?\)?\s+{_table_pct_pattern()}\s*%"
+    )
+    match = _search(modern_pattern, flat_text) or _search(legacy_pattern, flat_text)
     if not match:
         return None
     current_bn = _bn_from_billions(match.group(1))
@@ -8225,6 +8231,8 @@ def _parse_walmart(
     segments = _segment_list(
         _walmart_segment_row(flat, "Walmart U.S.", "Walmart U.S."),
         _walmart_segment_row(flat, "Walmart International", "Walmart International"),
+        _walmart_segment_row(flat, "Sam's Club U.S.", "Sam's Club U.S."),
+        _walmart_segment_row(flat, "Sam’s Club U.S.", "Sam's Club U.S."),
         _walmart_segment_row(flat, "Sam's Club", "Sam's Club U.S."),
         _walmart_segment_row(flat, "Sam’s Club", "Sam's Club U.S."),
     )
@@ -8233,21 +8241,11 @@ def _parse_walmart(
     if not _segments_reasonable_for_revenue(segments, revenue_bn):
         return parsed
 
-    geographies = [
-        {
-            "name": str(item.get("name") or ""),
-            "value_bn": float(item.get("value_bn") or 0.0),
-            "yoy_pct": item.get("yoy_pct"),
-        }
-        for item in segments
-        if float(item.get("value_bn") or 0.0) > 0
-    ]
     updates = _clean_mapping(
         {
             "current_segments": segments,
-            "current_geographies": geographies,
             "coverage_notes": [
-                "Walmart 历史季度会优先解析官方 earnings release 的 Net Sales table，并将其地区经营单元口径同步映射到地区结构页。"
+                "Walmart 当前季度会优先解析官方 earnings release 的分部 Net sales table，业务结构以 Walmart U.S. / Walmart International / Sam's Club U.S. 官方口径为准。"
             ],
         }
     )

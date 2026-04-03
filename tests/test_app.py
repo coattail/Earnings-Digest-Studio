@@ -2305,11 +2305,45 @@ class EarningsDigestStudioTestCase(unittest.TestCase):
             [item["name"] for item in parsed["current_segments"]],
             ["Walmart U.S.", "Walmart International", "Sam's Club U.S."],
         )
+        self.assertFalse(parsed.get("current_geographies"))
+        self.assertAlmostEqual(parsed["current_segments"][0]["value_bn"], 74.665, places=3)
+
+    def test_parse_official_materials_walmart_extracts_modern_release_segment_cards(self) -> None:
+        release_path = self._write_temp_text(
+            "walmart-modern-release.txt",
+            (
+                "Walmart U.S. Q4 FY26 Q4 FY25 Change FY26 FY25 Change "
+                "Net sales $129.2 $123.5 $5.7 4.6% $466.9 $450.2 $16.7 3.7% "
+                "Membership and other income $1.7 $1.5 $0.2 12.4% $6.6 $5.9 $0.7 11.1% "
+                "Operating income $6.5 $5.9 $0.6 11.0% $24.8 $22.7 $2.1 9.3% "
+                "Walmart International Q4 FY26 Q4 FY25 Change FY26 FY25 Change "
+                "Net sales $37.7 $32.7 $5.0 15.3% $121.9 $116.5 $5.4 4.6% "
+                "Membership and other income $0.0 $0.0 -- -- $0.1 $0.0 -- -- "
+                "Operating income $1.4 $1.4 $(0.0) (2.3)% $5.2 $5.7 $(0.5) (7.9)% "
+                "Sam's Club U.S. Q4 FY26 Q4 FY25 Change FY26 FY25 Change "
+                "Net sales $23.1 $22.4 $0.7 3.0% $90.2 $86.0 $4.2 4.9% "
+                "Membership and other income $1.2 $1.1 $0.1 8.3% $4.6 $4.4 $0.2 6.0% "
+                "Operating income $0.8 $0.7 $0.1 14.0% $3.0 $2.7 $0.3 10.0% "
+            ),
+        )
+
+        parsed = parse_official_materials(
+            get_company("walmart"),
+            {"calendar_quarter": "2025Q4", "fiscal_label": "Q4 FY2026", "coverage_notes": [], "latest_kpis": {"revenue_bn": 190.7}},
+            [
+                {"label": "Walmart earnings release", "kind": "official_release", "status": "cached", "text_path": release_path},
+            ],
+        )
+
         self.assertEqual(
-            [item["name"] for item in parsed["current_geographies"]],
+            [item["name"] for item in parsed["current_segments"]],
             ["Walmart U.S.", "Walmart International", "Sam's Club U.S."],
         )
-        self.assertAlmostEqual(parsed["current_segments"][0]["value_bn"], 74.665, places=3)
+        values = {item["name"]: float(item["value_bn"]) for item in parsed["current_segments"]}
+        self.assertAlmostEqual(values["Walmart U.S."], 129.2, places=3)
+        self.assertAlmostEqual(values["Walmart International"], 37.7, places=3)
+        self.assertAlmostEqual(values["Sam's Club U.S."], 23.1, places=3)
+        self.assertFalse(parsed.get("current_geographies"))
 
     def test_home_and_company_api_return_top_20_pool(self) -> None:
         home = self.client.get("/")
@@ -9315,6 +9349,21 @@ class OfficialSourceResolverUnitTestCase(unittest.TestCase):
             [item["name"] for item in normalized],
             ["Walmart U.S.", "Walmart International", "Sam's Club U.S."],
         )
+
+    def test_promote_geographies_as_segments_skips_companies_with_explicit_segment_taxonomy(self) -> None:
+        company = get_company("walmart")
+        promoted = reports_service._promote_geographies_as_segments(
+            company,
+            {
+                "current_segments": [],
+                "current_geographies": [
+                    {"name": "United States", "value_bn": 160.7, "scope": "annual_filing"},
+                    {"name": "Canada", "value_bn": 29.9, "scope": "annual_filing"},
+                ],
+            },
+        )
+
+        self.assertFalse(promoted["current_segments"])
 
     def test_normalize_segment_items_maps_historical_aliases_to_canonical_taxonomy(self) -> None:
         company = get_company("apple")
